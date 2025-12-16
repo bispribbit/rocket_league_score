@@ -1,0 +1,15 @@
+[package]
+name = "project_exe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal dependencies
+project_lib.workspace = true
+
+# External dependencies
+parking_lot.workspace = true

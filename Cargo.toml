@@ -1,0 +1,108 @@
+[workspace]
+members = ["crates/*"]
+
+# Resolver needs to be set for workspaces
+# https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
+resolver = "3"
+
+[workspace.package]
+# Default license and edition
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal workspace dependencies
+project_lib = { path = "crates/project_lib" }
+
+# External workspace dependencies
+parking_lot = { version = "0.12.5", default-features = false }
+
+[workspace.lints.rust]
+future_incompatible = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+rust_2021_compatibility = { level = "warn", priority = -1 }
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+tail_expr_drop_order = { level = "allow" } # Warns on all significant drop
+
+elided-lifetimes-in-paths = "allow" # Adds lots of noise in Bevy code for no benefit
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+nursery = { level = "warn", priority = -1 }
+
+# Nursery exception in allow list below 
+cognitive_complexity = "allow" # Doesn't work well in practice
+
+# Clippy pedantic lints, treat all as warnings by default
+pedantic = { level = "warn", priority = -1 }
+
+# Pedentic exceptions in allow list below
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+if_not_else = "allow"
+items_after_statements = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+shadow_unrelated = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+unreadable_literal = "allow"
+unseparated_literal_suffix = "allow"
+
+# Normal are often triggered in bevy
+type_complexity = "allow"
+
+# Restriction lints
+allow_attributes = "warn"
+alloc_instead_of_core = "warn"
+as_ptr_cast_mut = "warn"
+as_underscore = "warn"
+bool_to_int_with_if = "warn"
+collection_is_never_read = "warn"
+dbg_macro = "warn"
+default_union_representation = "warn"
+deref_by_slicing = "warn"
+empty_drop = "warn"
+empty_line_after_doc_comments = "warn"
+empty_structs_with_brackets = "warn"
+exit = "warn"
+fallible_impl_from = "warn"
+float_cmp_const = "warn"
+format_push_string = "warn"
+indexing_slicing = "warn"
+large_include_file = "warn"
+large_stack_frames = "warn"
+let_underscore_untyped = "warn"
+map_err_ignore = "warn"
+mem_forget = "warn"
+missing_assert_message = "warn"
+missing_enforced_import_renames = "warn"
+needless_raw_strings = "warn"
+negative_feature_names = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+partial_pub_fields = "warn"
+pub_without_shorthand = "warn"
+redundant_type_annotations = "warn"
+ref_patterns = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+same_name_method = "warn"
+std_instead_of_alloc = "warn"
+std_instead_of_core = "warn"
+string_slice = "warn"
+tests_outside_test_module = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+verbose_file_reads = "warn"

@@ -1,0 +1,13 @@
+[config]
+default_to_workspace = false
+
+[tasks.upgrade]
+dependencies = ["upgrade-internal", "update"]
+
+[tasks.upgrade-internal]
+command = "cargo"
+args = ["upgrade", "-i", "-v"]
+
+[tasks.update]
+command = "cargo"
+args = ["update"]

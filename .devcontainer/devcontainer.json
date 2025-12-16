@@ -1,0 +1,36 @@
+{
+    "name": "Rust Development",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "fill-labs.dependi",
+                "vadimcn.vscode-lldb"
+            ],
+            "settings": {
+                "editor.formatOnSave": true,
+                "files.eol": "\n",
+                "rust-analyzer.cargo.features": "all",
+                // Clippy runs in a different folder, preventing "waiting for file lock on build directory"
+                "rust-analyzer.cargo.targetDir": true,
+                "rust-analyzer.check.command": "clippy",
+                // Run clippy just in the current crate, not the whole workspace (Big speedup)
+                "rust-analyzer.check.workspace": false,
+                "rust-analyzer.rustfmt.extraArgs": [
+                    "--config",
+                    "group_imports=StdExternalCrate",
+                    "--config",
+                    "imports_granularity=Module"
+                ]
+            }
+        }
+    },
+    "remoteUser": "root",
+    "mounts": [
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.cargo/registry,target=/usr/local/cargo/registry,type=bind,consistency=cached"
+    ]
+}

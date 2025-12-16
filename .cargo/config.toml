@@ -1,0 +1,14 @@
+[cargo-new]
+name = "Your name"
+email = "name@example.com"
+vcs = "none"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false

@@ -1,0 +1,28 @@
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+allowed-idents-below-min-chars = [
+    "_",
+    "'_",
+    "e",
+    "i",
+    "j",
+    "k",
+    "n",
+    "w",
+    "x",
+    "y",
+    "z",
+]
+
+avoid-breaking-exported-api = false
+disallowed-types = [
+    { path = "crc::Crc", reason = "use xxHash familiy of hashes, ideally Blake3" },
+    { path = "std::sync::Mutex", reason = "use parking_lot::Mutex instead" },
+    { path = "std::sync::RwLock", reason = "use parking_lot::RwLock instead" },
+    { path = "std::sync::Condvar", reason = "use parking_lot::Condvar instead" },
+]
+
+excessive-nesting-threshold = 6
+min-ident-chars-threshold = 2

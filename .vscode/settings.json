@@ -1,0 +1,17 @@
+// Shared vscode settings goes here.
+{
+    "editor.formatOnSave": true,
+    "files.eol": "\n",
+    "rust-analyzer.cargo.features": "all",
+    // Clippy runs in a different folder, preventing "waiting for file lock on build directory"
+    "rust-analyzer.cargo.targetDir": true,
+    "rust-analyzer.check.command": "clippy",
+    // Run clippy just in the current crate, not the whole workspace (Big speedup)
+    "rust-analyzer.check.workspace": false,
+    "rust-analyzer.rustfmt.extraArgs": [
+        "--config",
+        "group_imports=StdExternalCrate",
+        "--config",
+        "imports_granularity=Module"
+    ],
+}
