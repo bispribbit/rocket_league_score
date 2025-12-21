@@ -1,14 +1,15 @@
 {
     "name": "Rust Development",
-    "build": {
-        "dockerfile": "Dockerfile"
-    },
+    "dockerComposeFile": "docker-compose.yml",
+    "service": "app",
+    "workspaceFolder": "/workspace",
     "customizations": {
         "vscode": {
             "extensions": [
+                "fill-labs.dependi",
+                "github.vscode-github-actions",
                 "rust-lang.rust-analyzer",
                 "tamasfe.even-better-toml",
-                "fill-labs.dependi",
                 "vadimcn.vscode-lldb"
             ],
             "settings": {
@@ -30,7 +31,5 @@
         }
     },
     "remoteUser": "root",
-    "mounts": [
-        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.cargo/registry,target=/usr/local/cargo/registry,type=bind,consistency=cached"
-    ]
+    "postStartCommand": "cd /workspace/crates/database && sqlx migrate run"
 }

@@ -9,7 +9,9 @@ workspace = true
 
 [dependencies]
 # Internal dependencies
-project_lib.workspace = true
+database.workspace = true
 
 # External dependencies
-parking_lot.workspace = true
+anyhow.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

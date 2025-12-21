@@ -12,10 +12,12 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Internal workspace dependencies
-project_lib = { path = "crates/project_lib" }
+database = { path = "crates/database" }
 
 # External workspace dependencies
-parking_lot = { version = "0.12.5", default-features = false }
+anyhow = { version = "1.0.100" }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "tls-rustls", "postgres", "migrate"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }
