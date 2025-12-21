@@ -1,5 +1,16 @@
+//! Database crate for Rocket League impact score calculator.
+//!
+//! Provides connection pooling, migrations, and repository functions
+//! for replays, players, and ML models.
+
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+
+pub mod models;
+pub mod repositories;
+
+pub use models::*;
+pub use repositories::*;
 
 /// Creates a connection pool to the `PostgreSQL` database.
 ///

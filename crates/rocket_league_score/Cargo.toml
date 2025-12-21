@@ -1,0 +1,24 @@
+[package]
+name = "rocket_league_score"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal dependencies
+database.workspace = true
+feature_extractor.workspace = true
+ml_model.workspace = true
+replay_parser.workspace = true
+
+# External dependencies
+anyhow.workspace = true
+burn.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true

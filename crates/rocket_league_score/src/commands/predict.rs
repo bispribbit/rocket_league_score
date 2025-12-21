@@ -1,0 +1,101 @@
+//! Predict command - runs inference on a replay file.
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use burn::backend::wgpu::WgpuDevice;
+use burn::backend::Wgpu;
+use database::ModelRepository;
+use feature_extractor::extract_frame_features;
+use ml_model::{load_checkpoint, predict, ImpactModel};
+use replay_parser::parse_replay;
+use sqlx::PgPool;
+
+type Backend = Wgpu;
+
+/// Runs the predict command.
+///
+/// # Errors
+///
+/// Returns an error if prediction fails.
+pub async fn run(
+    pool: &PgPool,
+    replay_path: &Path,
+    model_name: &str,
+    version: Option<i32>,
+) -> Result<()> {
+    println!("Predicting impact scores for: {}", replay_path.display());
+
+    // Load the model
+    let model_record = if let Some(v) = version {
+        ModelRepository::find_by_name_version(pool, model_name, v).await?
+    } else {
+        ModelRepository::find_latest(pool, model_name).await?
+    };
+
+    let model_record = model_record.context(format!(
+        "Model '{model_name}' not found. Train a model first."
+    ))?;
+
+    println!(
+        "Using model: {} v{}",
+        model_record.name, model_record.version
+    );
+
+    // Load model weights
+    let device = WgpuDevice::default();
+    let model: ImpactModel<Backend> = load_checkpoint(&model_record.checkpoint_path, &device)?;
+
+    // Parse the replay
+    let parsed = parse_replay(replay_path)?;
+
+    if parsed.frames.is_empty() {
+        println!("No frames found in replay.");
+        return Ok(());
+    }
+
+    println!("Analyzing {} frames...", parsed.frames.len());
+
+    // Run prediction on each frame and aggregate
+    let mut scores: Vec<f32> = Vec::new();
+
+    for frame in &parsed.frames {
+        let features = extract_frame_features(frame);
+        let score = predict(&model, &features, &device);
+        scores.push(score);
+    }
+
+    // Calculate statistics
+    let avg_score = scores.iter().sum::<f32>() / scores.len() as f32;
+    let min_score = scores.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+    println!("\n=== Impact Score Results ===");
+    println!("Average Score: {avg_score:.0}");
+    println!("Min Score:     {min_score:.0}");
+    println!("Max Score:     {max_score:.0}");
+    println!();
+
+    // Interpret the score
+    let skill_level = interpret_score(avg_score);
+    println!("Estimated Skill Level: {skill_level}");
+
+    Ok(())
+}
+
+/// Interprets an impact score as a skill level.
+const fn interpret_score(score: f32) -> &'static str {
+    // These thresholds are based on Rocket League's MMR system
+    // and would be refined through actual training data
+    match score as i32 {
+        0..=299 => "Bronze",
+        300..=499 => "Silver",
+        500..=699 => "Gold",
+        700..=899 => "Platinum",
+        900..=1099 => "Diamond",
+        1100..=1299 => "Champion",
+        1300..=1499 => "Grand Champion",
+        _ => "Supersonic Legend",
+    }
+}
+
