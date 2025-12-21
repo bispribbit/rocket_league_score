@@ -3,9 +3,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use database::{CreateReplay, CreateReplayPlayer, GameMode, ReplayRepository, ReplayPlayerRepository};
+use database::{CreateReplay, CreateReplayPlayer, GameMode, ReplayPlayerRepository, ReplayRepository};
 use replay_parser::parse_replay;
 use sqlx::PgPool;
+use tracing::{info, warn};
 
 /// Runs the ingest command.
 ///
@@ -18,23 +19,23 @@ pub async fn run(
     game_mode_str: &str,
     ratings_file: Option<&Path>,
 ) -> Result<()> {
-    println!("Ingesting replays from: {}", folder.display());
+    info!(folder = %folder.display(), "Ingesting replays");
 
     let game_mode = GameMode::from_str(game_mode_str)
         .context("Invalid game mode. Use: 3v3, 2v2, 1v1, hoops, rumble, dropshot, snowday")?;
 
     // TODO: Parse ratings file if provided
     let ratings = if let Some(path) = ratings_file {
-        println!("Loading ratings from: {}", path.display());
+        info!(path = %path.display(), "Loading ratings file");
         load_ratings_file(path)?
     } else {
-        println!("No ratings file provided. Using default ratings.");
+        info!("No ratings file provided, using default ratings");
         Vec::new()
     };
 
     // Find all .replay files in the folder
     let replay_files = find_replay_files(folder)?;
-    println!("Found {} replay files", replay_files.len());
+    info!(count = replay_files.len(), "Found replay files");
 
     let mut ingested = 0;
     let mut skipped = 0;
@@ -87,12 +88,12 @@ pub async fn run(
                 ingested += 1;
             }
             Err(e) => {
-                eprintln!("Failed to parse {}: {}", replay_path.display(), e);
+                warn!(path = %replay_path.display(), error = %e, "Failed to parse replay");
             }
         }
     }
 
-    println!("Ingestion complete: {ingested} ingested, {skipped} skipped");
+    info!(ingested, skipped, "Ingestion complete");
 
     Ok(())
 }

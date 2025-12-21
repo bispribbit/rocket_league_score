@@ -10,6 +10,7 @@ use feature_extractor::extract_frame_features;
 use ml_model::{load_checkpoint, predict, ImpactModel};
 use replay_parser::parse_replay;
 use sqlx::PgPool;
+use tracing::{info, warn};
 
 type Backend = Wgpu;
 
@@ -24,7 +25,7 @@ pub async fn run(
     model_name: &str,
     version: Option<i32>,
 ) -> Result<()> {
-    println!("Predicting impact scores for: {}", replay_path.display());
+    info!(replay = %replay_path.display(), "Predicting impact scores");
 
     // Load the model
     let model_record = if let Some(v) = version {
@@ -37,9 +38,10 @@ pub async fn run(
         "Model '{model_name}' not found. Train a model first."
     ))?;
 
-    println!(
-        "Using model: {} v{}",
-        model_record.name, model_record.version
+    info!(
+        model = %model_record.name,
+        version = model_record.version,
+        "Using model"
     );
 
     // Load model weights
@@ -50,11 +52,11 @@ pub async fn run(
     let parsed = parse_replay(replay_path)?;
 
     if parsed.frames.is_empty() {
-        println!("No frames found in replay.");
+        warn!("No frames found in replay");
         return Ok(());
     }
 
-    println!("Analyzing {} frames...", parsed.frames.len());
+    info!(frames = parsed.frames.len(), "Analyzing frames");
 
     // Run prediction on each frame and aggregate
     let mut scores: Vec<f32> = Vec::new();
@@ -70,15 +72,14 @@ pub async fn run(
     let min_score = scores.iter().copied().fold(f32::INFINITY, f32::min);
     let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-    println!("\n=== Impact Score Results ===");
-    println!("Average Score: {avg_score:.0}");
-    println!("Min Score:     {min_score:.0}");
-    println!("Max Score:     {max_score:.0}");
-    println!();
+    info!("=== Impact Score Results ===");
+    info!(avg_score, "Average Score");
+    info!(min_score, "Min Score");
+    info!(max_score, "Max Score");
 
     // Interpret the score
     let skill_level = interpret_score(avg_score);
-    println!("Estimated Skill Level: {skill_level}");
+    info!(skill_level, "Estimated Skill Level");
 
     Ok(())
 }

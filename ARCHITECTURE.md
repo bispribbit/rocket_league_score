@@ -98,18 +98,21 @@ rocket_league_score migrate
 - [x] Repository functions (CRUD for replays, players, models)
 - [x] CLI commands structure (ingest, train, predict, migrate)
 
-### TODO: replay_parser
+### DONE: replay_parser
 
-- [ ] **Implement `parse_replay()` with boxcars**: Currently returns mock data. Need to:
-  - Parse network frames from boxcars `Replay`
-  - Extract ball actor positions/velocities per frame
-  - Extract player actor positions/velocities/boost per frame
-  - Identify goal and kickoff events from game events
+- [x] **Implemented `parse_replay()` with boxcars**:
+  - Parses network frames from boxcars `Replay`
+  - Extracts ball actor positions/velocities per frame
+  - Extracts player/car actor positions/velocities/boost per frame
+  - Extracts goal events from replay header
+  - Detects kickoff frames (ball at center position)
+  - Tracks team assignments via TeamPaint and FlaggedByte attributes
   
-- [ ] **Implement `segment_by_goals()`**: Currently returns mock segments. Need to:
-  - Detect kickoff frames (ball at center, countdown complete)
-  - Detect goal frames from game events
-  - Determine which team scored
+- [x] **Implemented `segment_by_goals()`**:
+  - Creates segments between kickoffs and goals
+  - Identifies which team scored from goal events
+  
+- [ ] **Player names**: Currently showing as `Player_X` - need to properly link PlayerReplicationInfo names to car actors
 
 ### TODO: feature_extractor
 

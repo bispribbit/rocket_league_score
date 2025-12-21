@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use database::{create_pool, run_migrations};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 mod commands;
 
@@ -17,6 +19,10 @@ mod commands;
 #[command(about = "ML-based impact score calculator for Rocket League replays")]
 #[command(version)]
 struct Cli {
+    /// Enable verbose logging
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -81,6 +87,15 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Initialize tracing subscriber
+    let filter = if cli.verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::new("info")
+    };
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
     let database_url = std::env::var("DATABASE_URL")?;
     let pool = create_pool(&database_url).await?;
 
@@ -109,7 +124,7 @@ async fn main() -> Result<()> {
         }
         Commands::Migrate => {
             run_migrations(&pool).await?;
-            println!("Migrations completed successfully.");
+            info!("Migrations completed successfully");
         }
     }
 

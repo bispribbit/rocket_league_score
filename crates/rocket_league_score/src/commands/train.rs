@@ -10,6 +10,7 @@ use feature_extractor::{extract_segment_samples, PlayerRating};
 use ml_model::{create_model, train, ModelConfig, TrainingConfig, TrainingData};
 use replay_parser::{parse_replay, segment_by_goals};
 use sqlx::PgPool;
+use tracing::info;
 
 type Backend = Wgpu;
 
@@ -25,7 +26,7 @@ pub async fn run(
     batch_size: usize,
     learning_rate: f64,
 ) -> Result<()> {
-    println!("Starting training for model: {model_name}");
+    info!(model_name, "Starting training");
 
     let config = TrainingConfig {
         learning_rate,
@@ -35,21 +36,21 @@ pub async fn run(
     };
 
     // Load training data from database
-    println!("Loading training data...");
+    info!("Loading training data...");
     let training_data = load_training_data(pool).await?;
 
     if training_data.is_empty() {
         anyhow::bail!("No training data found. Please ingest replays first.");
     }
 
-    println!("Loaded {} training samples", training_data.len());
+    info!(samples = training_data.len(), "Loaded training samples");
 
     // Create model
     let device = WgpuDevice::default();
     let mut model = create_model::<Backend>(&device, &config.model);
 
     // Train model
-    println!("Training model with {epochs} epochs...");
+    info!(epochs, "Training model");
     train(&mut model, &training_data, &config)?;
 
     // Save model checkpoint
@@ -80,10 +81,12 @@ pub async fn run(
     )
     .await?;
 
-    println!(
-        "Training complete! Model saved as {model_name} v{next_version}"
+    info!(
+        model_name,
+        version = next_version,
+        checkpoint_path,
+        "Training complete"
     );
-    println!("Checkpoint: {checkpoint_path}");
 
     Ok(())
 }
