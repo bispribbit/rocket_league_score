@@ -27,7 +27,7 @@ crates/
          │
          ▼
 ┌─────────────────────┐
-│  feature_extractor  │  Extract per-frame features (~75 floats)
+│  feature_extractor  │  Extract per-frame features (147 floats)
 └────────┬────────────┘
          │
          ▼
@@ -71,14 +71,12 @@ rocket_league_score migrate
 
 1. **MMR-based labels**: Using actual player MMR (integer) instead of categorical skill labels allows the model to learn the continuous skill spectrum.
 
-2. **Per-frame features**: ~75 features including:
-   - Ball position and velocity (6 floats)
-   - Per player (6 players × 11 features = 66 floats):
-     - Position relative to ball and own goal
-     - Velocity
-     - Boost level
-     - Demolished flag
-   - Team-level features (possession, ball-to-goal distances)
+2. **Per-frame features**: 147 features including:
+   - Ball state (7): position, velocity, speed
+   - Per player state (6 × 13 = 78): position, velocity, rotation quaternion, speed, boost, demolished
+   - Per player geometry (6 × 9 = 54): distance to ball, distance to own goal, facing ball, goal line position, distance to each teammate (2), distance to each opponent (3)
+   - Team context (2 × 3 = 6): team centroid, average boost
+   - Game context (2): ball distance to each goal
 
 3. **Segment-based training**: Replays are split into segments between kickoffs and goals for focused learning.
 
@@ -91,7 +89,7 @@ rocket_league_score migrate
 ### Completed (Structure in Place)
 
 - [x] Workspace configuration with all crates
-- [x] `replay_parser` types: `ParsedReplay`, `GameFrame`, `PlayerState`, `BallState`, `GameSegment`
+- [x] `replay_parser` types: `ParsedReplay`, `GameFrame`, `PlayerState`, `BallState`, `GameSegment`, `Quaternion`
 - [x] `feature_extractor` types: `FrameFeatures`, `PlayerRating`, `TrainingSample`
 - [x] `ml_model` types: `ImpactModel`, `TrainingConfig`, `ModelConfig`, `TrainingData`
 - [x] Database migrations for all tables
@@ -114,15 +112,18 @@ rocket_league_score migrate
   
 - [ ] **Player names**: Currently showing as `Player_X` - need to properly link PlayerReplicationInfo names to car actors
 
-### TODO: feature_extractor
+### DONE: feature_extractor
 
-- [ ] **Implement `extract_frame_features()`**: Currently only extracts ball position. Need to:
-  - Extract all 6 player positions relative to ball and goals
-  - Calculate distances to nearest opponents/teammates
-  - Add boost levels and demolished flags
-  - Compute team possession indicator
+- [x] **Implemented `extract_frame_features()`**: Full 122-feature extraction:
+  - Ball state: position, velocity, speed, height classification, trajectory toward goals
+  - Player state: position, velocity, rotation (quaternion), speed magnitude, boost, demolished
+  - Player geometry: distance to ball, distance to own goal, facing ball angle, between-ness score
+  - Team context: team centroid position, average boost
+  - Game context: time remaining, overtime flag, ball-to-goal distances
+  
+- [x] **Normalization**: All features normalized to [-1, 1] or [0, 1] ranges during extraction
 
-- [ ] **Implement `normalize_features()`**: Need to compute mean/std from training data and apply normalization.
+- [x] **FEATURES.md**: Comprehensive documentation of all 122 features with indices
 
 ### TODO: ml_model
 

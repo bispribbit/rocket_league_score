@@ -4,53 +4,51 @@
 //! and run inference with a neural network that predicts player impact
 //! scores based on frame features.
 
+mod dataset;
+mod training;
+
+use std::path::Path;
+
+use burn::config::Config;
+use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, Relu};
 use burn::prelude::*;
+use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+pub use dataset::{ImpactBatcher, ImpactDataset, ImpactDatasetItem};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TrainingSample};
+pub use training::{TrainingOutput, train};
 
 /// Configuration for the impact score model.
-#[derive(Debug, Clone)]
+#[derive(Config, Debug)]
 pub struct ModelConfig {
     /// Number of hidden units in the first layer.
+    #[config(default = 256)]
     pub hidden_size_1: usize,
     /// Number of hidden units in the second layer.
+    #[config(default = 128)]
     pub hidden_size_2: usize,
     /// Dropout rate for regularization.
+    #[config(default = 0.1)]
     pub dropout: f64,
 }
 
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            hidden_size_1: 256,
-            hidden_size_2: 128,
-            dropout: 0.1,
-        }
-    }
-}
-
 /// Configuration for training the model.
-#[derive(Debug, Clone)]
+#[derive(Config, Debug)]
 pub struct TrainingConfig {
     /// Learning rate for the optimizer.
+    #[config(default = 1e-4)]
     pub learning_rate: f64,
     /// Number of training epochs.
+    #[config(default = 100)]
     pub epochs: usize,
     /// Batch size for training.
+    #[config(default = 64)]
     pub batch_size: usize,
     /// Model architecture configuration.
     pub model: ModelConfig,
-}
-
-impl Default for TrainingConfig {
-    fn default() -> Self {
-        Self {
-            learning_rate: 1e-4,
-            epochs: 100,
-            batch_size: 64,
-            model: ModelConfig::default(),
-        }
-    }
+    /// Validation split ratio (0.0 to 1.0).
+    #[config(default = 0.1)]
+    pub validation_split: f64,
 }
 
 /// The impact score prediction model.
@@ -115,6 +113,7 @@ pub struct TrainingData {
 
 impl TrainingData {
     /// Creates a new empty training data container.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             samples: Vec::new(),
@@ -127,13 +126,31 @@ impl TrainingData {
     }
 
     /// Returns the number of samples.
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.samples.len()
     }
 
     /// Returns true if there are no samples.
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.samples.is_empty()
+    }
+
+    /// Splits the data into training and validation sets.
+    ///
+    /// # Arguments
+    ///
+    /// * `validation_ratio` - Fraction of data to use for validation (0.0 to 1.0)
+    #[must_use]
+    pub fn split(&self, validation_ratio: f64) -> (Vec<TrainingSample>, Vec<TrainingSample>) {
+        let validation_count = (self.samples.len() as f64 * validation_ratio) as usize;
+        let train_count = self.samples.len() - validation_count;
+
+        let training = self.samples.iter().take(train_count).cloned().collect();
+        let validation = self.samples.iter().skip(train_count).cloned().collect();
+
+        (training, validation)
     }
 }
 
@@ -149,37 +166,6 @@ impl TrainingData {
 /// A new `ImpactModel` instance.
 pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> ImpactModel<B> {
     ImpactModel::new(device, config)
-}
-
-/// Trains the model on the provided data.
-///
-/// # Arguments
-///
-/// * `model` - The model to train.
-/// * `data` - The training data.
-/// * `config` - Training configuration.
-///
-/// # Errors
-///
-/// Returns an error if training fails.
-pub const fn train<B: Backend>(
-    _model: &mut ImpactModel<B>,
-    _data: &TrainingData,
-    _config: &TrainingConfig,
-) -> anyhow::Result<()> {
-    // TODO: Implement actual training loop
-    // This would include:
-    // 1. Convert TrainingData to Burn tensors
-    // 2. Create data loaders with batching
-    // 3. Initialize optimizer (Adam)
-    // 4. Training loop:
-    //    - Forward pass
-    //    - Compute MSE loss between predicted and target MMR
-    //    - Backward pass
-    //    - Update weights
-    // 5. Validation and early stopping
-
-    Ok(())
 }
 
 /// Predicts the impact score for a single frame.
@@ -198,20 +184,59 @@ pub fn predict<B: Backend>(
     features: &FrameFeatures,
     device: &B::Device,
 ) -> f32 {
-    // TODO: Implement actual inference
-    // For now, return a mock score
-
-    // Convert features to tensor
+    // Convert features to tensor [1, FEATURE_COUNT]
     let input_data: Vec<f32> = features.features.to_vec();
     let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).unsqueeze();
+
+    // Forward pass - output is [1, 1]
+    let output = model.forward(input);
+
+    // Extract scalar value using into_data
+    let output_data = output.into_data();
+    let values = output_data.to_vec::<f32>().unwrap_or_else(|_| vec![1000.0]);
+
+    values.first().copied().unwrap_or(1000.0)
+}
+
+/// Predicts impact scores for a batch of frames.
+///
+/// # Arguments
+///
+/// * `model` - The trained model.
+/// * `features` - Vector of frame features to predict on.
+/// * `device` - The device to run inference on.
+///
+/// # Returns
+///
+/// Vector of predicted impact scores.
+pub fn predict_batch<B: Backend>(
+    model: &ImpactModel<B>,
+    features: &[FrameFeatures],
+    device: &B::Device,
+) -> Vec<f32> {
+    if features.is_empty() {
+        return Vec::new();
+    }
+
+    // Build input tensor [batch_size, FEATURE_COUNT]
+    let batch_size = features.len();
+    let mut input_data = Vec::with_capacity(batch_size * FEATURE_COUNT);
+
+    for frame in features {
+        input_data.extend_from_slice(&frame.features);
+    }
+
+    let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device)
+        .reshape([batch_size, FEATURE_COUNT]);
 
     // Forward pass
     let output = model.forward(input);
 
-    // Extract scalar value
-    // TODO: Proper tensor to scalar conversion
-    let _ = output;
-    1000.0 // Mock score
+    // Extract values
+    let output_data = output.into_data();
+    output_data
+        .to_vec::<f32>()
+        .unwrap_or_else(|_| vec![1000.0; batch_size])
 }
 
 /// Saves the model checkpoint to disk.
@@ -219,21 +244,39 @@ pub fn predict<B: Backend>(
 /// # Arguments
 ///
 /// * `model` - The model to save.
-/// * `path` - The path to save to.
+/// * `path` - The path to save to (without extension).
+/// * `config` - The training configuration used.
 ///
 /// # Errors
 ///
 /// Returns an error if saving fails.
 pub fn save_checkpoint<B: Backend>(
-    _model: &ImpactModel<B>,
-    _path: &str,
+    model: &ImpactModel<B>,
+    path: &str,
+    config: &TrainingConfig,
 ) -> anyhow::Result<ModelCheckpoint> {
-    // TODO: Implement model serialization using Burn's record system
+    // Create parent directory if needed
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Use MessagePack recorder for efficient serialization
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+    model
+        .clone()
+        .save_file(path, &recorder)
+        .map_err(|e| anyhow::anyhow!("Failed to save model: {e}"))?;
+
+    // Also save the config
+    let config_path = format!("{path}.config.json");
+    config
+        .save(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to save config: {e}"))?;
 
     Ok(ModelCheckpoint {
-        path: _path.to_string(),
+        path: path.to_string(),
         version: 1,
-        training_config: TrainingConfig::default(),
+        training_config: config.clone(),
     })
 }
 
@@ -241,19 +284,36 @@ pub fn save_checkpoint<B: Backend>(
 ///
 /// # Arguments
 ///
-/// * `path` - The path to load from.
+/// * `path` - The path to load from (without extension).
 /// * `device` - The device to load the model to.
 ///
 /// # Errors
 ///
 /// Returns an error if loading fails.
 pub fn load_checkpoint<B: Backend>(
-    _path: &str,
+    path: &str,
     device: &B::Device,
 ) -> anyhow::Result<ImpactModel<B>> {
-    // TODO: Implement model deserialization using Burn's record system
+    // Try to load config first, fall back to defaults
+    let config_path = format!("{path}.config.json");
+    let model_config = if Path::new(&config_path).exists() {
+        let training_config = TrainingConfig::load(&config_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+        training_config.model
+    } else {
+        ModelConfig::new()
+    };
 
-    Ok(ImpactModel::new(device, &ModelConfig::default()))
+    // Create model with config
+    let model = ImpactModel::new(device, &model_config);
+
+    // Load weights
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+    let model = model
+        .load_file(path, &recorder, device)
+        .map_err(|e| anyhow::anyhow!("Failed to load model weights: {e}"))?;
+
+    Ok(model)
 }
 
 #[cfg(test)]
@@ -266,9 +326,49 @@ mod tests {
 
     #[test]
     fn test_model_creation() {
-        let device = Default::default();
-        let config = ModelConfig::default();
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = ModelConfig::new();
         let _model: ImpactModel<TestBackend> = create_model(&device, &config);
+    }
+
+    #[test]
+    fn test_model_forward() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = ModelConfig::new();
+        let model: ImpactModel<TestBackend> = create_model(&device, &config);
+
+        // Create a batch of 2 samples
+        let input = Tensor::<TestBackend, 2>::zeros([2, FEATURE_COUNT], &device);
+        let output = model.forward(input);
+
+        // Output should be [2, 1]
+        assert_eq!(output.dims(), [2, 1]);
+    }
+
+    #[test]
+    fn test_predict_single() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = ModelConfig::new();
+        let model: ImpactModel<TestBackend> = create_model(&device, &config);
+
+        let features = FrameFeatures::default();
+        let score = predict(&model, &features, &device);
+
+        // Score should be a reasonable number (model is untrained, so just check it's finite)
+        assert!(score.is_finite());
+    }
+
+    #[test]
+    fn test_predict_batch() {
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = ModelConfig::new();
+        let model: ImpactModel<TestBackend> = create_model(&device, &config);
+
+        let features = vec![FrameFeatures::default(), FrameFeatures::default()];
+        let scores = predict_batch(&model, &features, &device);
+
+        assert_eq!(scores.len(), 2);
+        assert!(scores.iter().all(|s| s.is_finite()));
     }
 
     #[test]
@@ -282,8 +382,26 @@ mod tests {
     }
 
     #[test]
+    fn test_training_data_split() {
+        let mut data = TrainingData::new();
+
+        // Add 10 samples
+        for i in 0..10 {
+            data.add_samples(vec![TrainingSample {
+                features: FrameFeatures::default(),
+                player_ratings: vec![],
+                target_mmr: i as f32 * 100.0,
+            }]);
+        }
+
+        let (train, val) = data.split(0.2);
+        assert_eq!(train.len(), 8);
+        assert_eq!(val.len(), 2);
+    }
+
+    #[test]
     fn test_training_config_default() {
-        let config = TrainingConfig::default();
+        let config = TrainingConfig::new(ModelConfig::new());
         assert!(config.learning_rate > 0.0);
         assert!(config.epochs > 0);
         assert!(config.batch_size > 0);
