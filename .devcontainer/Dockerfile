@@ -1,6 +1,6 @@
 FROM rust:1.92.0-trixie
 
-# Install additional tools for Rust development
+# Install additional tools for Rust development + Vulkan for GPU compute
 RUN apt-get update && apt-get install -y \
     git \
     build-essential \
@@ -14,6 +14,11 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     libpq-dev \
     postgresql-client \
+    # Vulkan libraries for GPU compute (wgpu/burn)
+    libvulkan1 \
+    libvulkan-dev \
+    vulkan-tools \
+    mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
 # Install rust components

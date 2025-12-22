@@ -12,6 +12,14 @@ services:
       db:
         condition: service_healthy
     command: sleep infinity
+    # GPU access for WSL2/Docker Desktop
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   db:
     image: postgres:17
