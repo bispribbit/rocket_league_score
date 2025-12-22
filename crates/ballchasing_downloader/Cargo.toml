@@ -1,0 +1,30 @@
+[package]
+name = "ballchasing_downloader"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ballchasing-downloader"
+path = "src/main.rs"
+
+[dependencies]
+# Internal dependencies
+database.workspace = true
+
+# External dependencies
+anyhow.workspace = true
+dotenvy.workspace = true
+governor.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

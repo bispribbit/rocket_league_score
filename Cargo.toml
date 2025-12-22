@@ -30,6 +30,13 @@ tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 uuid = { version = "1.19.0", features = ["v4"] }
 
+# Ballchasing downloader dependencies
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = { version = "0.15" }
+governor = { version = "0.8" }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = { version = "3.15" }
+
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }
 nonstandard_style = { level = "warn", priority = -1 }
