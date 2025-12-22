@@ -12,6 +12,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod commands;
+pub mod rank;
 
 /// Rocket League Impact Score Calculator
 #[derive(Parser)]
@@ -81,6 +82,21 @@ enum Commands {
 
     /// Run database migrations
     Migrate,
+
+    /// Run end-to-end pipeline test (no database required)
+    TestPipeline {
+        /// Path to the folder containing replay files
+        #[arg(short, long)]
+        replay_dir: PathBuf,
+
+        /// Path to the metadata.jsonl file
+        #[arg(short, long)]
+        metadata: PathBuf,
+
+        /// Number of replays to test with
+        #[arg(short, long, default_value = "3")]
+        num_replays: usize,
+    },
 }
 
 #[tokio::main]
@@ -125,6 +141,14 @@ async fn main() -> Result<()> {
         Commands::Migrate => {
             run_migrations(&pool).await?;
             info!("Migrations completed successfully");
+        }
+        Commands::TestPipeline {
+            replay_dir,
+            metadata,
+            num_replays,
+        } => {
+            // This command doesn't need the database
+            commands::test_pipeline::run(&replay_dir, &metadata, num_replays)?;
         }
     }
 

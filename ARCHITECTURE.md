@@ -12,13 +12,13 @@ crates/
 ├── replay_parser/        # Parse .replay files using boxcars
 ├── feature_extractor/    # Extract ML features from frame data
 ├── ml_model/             # Burn neural network for prediction
-└── rocket_league_score/  # CLI binary (ingest/train/predict)
+└── rocket_league_score/  # CLI binary (ingest/train/predict/test-pipeline)
 ```
 
 ## Data Flow
 
 ```
-.replay files
+.replay files + metadata.jsonl
     │
     ▼
 ┌─────────────────┐
@@ -54,6 +54,12 @@ crates/
 ## CLI Commands
 
 ```bash
+# End-to-end pipeline test (no database required)
+rocket_league_score test-pipeline \
+  --replay-dir replays/3v3 \
+  --metadata replays/3v3/metadata.jsonl \
+  --num-replays 5
+
 # Ingest replays with player MMR ratings
 rocket_league_score ingest --folder replays/3v3 --game-mode 3v3 --ratings-file ratings.csv
 
@@ -82,21 +88,20 @@ rocket_league_score migrate
 
 4. **Minimal database storage**: Only metadata and player ratings stored, not full replay data.
 
+5. **Metadata from ballchasing.com**: Player ranks are extracted from `metadata.jsonl` files and converted to MMR using rank-to-MMR mapping tables.
+
 ---
 
 ## Implementation Status
 
-### Completed (Structure in Place)
+### ✅ DONE: Core Infrastructure
 
 - [x] Workspace configuration with all crates
-- [x] `replay_parser` types: `ParsedReplay`, `GameFrame`, `PlayerState`, `BallState`, `GameSegment`, `Quaternion`
-- [x] `feature_extractor` types: `FrameFeatures`, `PlayerRating`, `TrainingSample`
-- [x] `ml_model` types: `ImpactModel`, `TrainingConfig`, `ModelConfig`, `TrainingData`
 - [x] Database migrations for all tables
 - [x] Repository functions (CRUD for replays, players, models)
-- [x] CLI commands structure (ingest, train, predict, migrate)
+- [x] CLI commands structure (ingest, train, predict, migrate, test-pipeline)
 
-### DONE: replay_parser
+### ✅ DONE: replay_parser
 
 - [x] **Implemented `parse_replay()` with boxcars**:
   - Parses network frames from boxcars `Replay`
@@ -112,63 +117,113 @@ rocket_league_score migrate
   
 - [ ] **Player names**: Currently showing as `Player_X` - need to properly link PlayerReplicationInfo names to car actors
 
-### DONE: feature_extractor
+### ✅ DONE: feature_extractor
 
-- [x] **Implemented `extract_frame_features()`**: Full 122-feature extraction:
-  - Ball state: position, velocity, speed, height classification, trajectory toward goals
+- [x] **Implemented `extract_frame_features()`**: Full 147-feature extraction:
+  - Ball state: position, velocity, speed
   - Player state: position, velocity, rotation (quaternion), speed magnitude, boost, demolished
-  - Player geometry: distance to ball, distance to own goal, facing ball angle, between-ness score
+  - Player geometry: distance to ball, distance to own goal, facing ball angle, goal-line position
   - Team context: team centroid position, average boost
-  - Game context: time remaining, overtime flag, ball-to-goal distances
+  - Game context: ball-to-goal distances
   
 - [x] **Normalization**: All features normalized to [-1, 1] or [0, 1] ranges during extraction
+- [x] **FEATURES.md**: Comprehensive documentation of all features with indices
 
-- [x] **FEATURES.md**: Comprehensive documentation of all 122 features with indices
+### ✅ DONE: ml_model
 
-### TODO: ml_model
+- [x] **ImpactModel**: 3-layer feedforward neural network (147 → 256 → 128 → 1)
+- [x] **Training pipeline**:
+  - `ImpactDataset` and `ImpactBatcher` for data loading
+  - Adam optimizer with configurable learning rate
+  - MSE loss function
+  - Validation split (configurable, default 10%)
+  - Early stopping (10 epochs patience)
+  - Progress logging
+- [x] **Inference**: `predict()` and `predict_batch()` functions
+- [x] **Checkpointing**: `save_checkpoint()` and `load_checkpoint()` using Burn's MessagePack format
+- [x] **Documentation**: MLModel.md with architecture and usage guide
 
-- [ ] **Implement `train()`**: Currently a no-op. Need to:
-  - Convert `TrainingData` to Burn tensors/datasets
-  - Create data loaders with batching
-  - Implement training loop with Adam optimizer
-  - Compute MSE loss between predicted and target MMR
-  - Add validation and early stopping
+### ✅ DONE: test_pipeline Command
 
-- [ ] **Implement `predict()`**: Currently returns mock score. Need to:
-  - Properly convert features to tensor
-  - Run forward pass
-  - Extract scalar output
+- [x] **Metadata parsing**: Reads `metadata.jsonl` and extracts player ranks
+- [x] **Rank-to-MMR mapping**: Converts rank strings to MMR values
+- [x] **End-to-end test**: Parses replays, extracts features, trains model, runs inference
+- [x] **Sanity checks**: Verifies loss is finite and predictions are in reasonable range
 
-- [ ] **Implement `save_checkpoint()` / `load_checkpoint()`**: Need to use Burn's record system for model serialization.
+### 🔄 IN PROGRESS: Full Training
 
-### TODO: CLI / ingest
-
-- [ ] **Implement CSV ratings parsing**: Currently returns empty vec. Need to parse format: `replay_filename,player_name,team,skill_rating`
+- [ ] Run small-scale test to verify pipeline works
+- [ ] Scale up to full dataset with proper train/validation/test splits
+- [ ] Evaluate model performance
 
 ### Future Enhancements
 
 - [ ] BakkesMod integration for real-time scoring
-- [ ] Support for 2v2 and 1v1 game modes
+- [ ] Support for 2v2 and 1v1 game modes (different feature counts)
 - [ ] Advanced features: 50/50 outcomes, passing sequences, boost steal detection
 - [ ] Per-player scoring (not just per-frame)
 - [ ] Training dashboard with loss curves
+- [ ] Model hyperparameter tuning
 
 ---
 
-## Training Data Requirements
+## Training Data
 
-To train the model, you need:
+### Available Data
 
-1. **Replay files** from various skill levels (bronze to SSL)
-2. **Player ratings CSV** with format:
-   ```csv
-   replay_filename,player_name,team,skill_rating
-   abc123.replay,PlayerOne,0,1547
-   abc123.replay,PlayerTwo,0,1623
-   abc123.replay,PlayerThree,0,1489
-   abc123.replay,OpponentA,1,1512
-   ...
-   ```
+| Mode | Replays | Metadata |
+|------|---------|----------|
+| 3v3  | 36,078  | ✅ metadata.jsonl |
+| 2v2  | 42,200  | ✅ metadata.jsonl |
+| 1v1  | 41,318  | ✅ metadata.jsonl |
 
-The model learns to predict what MMR-level play "looks like" at any given frame, then outputs an impact score reflecting skill level.
+### Metadata Format
 
+Each line in `metadata.jsonl` is a JSON object with:
+- `id`: Replay UUID (matches filename without `.replay`)
+- `data.blue.players[]`: Blue team players with `rank.id`, `rank.division`
+- `data.orange.players[]`: Orange team players with `rank.id`, `rank.division`
+
+### Rank-to-MMR Mapping
+
+Player ranks are converted to approximate MMR values:
+
+| Rank | Base MMR |
+|------|----------|
+| Supersonic Legend | 1883 |
+| Grand Champion III | 1706 |
+| Grand Champion II | 1575 |
+| Grand Champion I | 1436 |
+| Champion III | 1315 |
+| Champion II | 1195 |
+| Champion I | 1075 |
+| Diamond III | 980 |
+| Diamond II | 915 |
+| Diamond I | 835 |
+| Platinum III | 760 |
+| ... | ... |
+| Bronze I | 0 |
+
+Each division adds ~20-40 MMR to the base value.
+
+---
+
+## Quick Start: Running the Pipeline Test
+
+```bash
+# Build the project
+cargo build --release
+
+# Run end-to-end test with 5 replays
+./target/release/rocket_league_score test-pipeline \
+  --replay-dir /workspace/replays/3v3 \
+  --metadata /workspace/replays/3v3/metadata.jsonl \
+  --num-replays 5
+```
+
+Expected output:
+1. Loads metadata and matches to replay files
+2. Parses replays and extracts features
+3. Trains model for 5 epochs
+4. Runs inference on samples
+5. Reports sanity check results
