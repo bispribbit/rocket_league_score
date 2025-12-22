@@ -19,16 +19,17 @@ impl ReplayRepository {
     pub async fn create(pool: &PgPool, input: CreateReplay) -> Result<Replay, sqlx::Error> {
         let id = Uuid::new_v4();
 
-        sqlx::query_as::<_, Replay>(
-            "
+        sqlx::query_as!(
+            Replay,
+            r#"
             INSERT INTO replays (id, file_path, game_mode)
             VALUES ($1, $2, $3)
-            RETURNING id, file_path, game_mode, processed_at, created_at
-            ",
+            RETURNING id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
+            "#,
+            id,
+            input.file_path,
+            input.game_mode as GameMode
         )
-        .bind(id)
-        .bind(&input.file_path)
-        .bind(input.game_mode)
         .fetch_one(pool)
         .await
     }
@@ -38,15 +39,19 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn find_by_path(pool: &PgPool, file_path: &str) -> Result<Option<Replay>, sqlx::Error> {
-        sqlx::query_as::<_, Replay>(
-            "
-            SELECT id, file_path, game_mode, processed_at, created_at
+    pub async fn find_by_path(
+        pool: &PgPool,
+        file_path: &str,
+    ) -> Result<Option<Replay>, sqlx::Error> {
+        sqlx::query_as!(
+            Replay,
+            r#"
+            SELECT id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
             FROM replays
             WHERE file_path = $1
-            ",
+            "#,
+            file_path
         )
-        .bind(file_path)
         .fetch_optional(pool)
         .await
     }
@@ -57,14 +62,15 @@ impl ReplayRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Replay>, sqlx::Error> {
-        sqlx::query_as::<_, Replay>(
-            "
-            SELECT id, file_path, game_mode, processed_at, created_at
+        sqlx::query_as!(
+            Replay,
+            r#"
+            SELECT id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
             FROM replays
             WHERE id = $1
-            ",
+            "#,
+            id
         )
-        .bind(id)
         .fetch_optional(pool)
         .await
     }
@@ -78,15 +84,16 @@ impl ReplayRepository {
         pool: &PgPool,
         game_mode: GameMode,
     ) -> Result<Vec<Replay>, sqlx::Error> {
-        sqlx::query_as::<_, Replay>(
-            "
-            SELECT id, file_path, game_mode, processed_at, created_at
+        sqlx::query_as!(
+            Replay,
+            r#"
+            SELECT id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
             FROM replays
             WHERE game_mode = $1
             ORDER BY created_at DESC
-            ",
+            "#,
+            game_mode as GameMode
         )
-        .bind(game_mode)
         .fetch_all(pool)
         .await
     }
@@ -97,14 +104,14 @@ impl ReplayRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn mark_processed(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "
+        sqlx::query!(
+            r#"
             UPDATE replays
             SET processed_at = NOW()
             WHERE id = $1
-            ",
+            "#,
+            id
         )
-        .bind(id)
         .execute(pool)
         .await?;
 
@@ -116,17 +123,20 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn count_by_game_mode(pool: &PgPool, game_mode: GameMode) -> Result<i64, sqlx::Error> {
-        let result: (i64,) = sqlx::query_as(
-            "
-            SELECT COUNT(*) FROM replays WHERE game_mode = $1
-            ",
+    pub async fn count_by_game_mode(
+        pool: &PgPool,
+        game_mode: GameMode,
+    ) -> Result<i64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as "count!" FROM replays WHERE game_mode = $1
+            "#,
+            game_mode as GameMode
         )
-        .bind(game_mode)
         .fetch_one(pool)
         .await?;
 
-        Ok(result.0)
+        Ok(result.count)
     }
 }
 
@@ -139,21 +149,25 @@ impl ReplayPlayerRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn create(pool: &PgPool, input: CreateReplayPlayer) -> Result<ReplayPlayer, sqlx::Error> {
+    pub async fn create(
+        pool: &PgPool,
+        input: CreateReplayPlayer,
+    ) -> Result<ReplayPlayer, sqlx::Error> {
         let id = Uuid::new_v4();
 
-        sqlx::query_as::<_, ReplayPlayer>(
-            "
+        sqlx::query_as!(
+            ReplayPlayer,
+            r#"
             INSERT INTO replay_players (id, replay_id, player_name, team, skill_rating)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id, replay_id, player_name, team, skill_rating, created_at
-            ",
+            "#,
+            id,
+            input.replay_id,
+            input.player_name,
+            input.team,
+            input.skill_rating
         )
-        .bind(id)
-        .bind(input.replay_id)
-        .bind(&input.player_name)
-        .bind(input.team)
-        .bind(input.skill_rating)
         .fetch_one(pool)
         .await
     }
@@ -182,16 +196,20 @@ impl ReplayPlayerRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn list_by_replay(pool: &PgPool, replay_id: Uuid) -> Result<Vec<ReplayPlayer>, sqlx::Error> {
-        sqlx::query_as::<_, ReplayPlayer>(
-            "
+    pub async fn list_by_replay(
+        pool: &PgPool,
+        replay_id: Uuid,
+    ) -> Result<Vec<ReplayPlayer>, sqlx::Error> {
+        sqlx::query_as!(
+            ReplayPlayer,
+            r#"
             SELECT id, replay_id, player_name, team, skill_rating, created_at
             FROM replay_players
             WHERE replay_id = $1
             ORDER BY team, player_name
-            ",
+            "#,
+            replay_id
         )
-        .bind(replay_id)
         .fetch_all(pool)
         .await
     }
@@ -201,17 +219,20 @@ impl ReplayPlayerRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn average_rating_for_replay(pool: &PgPool, replay_id: Uuid) -> Result<Option<f64>, sqlx::Error> {
-        let result: (Option<f64>,) = sqlx::query_as(
-            "
-            SELECT AVG(skill_rating::float) FROM replay_players WHERE replay_id = $1
-            ",
+    pub async fn average_rating_for_replay(
+        pool: &PgPool,
+        replay_id: Uuid,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            SELECT AVG(skill_rating::float) as average FROM replay_players WHERE replay_id = $1
+            "#,
+            replay_id
         )
-        .bind(replay_id)
         .fetch_one(pool)
         .await?;
 
-        Ok(result.0)
+        Ok(result.average)
     }
 }
 
@@ -227,19 +248,20 @@ impl ModelRepository {
     pub async fn create(pool: &PgPool, input: CreateModel) -> Result<Model, sqlx::Error> {
         let id = Uuid::new_v4();
 
-        sqlx::query_as::<_, Model>(
-            "
+        sqlx::query_as!(
+            Model,
+            r#"
             INSERT INTO models (id, name, version, checkpoint_path, training_config, metrics)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, name, version, checkpoint_path, training_config, metrics, trained_at
-            ",
+            "#,
+            id,
+            input.name,
+            input.version,
+            input.checkpoint_path,
+            input.training_config,
+            input.metrics
         )
-        .bind(id)
-        .bind(&input.name)
-        .bind(input.version)
-        .bind(&input.checkpoint_path)
-        .bind(&input.training_config)
-        .bind(&input.metrics)
         .fetch_one(pool)
         .await
     }
@@ -254,15 +276,16 @@ impl ModelRepository {
         name: &str,
         version: i32,
     ) -> Result<Option<Model>, sqlx::Error> {
-        sqlx::query_as::<_, Model>(
-            "
+        sqlx::query_as!(
+            Model,
+            r#"
             SELECT id, name, version, checkpoint_path, training_config, metrics, trained_at
             FROM models
             WHERE name = $1 AND version = $2
-            ",
+            "#,
+            name,
+            version
         )
-        .bind(name)
-        .bind(version)
         .fetch_optional(pool)
         .await
     }
@@ -273,16 +296,17 @@ impl ModelRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn find_latest(pool: &PgPool, name: &str) -> Result<Option<Model>, sqlx::Error> {
-        sqlx::query_as::<_, Model>(
-            "
+        sqlx::query_as!(
+            Model,
+            r#"
             SELECT id, name, version, checkpoint_path, training_config, metrics, trained_at
             FROM models
             WHERE name = $1
             ORDER BY version DESC
             LIMIT 1
-            ",
+            "#,
+            name
         )
-        .bind(name)
         .fetch_optional(pool)
         .await
     }
@@ -293,16 +317,16 @@ impl ModelRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn next_version(pool: &PgPool, name: &str) -> Result<i32, sqlx::Error> {
-        let result: (Option<i32>,) = sqlx::query_as(
-            "
-            SELECT MAX(version) FROM models WHERE name = $1
-            ",
+        let result = sqlx::query!(
+            r#"
+            SELECT MAX(version) as max_version FROM models WHERE name = $1
+            "#,
+            name
         )
-        .bind(name)
         .fetch_one(pool)
         .await?;
 
-        Ok(result.0.unwrap_or(0) + 1)
+        Ok(result.max_version.unwrap_or(0) + 1)
     }
 
     /// Lists all versions of a model.
@@ -311,17 +335,17 @@ impl ModelRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn list_versions(pool: &PgPool, name: &str) -> Result<Vec<Model>, sqlx::Error> {
-        sqlx::query_as::<_, Model>(
-            "
+        sqlx::query_as!(
+            Model,
+            r#"
             SELECT id, name, version, checkpoint_path, training_config, metrics, trained_at
             FROM models
             WHERE name = $1
             ORDER BY version DESC
-            ",
+            "#,
+            name
         )
-        .bind(name)
         .fetch_all(pool)
         .await
     }
 }
-

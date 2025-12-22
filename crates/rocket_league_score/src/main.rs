@@ -8,11 +8,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use database::{create_pool, run_migrations};
+use rocket_league_score::commands;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-
-mod commands;
-pub mod rank;
 
 /// Rocket League Impact Score Calculator
 #[derive(Parser)]
