@@ -1,7 +1,7 @@
 //! Dataset and batching for Burn training.
 
 use burn::prelude::*;
-use feature_extractor::{TrainingSample, FEATURE_COUNT};
+use feature_extractor::{FEATURE_COUNT, TrainingSample};
 
 /// A single item in the impact dataset.
 #[derive(Debug, Clone)]
@@ -50,7 +50,6 @@ impl ImpactDataset {
         let items = samples.iter().map(ImpactDatasetItem::from).collect();
         Self { items }
     }
-
 }
 
 impl burn::data::dataset::Dataset<ImpactDatasetItem> for ImpactDataset {
@@ -70,9 +69,9 @@ impl burn::data::dataset::Dataset<ImpactDatasetItem> for ImpactDataset {
 /// A batch of training data.
 #[derive(Debug, Clone)]
 pub struct ImpactBatch<B: Backend> {
-    /// Input features tensor of shape [batch_size, FEATURE_COUNT].
+    /// Input features tensor of shape `[batch_size, FEATURE_COUNT]`.
     pub inputs: Tensor<B, 2>,
-    /// Target MMR values tensor of shape [batch_size, 1].
+    /// Target MMR values tensor of shape `[batch_size, 1]`.
     pub targets: Tensor<B, 2>,
 }
 
@@ -85,7 +84,7 @@ pub struct ImpactBatcher<B: Backend> {
 impl<B: Backend> ImpactBatcher<B> {
     /// Creates a new batcher for the given device.
     #[must_use]
-    pub fn new(device: B::Device) -> Self {
+    pub const fn new(device: B::Device) -> Self {
         Self { device }
     }
 

@@ -356,7 +356,7 @@ fn write_player_geometry(
     features[idx + 8] = opponent_distances[2];
 }
 
-/// Gets distances to all other players (excluding self), sorted by actor_id.
+/// Gets distances to all other players (excluding self), sorted by `actor_id`.
 /// Returns a fixed-size array with 1.0 for missing players.
 fn get_distances_to_others(
     position: &Vector3,

@@ -1,9 +1,12 @@
 //! Ingest command - imports replay files into the database.
 
 use std::path::Path;
+use core::str::FromStr;
 
 use anyhow::{Context, Result};
-use database::{CreateReplay, CreateReplayPlayer, GameMode, ReplayPlayerRepository, ReplayRepository};
+use database::{
+    CreateReplay, CreateReplayPlayer, GameMode, ReplayPlayerRepository, ReplayRepository,
+};
 use replay_parser::parse_replay;
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -44,7 +47,10 @@ pub async fn run(
         let file_path_str = replay_path.to_string_lossy().to_string();
 
         // Check if already ingested
-        if ReplayRepository::find_by_path(pool, &file_path_str).await?.is_some() {
+        if ReplayRepository::find_by_path(pool, &file_path_str)
+            .await?
+            .is_some()
+        {
             skipped += 1;
             continue;
         }
@@ -133,9 +139,10 @@ fn find_replay_files(folder: &Path) -> Result<Vec<std::path::PathBuf>> {
 
         if path.is_file() {
             if let Some(ext) = path.extension()
-                && ext == "replay" {
-                    files.push(path);
-                }
+                && ext == "replay"
+            {
+                files.push(path);
+            }
         } else if path.is_dir() {
             // Recursively search subdirectories
             files.extend(find_replay_files(&path)?);
@@ -144,4 +151,3 @@ fn find_replay_files(folder: &Path) -> Result<Vec<std::path::PathBuf>> {
 
     Ok(files)
 }
-

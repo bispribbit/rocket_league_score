@@ -2,17 +2,16 @@
 
 use anyhow::Result;
 use burn::backend::wgpu::WgpuDevice;
-use burn::backend::Wgpu;
-use database::{
-    CreateModel, GameMode, ModelRepository, ReplayPlayerRepository, ReplayRepository,
-};
-use feature_extractor::{extract_segment_samples, PlayerRating};
-use ml_model::{create_model, train, ModelConfig, TrainingConfig, TrainingData};
+use burn::backend::{Autodiff, Wgpu};
+use database::{CreateModel, GameMode, ModelRepository, ReplayPlayerRepository, ReplayRepository};
+use feature_extractor::{PlayerRating, extract_segment_samples};
+use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
 use replay_parser::{parse_replay, segment_by_goals};
 use sqlx::PgPool;
 use tracing::info;
 
-type Backend = Wgpu;
+// Training requires Autodiff wrapper for automatic differentiation
+type TrainBackend = Autodiff<Wgpu>;
 
 /// Runs the train command.
 ///
@@ -28,12 +27,11 @@ pub async fn run(
 ) -> Result<()> {
     info!(model_name, "Starting training");
 
-    let config = TrainingConfig {
-        learning_rate,
-        epochs,
-        batch_size,
-        model: ModelConfig::default(),
-    };
+    let model_config = ModelConfig::new();
+    let config = TrainingConfig::new(model_config.clone())
+        .with_learning_rate(learning_rate)
+        .with_epochs(epochs)
+        .with_batch_size(batch_size);
 
     // Load training data from database
     info!("Loading training data...");
@@ -45,28 +43,28 @@ pub async fn run(
 
     info!(samples = training_data.len(), "Loaded training samples");
 
-    // Create model
+    // Create model with Autodiff backend for training
     let device = WgpuDevice::default();
-    let mut model = create_model::<Backend>(&device, &config.model);
+    let mut model = create_model::<TrainBackend>(&device, &model_config);
 
     // Train model
     info!(epochs, "Training model");
-    train(&mut model, &training_data, &config)?;
+    let output = train(&mut model, &training_data, &config)?;
 
     // Save model checkpoint
     let next_version = ModelRepository::next_version(pool, model_name).await?;
-    let checkpoint_path = format!("models/{model_name}_{next_version}.bin");
+    let checkpoint_path = format!("models/{model_name}_{next_version}");
 
-    // TODO: Actually save the model weights
-    // ml_model::save_checkpoint(&model, &checkpoint_path)?;
+    save_checkpoint(&model, &checkpoint_path, &config)?;
+    info!(final_loss = output.final_train_loss, "Training completed");
 
     // Create model record in database
     let training_config_json = serde_json::json!({
         "learning_rate": learning_rate,
         "epochs": epochs,
         "batch_size": batch_size,
-        "hidden_size_1": config.model.hidden_size_1,
-        "hidden_size_2": config.model.hidden_size_2,
+        "hidden_size_1": model_config.hidden_size_1,
+        "hidden_size_2": model_config.hidden_size_2,
     });
 
     ModelRepository::create(
@@ -137,4 +135,3 @@ async fn load_training_data(pool: &PgPool) -> Result<TrainingData> {
 
     Ok(data)
 }
-

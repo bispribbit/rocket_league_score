@@ -1,5 +1,7 @@
 //! Database model types.
 
+use core::str::FromStr;
+
 use sqlx::types::chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -16,18 +18,20 @@ pub enum GameMode {
     Snowday,
 }
 
-impl GameMode {
+impl FromStr for GameMode {
+    type Err = anyhow::Error;
+
     /// Returns the game mode from a string representation.
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
-            "3v3" | "soccar_3v3" => Some(Self::Soccar3v3),
-            "2v2" | "soccar_2v2" => Some(Self::Soccar2v2),
-            "1v1" | "soccar_1v1" => Some(Self::Soccar1v1),
-            "hoops" => Some(Self::Hoops),
-            "rumble" => Some(Self::Rumble),
-            "dropshot" => Some(Self::Dropshot),
-            "snowday" => Some(Self::Snowday),
-            _ => None,
+            "3v3" | "soccar_3v3" => Ok(Self::Soccar3v3),
+            "2v2" | "soccar_2v2" => Ok(Self::Soccar2v2),
+            "1v1" | "soccar_1v1" => Ok(Self::Soccar1v1),
+            "hoops" => Ok(Self::Hoops),
+            "rumble" => Ok(Self::Rumble),
+            "dropshot" => Ok(Self::Dropshot),
+            "snowday" => Ok(Self::Snowday),
+            _ => Err(anyhow::anyhow!("Invalid game mode: {s}")),
         }
     }
 }
@@ -90,4 +94,3 @@ pub struct CreateModel {
     pub training_config: Option<serde_json::Value>,
     pub metrics: Option<serde_json::Value>,
 }
-
