@@ -8,6 +8,7 @@ services:
       - cargo-registry:/usr/local/cargo/registry
     environment:
       - DATABASE_URL=postgres://postgres:postgres@db:5432/postgres
+      - RUST_BACKTRACE=1
     depends_on:
       db:
         condition: service_healthy

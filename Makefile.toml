@@ -1,6 +1,10 @@
 [config]
 default_to_workspace = false
 
+[tasks.sqlx-offline]
+command = "cargo"
+args = ["sqlx", "prepare", "--workspace"]
+
 [tasks.upgrade]
 dependencies = ["upgrade-internal", "update"]
 

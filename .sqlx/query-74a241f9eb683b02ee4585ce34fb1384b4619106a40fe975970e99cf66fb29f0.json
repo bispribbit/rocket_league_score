@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE ballchasing_replays\n        SET \n            download_status = 'not_downloaded',\n            updated_at = NOW()\n        WHERE download_status = 'in_progress'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "74a241f9eb683b02ee4585ce34fb1384b4619106a40fe975970e99cf66fb29f0"
+}

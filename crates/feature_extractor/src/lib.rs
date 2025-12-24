@@ -647,7 +647,7 @@ pub fn extract_segment_samples(
             // Pad blue team with default MMR if fewer than 3 players
             target_mmr.extend(core::iter::repeat_n(
                 1000.0,
-                PLAYERS_PER_TEAM - blue_players.len(),
+                PLAYERS_PER_TEAM.saturating_sub(blue_players.len()),
             ));
 
             // Orange team (next 3 slots)
@@ -661,7 +661,7 @@ pub fn extract_segment_samples(
             // Pad orange team with default MMR if fewer than 3 players
             target_mmr.extend(core::iter::repeat_n(
                 1000.0,
-                PLAYERS_PER_TEAM - orange_players.len(),
+                PLAYERS_PER_TEAM.saturating_sub(orange_players.len()),
             ));
 
             TrainingSample {

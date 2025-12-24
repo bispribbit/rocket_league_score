@@ -3,7 +3,7 @@
 use anyhow::Result;
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
-use database::{CreateModel, GameMode, ModelRepository, ReplayPlayerRepository, ReplayRepository};
+use database::{CreateModel, GameMode};
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
 use replay_parser::{parse_replay, segment_by_goals};
@@ -50,7 +50,7 @@ pub async fn run(
     let output = train(&mut model, &training_data, &config)?;
 
     // Save model checkpoint
-    let next_version = ModelRepository::next_version(model_name).await?;
+    let next_version = database::get_next_model_version(model_name).await?;
     let checkpoint_path = format!("models/{model_name}_{next_version}");
 
     save_checkpoint(&model, &checkpoint_path, &config)?;
@@ -65,7 +65,7 @@ pub async fn run(
         "hidden_size_2": model_config.hidden_size_2,
     });
 
-    ModelRepository::create(CreateModel {
+    database::insert_model(CreateModel {
         name: model_name.to_string(),
         version: next_version,
         checkpoint_path: checkpoint_path.clone(),
@@ -89,11 +89,11 @@ async fn load_training_data() -> Result<TrainingData> {
     let mut data = TrainingData::new();
 
     // Get all 3v3 replays (our primary training data)
-    let replays = ReplayRepository::list_by_game_mode(GameMode::Soccar3v3).await?;
+    let replays = database::list_replays_by_game_mode(GameMode::Soccar3v3).await?;
 
     for replay in replays {
         // Get player ratings for this replay
-        let db_players = ReplayPlayerRepository::list_by_replay(replay.id).await?;
+        let db_players = database::list_replay_players_by_replay(replay.id).await?;
 
         if db_players.is_empty() {
             // Skip replays without player ratings

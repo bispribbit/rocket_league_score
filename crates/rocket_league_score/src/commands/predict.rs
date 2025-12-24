@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
-use database::ModelRepository;
+use database;
 use feature_extractor::extract_frame_features;
 use ml_model::{ImpactModel, load_checkpoint, predict};
 use replay_parser::parse_replay;
@@ -23,9 +23,9 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
 
     // Load the model
     let model_record = if let Some(v) = version {
-        ModelRepository::find_by_name_version(model_name, v).await?
+        database::find_model_by_name_version(model_name, v).await?
     } else {
-        ModelRepository::find_latest(model_name).await?
+        database::find_latest_model(model_name).await?
     };
 
     let model_record = model_record.context(format!(

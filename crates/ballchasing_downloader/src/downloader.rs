@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use database::{
-    BallchasingRank, BallchasingReplayRepository, CreateBallchasingReplay, DownloadStatus,
+    BallchasingRank, CreateBallchasingReplay, DownloadStatus,
 };
 use replay_structs::ReplaySummary;
 use tempfile::NamedTempFile;
@@ -45,7 +45,7 @@ pub async fn run(config: &Config) -> Result<()> {
     let client = Arc::new(BallchasingClient::new(config)?);
 
     // Reset any stuck in-progress downloads
-    let reset_count = BallchasingReplayRepository::reset_in_progress().await?;
+    let reset_count = database::reset_in_progress_ballchasing_downloads().await?;
     if reset_count > 0 {
         info!("Reset {reset_count} in-progress downloads");
     }
@@ -81,7 +81,7 @@ async fn fetch_all_metadata(client: &BallchasingClient) -> Result<()> {
         let mut all_complete = true;
 
         for rank in BallchasingRank::all_ranked() {
-            let current = BallchasingReplayRepository::count_by_rank(rank).await?;
+            let current = database::count_ballchasing_replays_by_rank(rank).await?;
 
             if current >= TARGET_REPLAYS_PER_RANK as i64 {
                 continue;
@@ -93,7 +93,7 @@ async fn fetch_all_metadata(client: &BallchasingClient) -> Result<()> {
             info!("Rank {rank}: have {current}, fetching up to {needed} more");
 
             // Get existing IDs
-            let existing = BallchasingReplayRepository::list_by_rank(rank, None).await?;
+            let existing = database::list_ballchasing_replays_by_rank(rank, None).await?;
             let existing_ids: HashSet<Uuid> = existing.iter().map(|r| r.id).collect();
 
             // Fetch from API
@@ -118,7 +118,7 @@ async fn fetch_all_metadata(client: &BallchasingClient) -> Result<()> {
             }
 
             if !to_create.is_empty() {
-                let created = BallchasingReplayRepository::create_many(to_create).await?;
+                let created = database::insert_ballchasing_replays(to_create).await?;
                 info!("Stored {created} new replays for rank {rank}");
             }
         }
@@ -144,20 +144,20 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
 
     loop {
         // Get batch of pending downloads
-        let pending = BallchasingReplayRepository::list_pending_downloads(None, 100).await?;
+        let pending = database::list_pending_ballchasing_downloads(None, 100).await?;
 
         if pending.is_empty() {
             // Check if fetch is still running by waiting a bit and checking again
             sleep(Duration::from_secs(2)).await;
 
             let still_pending =
-                BallchasingReplayRepository::list_pending_downloads(None, 1).await?;
+                database::list_pending_ballchasing_downloads(None, 1).await?;
 
             if still_pending.is_empty() {
                 // Double-check all ranks are complete
                 let mut all_downloaded = true;
                 for rank in BallchasingRank::all_ranked() {
-                    let not_downloaded = BallchasingReplayRepository::count_by_rank_and_status(
+                    let not_downloaded = database::count_ballchasing_replays_by_rank_and_status(
                         rank,
                         DownloadStatus::NotDownloaded,
                     )
@@ -216,18 +216,18 @@ async fn download_single(
     rank: BallchasingRank,
 ) -> Result<()> {
     // Mark as in progress
-    BallchasingReplayRepository::mark_in_progress(replay_id).await?;
+    database::mark_ballchasing_replay_in_progress(replay_id).await?;
 
     // Attempt download
     match download_and_save(client, replay_id, rank).await {
         Ok(file_path) => {
-            BallchasingReplayRepository::mark_downloaded(replay_id, &file_path).await?;
+            database::mark_ballchasing_replay_downloaded(replay_id, &file_path).await?;
             debug!("Downloaded {replay_id}");
             Ok(())
         }
         Err(error) => {
             let error_msg = format!("{error:#}");
-            BallchasingReplayRepository::mark_failed(replay_id, &error_msg).await?;
+            database::mark_ballchasing_replay_failed(replay_id, &error_msg).await?;
             error!("Failed to download {replay_id}: {error}");
             Err(error)
         }
@@ -271,9 +271,9 @@ async fn log_download_progress() -> Result<()> {
 
     for rank in BallchasingRank::all_ranked() {
         let downloaded =
-            BallchasingReplayRepository::count_by_rank_and_status(rank, DownloadStatus::Downloaded)
+            database::count_ballchasing_replays_by_rank_and_status(rank, DownloadStatus::Downloaded)
                 .await?;
-        let pending = BallchasingReplayRepository::count_by_rank_and_status(
+        let pending = database::count_ballchasing_replays_by_rank_and_status(
             rank,
             DownloadStatus::NotDownloaded,
         )
@@ -312,10 +312,10 @@ async fn print_stats() -> Result<()> {
 
     for rank in BallchasingRank::all_ranked() {
         let downloaded =
-            BallchasingReplayRepository::count_by_rank_and_status(rank, DownloadStatus::Downloaded)
+            database::count_ballchasing_replays_by_rank_and_status(rank, DownloadStatus::Downloaded)
                 .await?;
         let failed =
-            BallchasingReplayRepository::count_by_rank_and_status(rank, DownloadStatus::Failed)
+            database::count_ballchasing_replays_by_rank_and_status(rank, DownloadStatus::Failed)
                 .await?;
         let total = downloaded + failed;
 

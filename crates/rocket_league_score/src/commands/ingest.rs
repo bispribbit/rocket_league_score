@@ -5,8 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use database::{
-    BallchasingReplayRepository, CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode,
-    ReplayPlayerRepository, ReplayRepository,
+    CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode,
 };
 use replay_parser::{ExtractedPlayer, extract_players_from_metadata, parse_replay};
 use tracing::{info, warn};
@@ -45,7 +44,7 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
         let file_path_str = replay_path.to_string_lossy().to_string();
 
         // Check if already ingested
-        if ReplayRepository::find_by_path(&file_path_str)
+        if database::find_replay_by_path(&file_path_str)
             .await?
             .is_some()
         {
@@ -57,7 +56,7 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
         match parse_replay(replay_path) {
             Ok(_parsed) => {
                 // Create replay record
-                let replay = ReplayRepository::create(CreateReplay {
+                let replay = database::insert_replay(CreateReplay {
                     file_path: file_path_str.clone(),
                     game_mode,
                 })
@@ -120,7 +119,7 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
                 }
 
                 if !players_for_replay.is_empty() {
-                    ReplayPlayerRepository::create_many(players_for_replay).await?;
+                    database::insert_replay_players(players_for_replay).await?;
                 }
 
                 ingested += 1;
@@ -194,7 +193,7 @@ async fn find_ballchasing_replay_by_path(
     let all_ranks = database::BallchasingRank::all_ranked();
     for rank in all_ranks {
         let replays =
-            BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded))
+            database::list_ballchasing_replays_by_rank(rank, Some(DownloadStatus::Downloaded))
                 .await?;
 
         for replay in replays {
@@ -211,7 +210,7 @@ async fn find_ballchasing_replay_by_path(
         .file_stem()
         .and_then(|s| s.to_str())
         && let Ok(replay_id) = Uuid::parse_str(file_name)
-        && let Some(replay) = BallchasingReplayRepository::find_by_id(replay_id).await?
+        && let Some(replay) = database::find_ballchasing_replay_by_id(replay_id).await?
     {
         return Ok(Some(replay));
     }

@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
-use database::{BallchasingReplayRepository, DownloadStatus};
+use database::DownloadStatus;
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
 use replay_parser::{parse_replay, segment_by_goals};
@@ -38,7 +38,7 @@ async fn load_metadata(limit: Option<usize>) -> Result<HashMap<PathBuf, Vec<Play
 
     for rank in all_ranks {
         let replays =
-            BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded))
+            database::list_ballchasing_replays_by_rank(rank, Some(DownloadStatus::Downloaded))
                 .await?;
         if let Some(max) = limit {
             let remaining = max.saturating_sub(all_replays.len());

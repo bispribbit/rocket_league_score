@@ -8,11 +8,17 @@ use std::sync::LazyLock;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+pub mod ballchasing_replay;
+pub mod model;
 pub mod models;
-pub mod repositories;
+pub mod replay;
+pub mod replay_player;
 
+pub use ballchasing_replay::*;
+pub use model::*;
 pub use models::*;
-pub use repositories::*;
+pub use replay::*;
+pub use replay_player::*;
 
 /// Internal storage for the pool using `OnceLock` for runtime initialization.
 static POOL_INNER: std::sync::OnceLock<PgPool> = std::sync::OnceLock::new();

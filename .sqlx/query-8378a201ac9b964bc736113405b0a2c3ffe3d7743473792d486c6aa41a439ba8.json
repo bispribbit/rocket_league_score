@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, replay_id, player_name, team, skill_rating, created_at\n        FROM replay_players\n        WHERE replay_id = $1\n        ORDER BY team, player_name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "replay_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "player_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "team",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 4,
+        "name": "skill_rating",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8378a201ac9b964bc736113405b0a2c3ffe3d7743473792d486c6aa41a439ba8"
+}
