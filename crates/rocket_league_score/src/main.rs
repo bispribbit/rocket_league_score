@@ -83,10 +83,6 @@ enum Commands {
 
     /// Run end-to-end pipeline test
     TestPipeline {
-        /// Path to the folder containing replay files
-        #[arg(short, long)]
-        replay_dir: PathBuf,
-
         /// Number of replays to test with
         #[arg(short, long, default_value = "3")]
         num_replays: usize,
@@ -136,11 +132,8 @@ async fn main() -> Result<()> {
             run_migrations().await?;
             info!("Migrations completed successfully");
         }
-        Commands::TestPipeline {
-            replay_dir,
-            num_replays,
-        } => {
-            commands::pipeline::run(&replay_dir, num_replays).await?;
+        Commands::TestPipeline { num_replays } => {
+            commands::pipeline::run(num_replays).await?;
         }
     }
 

@@ -185,8 +185,7 @@ pub fn predict<B: Backend>(
     device: &B::Device,
 ) -> f32 {
     // Convert features to tensor [1, FEATURE_COUNT]
-    let input_data: Vec<f32> = features.features.to_vec();
-    let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).unsqueeze();
+    let input = Tensor::<B, 1>::from_floats(features.features, device).unsqueeze();
 
     // Forward pass - output is [1, 1]
     let output = model.forward(input);
@@ -389,8 +388,7 @@ mod tests {
         for i in 0..10 {
             data.add_samples(vec![TrainingSample {
                 features: FrameFeatures::default(),
-                player_ratings: vec![],
-                target_mmr: i as f32 * 100.0,
+                target_mmr: vec![i as f32 * 100.0; 6],
             }]);
         }
 

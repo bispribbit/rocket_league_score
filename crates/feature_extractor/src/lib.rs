@@ -7,6 +7,8 @@
 //!
 //! See `FEATURES.md` for the complete feature specification.
 
+use std::collections::HashMap;
+
 use replay_parser::{GameFrame, PlayerState, Quaternion, Vector3};
 
 /// Total number of features extracted per frame.
@@ -69,9 +71,9 @@ pub mod field {
 }
 
 /// A player's actual MMR rating used as training label.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PlayerRating {
-    pub player_id: u32,
+    pub player_name: String,
     pub mmr: i32,
 }
 
@@ -97,10 +99,9 @@ impl Default for FrameFeatures {
 #[derive(Debug, Clone)]
 pub struct TrainingSample {
     pub features: FrameFeatures,
-    /// MMR ratings for all players in this frame.
-    pub player_ratings: Vec<PlayerRating>,
-    /// Average MMR of the match (used as label).
-    pub target_mmr: f32,
+    /// Target MMR per player slot (6 players: blue team sorted by `actor_id`, then orange team sorted by `actor_id`).
+    /// Matches the feature order in the feature vector.
+    pub target_mmr: Vec<f32>,
 }
 
 /// Extracts ML features from a single game frame.
@@ -223,31 +224,59 @@ fn extract_player_state_features(
 
 /// Writes a single player's state features to the feature vector.
 fn write_player_state(features: &mut [f32; FEATURE_COUNT], idx: usize, player: &PlayerState) {
-    // Position
-    features[idx] = normalize_x(player.position.x);
-    features[idx + 1] = normalize_y(player.position.y);
-    features[idx + 2] = normalize_z(player.position.z);
+    // If demolished, zero out all features except the demolished flag
+    if player.is_demolished {
+        // Position (zeroed)
+        features[idx] = 0.0;
+        features[idx + 1] = 0.0;
+        features[idx + 2] = 0.0;
 
-    // Velocity
-    features[idx + 3] = normalize_car_velocity(player.velocity.x);
-    features[idx + 4] = normalize_car_velocity(player.velocity.y);
-    features[idx + 5] = normalize_car_velocity(player.velocity.z);
+        // Velocity (zeroed)
+        features[idx + 3] = 0.0;
+        features[idx + 4] = 0.0;
+        features[idx + 5] = 0.0;
 
-    // Rotation (quaternion - already in [-1, 1] range)
-    features[idx + 6] = player.rotation.x;
-    features[idx + 7] = player.rotation.y;
-    features[idx + 8] = player.rotation.z;
-    features[idx + 9] = player.rotation.w;
+        // Rotation (zeroed)
+        features[idx + 6] = 0.0;
+        features[idx + 7] = 0.0;
+        features[idx + 8] = 0.0;
+        features[idx + 9] = 0.0;
 
-    // Speed magnitude (normalized to supersonic = 1.0)
-    let speed = vector_magnitude(&player.velocity);
-    features[idx + 10] = (speed / field::MAX_CAR_SPEED).min(1.0);
+        // Speed (zeroed)
+        features[idx + 10] = 0.0;
 
-    // Boost (already 0-1)
-    features[idx + 11] = player.boost;
+        // Boost (zeroed)
+        features[idx + 11] = 0.0;
 
-    // Demolished flag
-    features[idx + 12] = if player.is_demolished { 1.0 } else { 0.0 };
+        // Demolished flag
+        features[idx + 12] = 1.0;
+    } else {
+        // Position
+        features[idx] = normalize_x(player.position.x);
+        features[idx + 1] = normalize_y(player.position.y);
+        features[idx + 2] = normalize_z(player.position.z);
+
+        // Velocity
+        features[idx + 3] = normalize_car_velocity(player.velocity.x);
+        features[idx + 4] = normalize_car_velocity(player.velocity.y);
+        features[idx + 5] = normalize_car_velocity(player.velocity.z);
+
+        // Rotation (quaternion - already in [-1, 1] range)
+        features[idx + 6] = player.rotation.x;
+        features[idx + 7] = player.rotation.y;
+        features[idx + 8] = player.rotation.z;
+        features[idx + 9] = player.rotation.w;
+
+        // Speed magnitude (normalized to supersonic = 1.0)
+        let speed = vector_magnitude(&player.velocity);
+        features[idx + 10] = (speed / field::MAX_CAR_SPEED).min(1.0);
+
+        // Boost (already 0-1)
+        features[idx + 11] = player.boost;
+
+        // Demolished flag
+        features[idx + 12] = 0.0;
+    }
 }
 
 /// Extracts player geometry features (6 features × 6 players = 36 features).
@@ -310,6 +339,14 @@ fn write_player_geometry(
     teammates: &[&PlayerState],
     opponents: &[&PlayerState],
 ) {
+    // If demolished, zero out all geometry features
+    if player.is_demolished {
+        for j in 0..indices::PLAYER_GEOM_FEATURES {
+            features[idx + j] = 0.0;
+        }
+        return;
+    }
+
     // 0: Distance to ball (normalized by field diagonal)
     let dist_to_ball = distance(&player.position, ball_pos);
     features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
@@ -453,15 +490,19 @@ fn extract_team_context_features(
 }
 
 /// Calculates team statistics (centroid X, centroid Y, average boost).
+/// Excludes demolished players from calculations.
 fn calculate_team_stats(players: &[&PlayerState]) -> (f32, f32, f32) {
-    if players.is_empty() {
+    // Filter out demolished players
+    let active_players: Vec<_> = players.iter().filter(|p| !p.is_demolished).collect();
+
+    if active_players.is_empty() {
         return (0.0, 0.0, 0.0);
     }
 
-    let count = players.len() as f32;
-    let sum_x: f32 = players.iter().map(|p| p.position.x).sum();
-    let sum_y: f32 = players.iter().map(|p| p.position.y).sum();
-    let sum_boost: f32 = players.iter().map(|p| p.boost).sum();
+    let count = active_players.len() as f32;
+    let sum_x: f32 = active_players.iter().map(|p| p.position.x).sum();
+    let sum_y: f32 = active_players.iter().map(|p| p.position.y).sum();
+    let sum_boost: f32 = active_players.iter().map(|p| p.boost).sum();
 
     (
         normalize_x(sum_x / count),
@@ -573,22 +614,60 @@ fn quaternion_forward(q: &Quaternion) -> Vector3 {
 }
 
 /// Extracts features from all frames in a segment and pairs with ratings.
+///
+/// Creates per-player `target_mmr` matching the feature order
+/// (blue team sorted by `actor_id`, then orange team sorted by `actor_id`).
 pub fn extract_segment_samples(
     frames: &[GameFrame],
     player_ratings: &[PlayerRating],
 ) -> Vec<TrainingSample> {
-    let avg_mmr = if player_ratings.is_empty() {
-        1000.0
-    } else {
-        player_ratings.iter().map(|r| r.mmr as f32).sum::<f32>() / player_ratings.len() as f32
-    };
+    // Create a lookup map from player name to MMR
+    let rating_map: HashMap<&str, i32> = player_ratings
+        .iter()
+        .map(|player_rating| (player_rating.player_name.as_str(), player_rating.mmr))
+        .collect();
 
     frames
         .iter()
-        .map(|frame| TrainingSample {
-            features: extract_frame_features(frame),
-            player_ratings: player_ratings.to_vec(),
-            target_mmr: avg_mmr,
+        .map(|frame| {
+            // Sort players to match feature order (blue team sorted by actor_id, then orange team sorted by actor_id)
+            let (blue_players, orange_players) = sort_players_by_team(&frame.players);
+
+            // Build target_mmr vector matching feature order
+            let mut target_mmr = Vec::with_capacity(TOTAL_PLAYERS);
+
+            // Blue team (first 3 slots)
+            for player in blue_players.iter().take(PLAYERS_PER_TEAM) {
+                let mmr = rating_map
+                    .get(player.name.as_str())
+                    .copied()
+                    .unwrap_or(1000) as f32;
+                target_mmr.push(mmr);
+            }
+            // Pad blue team with default MMR if fewer than 3 players
+            target_mmr.extend(core::iter::repeat_n(
+                1000.0,
+                PLAYERS_PER_TEAM - blue_players.len(),
+            ));
+
+            // Orange team (next 3 slots)
+            for player in orange_players.iter().take(PLAYERS_PER_TEAM) {
+                let mmr = rating_map
+                    .get(player.name.as_str())
+                    .copied()
+                    .unwrap_or(1000) as f32;
+                target_mmr.push(mmr);
+            }
+            // Pad orange team with default MMR if fewer than 3 players
+            target_mmr.extend(core::iter::repeat_n(
+                1000.0,
+                PLAYERS_PER_TEAM - orange_players.len(),
+            ));
+
+            TrainingSample {
+                features: extract_frame_features(frame),
+                target_mmr,
+            }
         })
         .collect()
 }

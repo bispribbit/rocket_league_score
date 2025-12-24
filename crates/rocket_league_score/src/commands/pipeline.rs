@@ -8,14 +8,14 @@
 //! 5. Run inference and check output is reasonable
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
 use database::{BallchasingReplayRepository, DownloadStatus};
-use feature_extractor::{PlayerRating, extract_frame_features};
+use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
 use replay_parser::{parse_replay, segment_by_goals};
 use replay_structs::{PlayerWithRating, RankInfo, ReplaySummary};
@@ -31,7 +31,7 @@ fn rank_to_mmr(rank_info: &RankInfo) -> Option<i32> {
 }
 
 /// Loads metadata for replays from the database.
-async fn load_metadata(limit: Option<usize>) -> Result<HashMap<String, Vec<PlayerWithRating>>> {
+async fn load_metadata(limit: Option<usize>) -> Result<HashMap<PathBuf, Vec<PlayerWithRating>>> {
     // Get all downloaded replays
     let all_ranks = database::BallchasingRank::all_ranked();
     let mut all_replays = Vec::new();
@@ -40,19 +40,22 @@ async fn load_metadata(limit: Option<usize>) -> Result<HashMap<String, Vec<Playe
         let replays =
             BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded))
                 .await?;
+        if let Some(max) = limit {
+            let remaining = max.saturating_sub(all_replays.len());
+            if remaining == 0 {
+                break;
+            }
+            if replays.len() > remaining {
+                all_replays.extend(replays.into_iter().take(remaining));
+                break;
+            }
+        }
         all_replays.extend(replays);
     }
 
-    let mut metadata_map: HashMap<String, Vec<PlayerWithRating>> = HashMap::new();
-    let mut count = 0;
+    let mut metadata_map: HashMap<PathBuf, Vec<PlayerWithRating>> = HashMap::new();
 
     for replay in all_replays {
-        if let Some(max) = limit
-            && count >= max
-        {
-            break;
-        }
-
         // Deserialize metadata
         let summary: ReplaySummary = serde_json::from_value(replay.metadata)
             .context("Failed to deserialize replay metadata")?;
@@ -117,11 +120,10 @@ async fn load_metadata(limit: Option<usize>) -> Result<HashMap<String, Vec<Playe
             }
         }
 
-        if !players.is_empty() {
-            // Use replay ID as filename (format: {id}.replay)
-            let filename = format!("{}.replay", summary.id);
-            metadata_map.insert(filename, players);
-            count += 1;
+        if let Some(filepath) = replay.file_path
+            && !players.is_empty()
+        {
+            metadata_map.insert(PathBuf::from(filepath), players);
         }
     }
 
@@ -133,17 +135,11 @@ async fn load_metadata(limit: Option<usize>) -> Result<HashMap<String, Vec<Playe
 /// # Errors
 ///
 /// Returns an error if the test fails.
-pub async fn run(replay_dir: &Path, num_replays: usize) -> Result<()> {
+pub async fn run(num_replays: usize) -> Result<()> {
     info!("=== ML Pipeline End-to-End Test ===");
-    info!(
-        replay_dir = %replay_dir.display(),
-        num_replays,
-        "Configuration"
-    );
-
     // Step 1: Load metadata
     info!("Step 1: Loading metadata...");
-    let metadata = load_metadata(Some(num_replays * 10)).await?;
+    let metadata = load_metadata(Some(num_replays)).await?;
     info!(games_with_metadata = metadata.len(), "Metadata loaded");
 
     if metadata.is_empty() {
@@ -156,21 +152,20 @@ pub async fn run(replay_dir: &Path, num_replays: usize) -> Result<()> {
     let mut replays_processed = 0;
     let mut total_frames = 0;
 
-    for (replay_name, players) in &metadata {
+    for (file_name, players) in &metadata {
         if replays_processed >= num_replays {
             break;
         }
 
-        let replay_path = replay_dir.join(replay_name);
-        if !replay_path.exists() {
+        if !file_name.exists() {
             continue;
         }
 
         // Parse replay
-        let parsed = match parse_replay(&replay_path) {
+        let parsed = match parse_replay(file_name) {
             Ok(p) => p,
             Err(e) => {
-                info!(replay = %replay_name, error = %e, "Failed to parse replay, skipping");
+                info!(replay = %file_name.display(), error = %e, "Failed to parse replay, skipping");
                 continue;
             }
         };
@@ -182,15 +177,11 @@ pub async fn run(replay_dir: &Path, num_replays: usize) -> Result<()> {
         // Convert player ratings
         let player_ratings: Vec<PlayerRating> = players
             .iter()
-            .enumerate()
-            .map(|(i, player)| PlayerRating {
-                player_id: i as u32,
+            .map(|player| PlayerRating {
+                player_name: player.player_name.clone(),
                 mmr: player.mmr,
             })
             .collect();
-
-        let avg_mmr: f32 =
-            player_ratings.iter().map(|r| r.mmr as f32).sum::<f32>() / player_ratings.len() as f32;
 
         // Segment by goals and extract features
         let segments = segment_by_goals(&parsed);
@@ -200,36 +191,23 @@ pub async fn run(replay_dir: &Path, num_replays: usize) -> Result<()> {
                 continue;
             };
 
-            // Sample every 10th frame to reduce data size for testing
-            for (i, frame) in frames.iter().enumerate() {
-                if i % 10 != 0 {
-                    continue;
-                }
-
-                let features = extract_frame_features(frame);
-                training_data.add_samples(vec![feature_extractor::TrainingSample {
-                    features,
-                    player_ratings: player_ratings.clone(),
-                    target_mmr: avg_mmr,
-                }]);
-                total_frames += 1;
-            }
+            let samples = extract_segment_samples(frames, &player_ratings);
+            training_data.add_samples(samples);
+            total_frames += frames.len();
         }
 
         replays_processed += 1;
         info!(
-            replay = %replay_name,
+            replay = %file_name.display(),
             frames = parsed.frames.len(),
-            avg_mmr = avg_mmr as i32,
             "Processed replay"
         );
     }
 
     if training_data.is_empty() {
         anyhow::bail!(
-            "No training data extracted. Found {} replays in metadata but none matched files in {}",
-            metadata.len(),
-            replay_dir.display()
+            "No training data extracted. Found {} replays in metadata but none matched files on disk",
+            metadata.len()
         );
     }
 
@@ -279,13 +257,27 @@ pub async fn run(replay_dir: &Path, num_replays: usize) -> Result<()> {
     for &idx in &sample_indices {
         if let Some(sample) = training_data.samples.get(idx) {
             let predicted = predict(&inference_model, &sample.features, &device);
-            info!(
-                sample = idx,
-                target_mmr = sample.target_mmr as i32,
-                predicted_mmr = predicted as i32,
-                diff = (predicted - sample.target_mmr).abs() as i32,
-                "Prediction"
-            );
+
+            // Evaluate against each player's target MMR
+            for (player_idx, target_mmr) in sample.target_mmr.iter().enumerate() {
+                let diff = (predicted - target_mmr).abs();
+                let team = if player_idx < feature_extractor::PLAYERS_PER_TEAM {
+                    "blue"
+                } else {
+                    "orange"
+                };
+                let slot = player_idx % feature_extractor::PLAYERS_PER_TEAM;
+
+                info!(
+                    sample = idx,
+                    player_slot = slot,
+                    team = team,
+                    target_mmr = *target_mmr as i32,
+                    predicted_mmr = predicted as i32,
+                    diff = diff as i32,
+                    "Player prediction"
+                );
+            }
         }
     }
 

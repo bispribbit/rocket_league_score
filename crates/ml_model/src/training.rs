@@ -267,10 +267,10 @@ mod tests {
         // Create some training data
         let mut data = TrainingData::new();
         for i in 0..100 {
+            let mmr = (i as f32).mul_add(10.0, 1000.0);
             data.add_samples(vec![feature_extractor::TrainingSample {
                 features: FrameFeatures::default(),
-                player_ratings: vec![],
-                target_mmr: (i as f32).mul_add(10.0, 1000.0),
+                target_mmr: vec![mmr; 6],
             }]);
         }
 

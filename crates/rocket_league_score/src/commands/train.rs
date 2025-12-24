@@ -103,9 +103,8 @@ async fn load_training_data() -> Result<TrainingData> {
         // Convert to feature extractor format
         let player_ratings: Vec<PlayerRating> = db_players
             .iter()
-            .enumerate()
-            .map(|(i, p)| PlayerRating {
-                player_id: i as u32,
+            .map(|p| PlayerRating {
+                player_name: p.player_name.clone(),
                 mmr: p.skill_rating,
             })
             .collect();

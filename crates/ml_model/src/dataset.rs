@@ -14,18 +14,30 @@ pub struct ImpactDatasetItem {
 
 impl From<&TrainingSample> for ImpactDatasetItem {
     fn from(sample: &TrainingSample) -> Self {
+        // Use average of per-player target_mmr for training (model currently predicts single value)
+        let avg_target = if sample.target_mmr.is_empty() {
+            1000.0
+        } else {
+            sample.target_mmr.iter().sum::<f32>() / sample.target_mmr.len() as f32
+        };
         Self {
             features: sample.features.features,
-            target: sample.target_mmr,
+            target: avg_target,
         }
     }
 }
 
 impl From<TrainingSample> for ImpactDatasetItem {
     fn from(sample: TrainingSample) -> Self {
+        // Use average of per-player target_mmr for training (model currently predicts single value)
+        let avg_target = if sample.target_mmr.is_empty() {
+            1000.0
+        } else {
+            sample.target_mmr.iter().sum::<f32>() / sample.target_mmr.len() as f32
+        };
         Self {
             features: sample.features.features,
-            target: sample.target_mmr,
+            target: avg_target,
         }
     }
 }
@@ -128,13 +140,11 @@ mod tests {
         let samples = vec![
             TrainingSample {
                 features: FrameFeatures::default(),
-                player_ratings: vec![],
-                target_mmr: 1000.0,
+                target_mmr: vec![1000.0; 6],
             },
             TrainingSample {
                 features: FrameFeatures::default(),
-                player_ratings: vec![],
-                target_mmr: 1500.0,
+                target_mmr: vec![1500.0; 6],
             },
         ];
 
@@ -171,8 +181,7 @@ mod tests {
     fn test_dataset_item_conversion() {
         let sample = TrainingSample {
             features: FrameFeatures::default(),
-            player_ratings: vec![],
-            target_mmr: 1234.5,
+            target_mmr: vec![1234.5; 6],
         };
 
         let item: ImpactDatasetItem = (&sample).into();
