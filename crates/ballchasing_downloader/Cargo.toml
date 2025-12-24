@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal dependencies
 database.workspace = true
+replay_structs.workspace = true
 
 # External dependencies
 anyhow.workspace = true

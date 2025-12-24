@@ -7,7 +7,6 @@ use database::{CreateModel, GameMode, ModelRepository, ReplayPlayerRepository, R
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
 use replay_parser::{parse_replay, segment_by_goals};
-use sqlx::PgPool;
 use tracing::info;
 
 // Training requires Autodiff wrapper for automatic differentiation
@@ -19,7 +18,6 @@ type TrainBackend = Autodiff<Wgpu>;
 ///
 /// Returns an error if training fails.
 pub async fn run(
-    pool: &PgPool,
     model_name: &str,
     epochs: usize,
     batch_size: usize,
@@ -35,7 +33,7 @@ pub async fn run(
 
     // Load training data from database
     info!("Loading training data...");
-    let training_data = load_training_data(pool).await?;
+    let training_data = load_training_data().await?;
 
     if training_data.is_empty() {
         anyhow::bail!("No training data found. Please ingest replays first.");
@@ -52,7 +50,7 @@ pub async fn run(
     let output = train(&mut model, &training_data, &config)?;
 
     // Save model checkpoint
-    let next_version = ModelRepository::next_version(pool, model_name).await?;
+    let next_version = ModelRepository::next_version(model_name).await?;
     let checkpoint_path = format!("models/{model_name}_{next_version}");
 
     save_checkpoint(&model, &checkpoint_path, &config)?;
@@ -68,7 +66,6 @@ pub async fn run(
     });
 
     ModelRepository::create(
-        pool,
         CreateModel {
             name: model_name.to_string(),
             version: next_version,
@@ -90,15 +87,15 @@ pub async fn run(
 }
 
 /// Loads training data from the database.
-async fn load_training_data(pool: &PgPool) -> Result<TrainingData> {
+async fn load_training_data() -> Result<TrainingData> {
     let mut data = TrainingData::new();
 
     // Get all 3v3 replays (our primary training data)
-    let replays = ReplayRepository::list_by_game_mode(pool, GameMode::Soccar3v3).await?;
+    let replays = ReplayRepository::list_by_game_mode(GameMode::Soccar3v3).await?;
 
     for replay in replays {
         // Get player ratings for this replay
-        let db_players = ReplayPlayerRepository::list_by_replay(pool, replay.id).await?;
+        let db_players = ReplayPlayerRepository::list_by_replay(replay.id).await?;
 
         if db_players.is_empty() {
             // Skip replays without player ratings

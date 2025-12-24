@@ -8,18 +8,17 @@
 //! 5. Run inference and check output is reasonable
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
+use database::{BallchasingReplayRepository, DownloadStatus};
 use feature_extractor::{PlayerRating, extract_frame_features};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
 use replay_parser::{parse_replay, segment_by_goals};
-use serde::Deserialize;
+use replay_structs::{PlayerWithRating, RankInfo, ReplaySummary};
 use tracing::info;
 
 use crate::rank::Rank;
@@ -27,92 +26,97 @@ use crate::rank::Rank;
 type TrainBackend = Autodiff<Wgpu>;
 
 /// Converts a rank ID and division to MMR using the Rank enum.
-fn rank_to_mmr(rank_id: &str, division: Option<i32>) -> Option<i32> {
-    Rank::from_rank_id(rank_id, division).map(Rank::mmr_middle)
+fn rank_to_mmr(rank_info: &RankInfo) -> Option<i32> {
+    Rank::from_rank_id(&rank_info.id, rank_info.division).map(Rank::mmr_middle)
 }
 
-/// Player rank from metadata.
-#[derive(Debug, Deserialize)]
-struct PlayerRank {
-    id: String,
-    #[expect(dead_code)]
-    tier: Option<i32>,
-    division: Option<i32>,
-}
-
-/// Player info from metadata.
-#[derive(Debug, Deserialize)]
-struct PlayerInfo {
-    name: String,
-    rank: Option<PlayerRank>,
-}
-
-/// Team info from metadata.
-#[derive(Debug, Deserialize)]
-struct TeamInfo {
-    players: Vec<PlayerInfo>,
-}
-
-/// Game metadata structure (simplified).
-#[derive(Debug, Deserialize)]
-struct GameMetadata {
-    id: String,
-    data: GameData,
-}
-
-#[derive(Debug, Deserialize)]
-struct GameData {
-    blue: TeamInfo,
-    orange: TeamInfo,
-}
-
-/// Loads metadata for replays from a JSONL file.
-fn load_metadata(
-    metadata_path: &Path,
+/// Loads metadata for replays from the database.
+async fn load_metadata(
     limit: Option<usize>,
-) -> Result<HashMap<String, Vec<(String, i32)>>> {
-    let file = File::open(metadata_path)
-        .with_context(|| format!("Failed to open metadata file: {}", metadata_path.display()))?;
-    let reader = BufReader::new(file);
+) -> Result<HashMap<String, Vec<PlayerWithRating>>> {
+    // Get all downloaded replays
+    let all_ranks = database::BallchasingRank::all_ranked();
+    let mut all_replays = Vec::new();
 
-    let mut metadata_map: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+    for rank in all_ranks {
+        let replays = BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded)).await?;
+        all_replays.extend(replays);
+    }
+
+    let mut metadata_map: HashMap<String, Vec<PlayerWithRating>> = HashMap::new();
     let mut count = 0;
 
-    for line in reader.lines() {
+    for replay in all_replays {
         if let Some(max) = limit
             && count >= max
         {
             break;
         }
 
-        let line = line?;
-        let game: GameMetadata = match serde_json::from_str(&line) {
-            Ok(g) => g,
-            Err(_) => continue, // Skip malformed lines
-        };
+        // Deserialize metadata
+        let summary: ReplaySummary = serde_json::from_value(replay.metadata)
+            .context("Failed to deserialize replay metadata")?;
 
         let mut players = Vec::new();
 
         // Extract blue team players
-        for player in &game.data.blue.players {
-            if let Some(rank) = &player.rank
-                && let Some(mmr) = rank_to_mmr(&rank.id, rank.division)
-            {
-                players.push((player.name.clone(), mmr));
+        if let Some(blue_team) = &summary.blue
+            && let Some(team_players) = &blue_team.players
+        {
+            for player in team_players {
+                let mmr = if let Some(rank) = &player.rank {
+                    rank_to_mmr(rank)
+                } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank) {
+                    // Use middle of min and max rank if player rank is null
+                    let min_mmr = rank_to_mmr(min_rank)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
+                    let max_mmr = rank_to_mmr(max_rank)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to MMR"))?;
+                    Some(i32::midpoint(min_mmr, max_mmr))
+                } else {
+                    None
+                };
+
+                if let (Some(name), Some(mmr_value)) = (player.name.as_ref(), mmr) {
+                    players.push(PlayerWithRating {
+                        player_name: name.clone(),
+                        mmr: mmr_value,
+                    });
+                }
             }
         }
 
         // Extract orange team players
-        for player in &game.data.orange.players {
-            if let Some(rank) = &player.rank
-                && let Some(mmr) = rank_to_mmr(&rank.id, rank.division)
-            {
-                players.push((player.name.clone(), mmr));
+        if let Some(orange_team) = &summary.orange
+            && let Some(team_players) = &orange_team.players
+        {
+            for player in team_players {
+                let mmr = if let Some(rank) = &player.rank {
+                    rank_to_mmr(rank)
+                } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank) {
+                    // Use middle of min and max rank if player rank is null
+                    let min_mmr = rank_to_mmr(min_rank)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
+                    let max_mmr = rank_to_mmr(max_rank)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to MMR"))?;
+                    Some(i32::midpoint(min_mmr, max_mmr))
+                } else {
+                    None
+                };
+
+                if let (Some(name), Some(mmr_value)) = (player.name.as_ref(), mmr) {
+                    players.push(PlayerWithRating {
+                        player_name: name.clone(),
+                        mmr: mmr_value,
+                    });
+                }
             }
         }
 
         if !players.is_empty() {
-            metadata_map.insert(format!("{}.replay", game.id), players);
+            // Use replay ID as filename (format: {id}.replay)
+            let filename = format!("{}.replay", summary.id);
+            metadata_map.insert(filename, players);
             count += 1;
         }
     }
@@ -125,18 +129,17 @@ fn load_metadata(
 /// # Errors
 ///
 /// Returns an error if the test fails.
-pub fn run(replay_dir: &Path, metadata_path: &Path, num_replays: usize) -> Result<()> {
+pub async fn run(replay_dir: &Path, num_replays: usize) -> Result<()> {
     info!("=== ML Pipeline End-to-End Test ===");
     info!(
         replay_dir = %replay_dir.display(),
-        metadata_path = %metadata_path.display(),
         num_replays,
         "Configuration"
     );
 
     // Step 1: Load metadata
     info!("Step 1: Loading metadata...");
-    let metadata = load_metadata(metadata_path, Some(num_replays * 10))?;
+    let metadata = load_metadata(Some(num_replays * 10)).await?;
     info!(games_with_metadata = metadata.len(), "Metadata loaded");
 
     if metadata.is_empty() {
@@ -176,9 +179,9 @@ pub fn run(replay_dir: &Path, metadata_path: &Path, num_replays: usize) -> Resul
         let player_ratings: Vec<PlayerRating> = players
             .iter()
             .enumerate()
-            .map(|(i, (_, mmr))| PlayerRating {
+            .map(|(i, player)| PlayerRating {
                 player_id: i as u32,
-                mmr: *mmr,
+                mmr: player.mmr,
             })
             .collect();
 
@@ -321,17 +324,51 @@ mod tests {
 
     #[test]
     fn test_rank_to_mmr() {
+        use replay_structs::RankInfo;
+
         // Supersonic Legend: mmr_middle = (1883 + 2000) / 2 = 1941
-        assert_eq!(rank_to_mmr("supersonic-legend", Some(1)), Some(1941));
+        let rank = RankInfo {
+            id: "supersonic-legend".to_string(),
+            tier: None,
+            division: Some(1),
+            name: None,
+        };
+        assert_eq!(rank_to_mmr(&rank), Some(1941));
 
         // Grand Champion 3 Div 1: mmr_middle = (1706 + 1739) / 2 = 1722
-        assert_eq!(rank_to_mmr("grand-champion-3", Some(1)), Some(1722));
+        let rank = RankInfo {
+            id: "grand-champion-3".to_string(),
+            tier: None,
+            division: Some(1),
+            name: None,
+        };
+        assert_eq!(rank_to_mmr(&rank), Some(1722));
+
         // Grand Champion 3 Div 2: mmr_middle = (1746 + 1780) / 2 = 1763
-        assert_eq!(rank_to_mmr("grand-champion-3", Some(2)), Some(1763));
+        let rank = RankInfo {
+            id: "grand-champion-3".to_string(),
+            tier: None,
+            division: Some(2),
+            name: None,
+        };
+        assert_eq!(rank_to_mmr(&rank), Some(1763));
+
         // Grand Champion 3 Div 3: mmr_middle = (1794 + 1809) / 2 = 1801
-        assert_eq!(rank_to_mmr("grand-champion-3", Some(3)), Some(1801));
+        let rank = RankInfo {
+            id: "grand-champion-3".to_string(),
+            tier: None,
+            division: Some(3),
+            name: None,
+        };
+        assert_eq!(rank_to_mmr(&rank), Some(1801));
 
         // Unknown rank
-        assert_eq!(rank_to_mmr("unknown-rank", Some(1)), None);
+        let rank = RankInfo {
+            id: "unknown-rank".to_string(),
+            tier: None,
+            division: Some(1),
+            name: None,
+        };
+        assert_eq!(rank_to_mmr(&rank), None);
     }
 }

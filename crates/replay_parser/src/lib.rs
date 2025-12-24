@@ -81,19 +81,6 @@ pub struct GameFrame {
     pub players: Vec<PlayerState>,
 }
 
-/// Metadata about the replay.
-#[derive(Debug, Clone, Default)]
-pub struct ReplayMetadata {
-    pub replay_id: String,
-    pub replay_name: String,
-    pub game_mode: String,
-    pub map_name: String,
-    pub team_size: u32,
-    pub team_0_score: u32,
-    pub team_1_score: u32,
-    pub num_frames: u32,
-}
-
 /// Goal event extracted from replay header.
 #[derive(Debug, Clone)]
 pub struct GoalEvent {
@@ -105,7 +92,6 @@ pub struct GoalEvent {
 /// A fully parsed replay containing metadata and all frames.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedReplay {
-    pub metadata: ReplayMetadata,
     pub frames: Vec<GameFrame>,
     pub goals: Vec<GoalEvent>,
     pub goal_frames: Vec<usize>,
@@ -152,19 +138,7 @@ pub fn parse_replay(path: &Path) -> anyhow::Result<ParsedReplay> {
     parse_boxcars_replay(&replay)
 }
 
-/// Parses a replay from raw bytes.
-///
-/// # Errors
-///
-/// Returns an error if parsing fails.
-pub fn parse_replay_bytes(data: &[u8]) -> anyhow::Result<ParsedReplay> {
-    let replay = ParserBuilder::new(data).must_parse_network_data().parse()?;
-
-    parse_boxcars_replay(&replay)
-}
-
 fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
-    let metadata = extract_metadata(replay);
     let goals = extract_goals(replay);
     let goal_frames: Vec<usize> = goals.iter().map(|goal| goal.frame).collect();
 
@@ -437,40 +411,11 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     }
 
     Ok(ParsedReplay {
-        metadata,
         frames,
         goals,
         goal_frames,
         kickoff_frames,
     })
-}
-
-fn extract_metadata(replay: &Replay) -> ReplayMetadata {
-    let mut metadata = ReplayMetadata::default();
-
-    for (key, value) in &replay.properties {
-        match (key.as_str(), value) {
-            ("Id", HeaderProp::Str(id)) => metadata.replay_id.clone_from(id),
-            ("ReplayName", HeaderProp::Str(replay_name)) => {
-                metadata.replay_name.clone_from(replay_name);
-            }
-            ("MapName", HeaderProp::Name(map_name)) => metadata.map_name.clone_from(map_name),
-            ("TeamSize", HeaderProp::Int(team_size)) => metadata.team_size = *team_size as u32,
-            ("Team0Score", HeaderProp::Int(team_0_score)) => {
-                metadata.team_0_score = *team_0_score as u32;
-            }
-            ("Team1Score", HeaderProp::Int(team_1_score)) => {
-                metadata.team_1_score = *team_1_score as u32;
-            }
-            ("NumFrames", HeaderProp::Int(num_frames)) => metadata.num_frames = *num_frames as u32,
-            ("MatchType", HeaderProp::Name(match_type)) => {
-                metadata.game_mode.clone_from(match_type);
-            }
-            _ => {}
-        }
-    }
-
-    metadata
 }
 
 fn extract_goals(replay: &Replay) -> Vec<GoalEvent> {
@@ -552,6 +497,112 @@ pub fn segment_by_goals(replay: &ParsedReplay) -> Vec<GameSegment> {
     segments
 }
 
+/// Player information extracted from metadata.
+#[derive(Debug, Clone)]
+pub struct ExtractedPlayer {
+    /// Player name
+    pub player_name: String,
+
+    /// Team (0 for blue, 1 for orange)
+    pub team: i16,
+
+    /// Skill rating (MMR)
+    pub skill_rating: i32,
+}
+
+/// Extracts player information from ballchasing metadata.
+///
+/// # Arguments
+///
+/// * `metadata` - JSON value from `ballchasing_replays.metadata` field
+/// * `rank_to_mmr` - Function to convert `RankInfo` to MMR (i32)
+///
+/// # Returns
+///
+/// Vector of player information with name, team, and skill rating.
+///
+/// If a player's rank is null, the function will use the middle of `min_rank` and `max_rank`
+/// from the metadata if available.
+///
+/// # Errors
+///
+/// Returns an error if the metadata cannot be deserialized or if rank conversion fails.
+pub fn extract_players_from_metadata<F>(
+    metadata: &serde_json::Value,
+    rank_to_mmr: F,
+) -> anyhow::Result<Vec<ExtractedPlayer>>
+where
+    F: Fn(&replay_structs::RankInfo) -> Option<i32>,
+{
+    use anyhow::Context;
+    use replay_structs::ReplaySummary;
+
+    let summary: ReplaySummary = serde_json::from_value(metadata.clone())
+        .context("Failed to deserialize replay metadata")?;
+
+    let mut players = Vec::new();
+
+    // Extract blue team players (team 0)
+    if let Some(blue_team) = &summary.blue
+        && let Some(team_players) = &blue_team.players
+    {
+        for player in team_players {
+            let mmr = if let Some(rank) = &player.rank {
+                rank_to_mmr(rank)
+            } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank)
+            {
+                // Use middle of min and max rank if player rank is null
+                let min_mmr = rank_to_mmr(min_rank)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
+                let max_mmr = rank_to_mmr(max_rank)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to MMR"))?;
+                Some(i32::midpoint(min_mmr, max_mmr))
+            } else {
+                None
+            };
+
+            if let (Some(name), Some(mmr_value)) = (player.name.as_ref(), mmr) {
+                players.push(ExtractedPlayer {
+                    player_name: name.clone(),
+                    team: 0,
+                    skill_rating: mmr_value,
+                });
+            }
+        }
+    }
+
+    // Extract orange team players (team 1)
+    if let Some(orange_team) = &summary.orange
+        && let Some(team_players) = &orange_team.players
+    {
+        for player in team_players {
+            let mmr = if let Some(rank) = &player.rank {
+                rank_to_mmr(rank)
+            } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank)
+            {
+                // Use middle of min and max rank if player rank is null
+                let min_mmr = rank_to_mmr(min_rank)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
+                let max_mmr = rank_to_mmr(max_rank)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to MMR"))?;
+                Some(i32::midpoint(min_mmr, max_mmr))
+            } else {
+                None
+            };
+
+            if let (Some(name), Some(mmr_value)) = (player.name.as_ref(), mmr) {
+                players.push(ExtractedPlayer {
+                    player_name: name.clone(),
+                    team: 1,
+                    skill_rating: mmr_value,
+                });
+            }
+        }
+    }
+
+    Ok(players)
+}
+
 #[cfg(test)]
 mod tests {
     use tracing::{info, warn};
@@ -579,21 +630,6 @@ mod tests {
         }
 
         let parsed = parse_replay(replay_path).expect("Failed to parse replay");
-
-        // Check metadata
-        info!("=== METADATA ===");
-        info!(replay_id = %parsed.metadata.replay_id, "Replay ID");
-        info!(map = %parsed.metadata.map_name, "Map");
-        info!(team_size = parsed.metadata.team_size, "Team size");
-        info!(
-            team_0_score = parsed.metadata.team_0_score,
-            team_1_score = parsed.metadata.team_1_score,
-            "Score"
-        );
-        info!(
-            header_frames = parsed.metadata.num_frames,
-            "Num frames (header)"
-        );
         info!(parsed_frames = parsed.frames.len(), "Parsed frames");
 
         assert!(parsed.frames.len() > 1000, "Expected many frames");

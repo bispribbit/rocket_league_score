@@ -13,6 +13,7 @@ database.workspace = true
 feature_extractor.workspace = true
 ml_model.workspace = true
 replay_parser.workspace = true
+replay_structs.workspace = true
 
 # External dependencies
 anyhow.workspace = true

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use database::{create_pool, run_migrations};
+use database::{initialize_pool, run_migrations};
 use rocket_league_score::commands;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -81,15 +81,11 @@ enum Commands {
     /// Run database migrations
     Migrate,
 
-    /// Run end-to-end pipeline test (no database required)
+    /// Run end-to-end pipeline test
     TestPipeline {
         /// Path to the folder containing replay files
         #[arg(short, long)]
         replay_dir: PathBuf,
-
-        /// Path to the metadata.jsonl file
-        #[arg(short, long)]
-        metadata: PathBuf,
 
         /// Number of replays to test with
         #[arg(short, long, default_value = "3")]
@@ -111,7 +107,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = create_pool(&database_url).await?;
+    initialize_pool(&database_url).await?;
 
     match cli.command {
         Commands::Ingest {
@@ -119,7 +115,7 @@ async fn main() -> Result<()> {
             game_mode,
             ratings_file,
         } => {
-            commands::ingest::run(&pool, &folder, &game_mode, ratings_file.as_deref()).await?;
+            commands::ingest::run(&folder, &game_mode, ratings_file.as_deref()).await?;
         }
         Commands::Train {
             name,
@@ -127,26 +123,24 @@ async fn main() -> Result<()> {
             batch_size,
             learning_rate,
         } => {
-            commands::train::run(&pool, &name, epochs, batch_size, learning_rate).await?;
+            commands::train::run(&name, epochs, batch_size, learning_rate).await?;
         }
         Commands::Predict {
             replay,
             model,
             version,
         } => {
-            commands::predict::run(&pool, &replay, &model, version).await?;
+            commands::predict::run(&replay, &model, version).await?;
         }
         Commands::Migrate => {
-            run_migrations(&pool).await?;
+            run_migrations().await?;
             info!("Migrations completed successfully");
         }
         Commands::TestPipeline {
             replay_dir,
-            metadata,
             num_replays,
         } => {
-            // This command doesn't need the database
-            commands::test_pipeline::run(&replay_dir, &metadata, num_replays)?;
+            commands::pipeline::run(&replay_dir, num_replays).await?;
         }
     }
 

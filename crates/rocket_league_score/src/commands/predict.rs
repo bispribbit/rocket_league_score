@@ -9,7 +9,6 @@ use database::ModelRepository;
 use feature_extractor::extract_frame_features;
 use ml_model::{load_checkpoint, predict, ImpactModel};
 use replay_parser::parse_replay;
-use sqlx::PgPool;
 use tracing::{info, warn};
 
 type Backend = Wgpu;
@@ -20,7 +19,6 @@ type Backend = Wgpu;
 ///
 /// Returns an error if prediction fails.
 pub async fn run(
-    pool: &PgPool,
     replay_path: &Path,
     model_name: &str,
     version: Option<i32>,
@@ -29,9 +27,9 @@ pub async fn run(
 
     // Load the model
     let model_record = if let Some(v) = version {
-        ModelRepository::find_by_name_version(pool, model_name, v).await?
+        ModelRepository::find_by_name_version(model_name, v).await?
     } else {
-        ModelRepository::find_latest(pool, model_name).await?
+        ModelRepository::find_latest(model_name).await?
     };
 
     let model_record = model_record.context(format!(

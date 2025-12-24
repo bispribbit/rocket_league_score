@@ -6,7 +6,7 @@
 //! Make sure to run the ingest example first to populate the database.
 
 use anyhow::Result;
-use database::create_pool;
+use database::initialize_pool;
 use rocket_league_score::commands;
 use tracing_subscriber::EnvFilter;
 
@@ -23,9 +23,9 @@ async fn main() -> Result<()> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = create_pool(&database_url).await?;
+    initialize_pool(&database_url).await?;
 
-    commands::train::run(&pool, MODEL_NAME, EPOCHS, BATCH_SIZE, LEARNING_RATE).await?;
+    commands::train::run(MODEL_NAME, EPOCHS, BATCH_SIZE, LEARNING_RATE).await?;
 
     Ok(())
 }

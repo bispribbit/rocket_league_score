@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use replay_structs::ReplaySummary;
 use reqwest::Client;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::models::ReplayListResponse;
@@ -96,6 +97,15 @@ impl BallchasingClient {
     ) -> Result<ReplayListResponse> {
         self.wait_for_rate_limit().await;
 
+        info!(
+            playlist = playlist,
+            min_rank = min_rank,
+            max_rank = max_rank,
+            count = count,
+            after = after,
+            "Listing replays",
+        );
+
         let count = count.min(200); // API max is 200
 
         let mut url = format!(
@@ -107,7 +117,7 @@ impl BallchasingClient {
             let _ = write!(url, "&after={after_id}");
         }
 
-        debug!("Fetching replays: {url}");
+        info!("Fetching replays: {url}");
 
         let response = self
             .client
@@ -128,7 +138,7 @@ impl BallchasingClient {
             .await
             .context("Failed to parse replay list response")?;
 
-        debug!("Received {} replays", data.list.len());
+        info!("Received {} replays", data.list.len());
 
         Ok(data)
     }
@@ -149,9 +159,9 @@ impl BallchasingClient {
     pub async fn download_replay(&self, replay_id: Uuid) -> Result<Vec<u8>> {
         self.wait_for_rate_limit().await;
 
-        let url = format!("{API_BASE_URL}/replays/{replay_id}/file");
+        info!("Downloading replay: {replay_id}", replay_id = replay_id,);
 
-        debug!("Downloading replay: {url}");
+        let url = format!("{API_BASE_URL}/replays/{replay_id}/file");
 
         let response = self
             .client
@@ -172,7 +182,7 @@ impl BallchasingClient {
             .await
             .context("Failed to read replay file bytes")?;
 
-        debug!("Downloaded {} bytes for replay {replay_id}", bytes.len());
+        info!("Downloaded {} bytes for replay {replay_id}", bytes.len());
 
         Ok(bytes.to_vec())
     }
@@ -200,26 +210,26 @@ impl BallchasingClient {
         rank: &str,
         target_count: usize,
         existing_ids: &std::collections::HashSet<Uuid>,
-    ) -> Result<Vec<super::models::ReplaySummary>> {
+    ) -> Result<Vec<ReplaySummary>> {
         let mut all_replays = Vec::new();
         let mut after: Option<String> = None;
         let mut consecutive_duplicates = 0;
+
+        info!(
+            "Fetching replays for rank {rank}, target count: {target_count}",
+            rank = rank,
+            target_count = target_count,
+        );
 
         while all_replays.len() < target_count {
             let batch_size = (target_count - all_replays.len()).min(200);
 
             let response = self
-                .list_replays(
-                    "ranked-standard",
-                    rank,
-                    rank,
-                    batch_size,
-                    after.as_deref(),
-                )
+                .list_replays("ranked-standard", rank, rank, batch_size, after.as_deref())
                 .await?;
 
             if response.list.is_empty() {
-                debug!("No more replays available for rank {rank}");
+                info!("No more replays available for rank {rank}");
                 break;
             }
 
@@ -235,9 +245,7 @@ impl BallchasingClient {
             if new_count == 0 {
                 consecutive_duplicates += 1;
                 if consecutive_duplicates >= 3 {
-                    warn!(
-                        "Too many consecutive duplicate batches for rank {rank}, stopping fetch"
-                    );
+                    warn!("Too many consecutive duplicate batches for rank {rank}, stopping fetch");
                     break;
                 }
             } else {
@@ -253,7 +261,7 @@ impl BallchasingClient {
 
             // Check if there are more pages
             if response.next.is_none() {
-                debug!("No more pages for rank {rank}");
+                info!("No more pages for rank {rank}");
                 break;
             }
         }
@@ -261,4 +269,3 @@ impl BallchasingClient {
         Ok(all_replays)
     }
 }
-

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use database::{
     BallchasingRank, BallchasingReplayRepository, CreateBallchasingReplay, DownloadStatus,
 };
-use sqlx::PgPool;
+use replay_structs::ReplaySummary;
 use tempfile::NamedTempFile;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
@@ -21,13 +21,12 @@ use uuid::Uuid;
 
 use crate::Config;
 use crate::api::client::BallchasingClient;
-use crate::api::models::ReplaySummary;
 
 /// Target number of replays per rank.
 const TARGET_REPLAYS_PER_RANK: usize = 1100;
 
 /// Output directory for replay files.
-const OUTPUT_DIR: &str = "replays/3v3";
+const OUTPUT_DIR: &str = "/workspace/ballchasing/replays/3v3";
 
 /// How often to log progress (in seconds).
 const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
@@ -42,12 +41,11 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 /// # Errors
 ///
 /// Returns an error if the process fails.
-pub async fn run(pool: &PgPool, config: &Config) -> Result<()> {
+pub async fn run(config: &Config) -> Result<()> {
     let client = Arc::new(BallchasingClient::new(config)?);
-    let pool = pool.clone();
 
     // Reset any stuck in-progress downloads
-    let reset_count = BallchasingReplayRepository::reset_in_progress(&pool).await?;
+    let reset_count = BallchasingReplayRepository::reset_in_progress().await?;
     if reset_count > 0 {
         info!("Reset {reset_count} in-progress downloads");
     }
@@ -56,17 +54,12 @@ pub async fn run(pool: &PgPool, config: &Config) -> Result<()> {
     fs::create_dir_all(OUTPUT_DIR).context("Failed to create output directory")?;
 
     // Run fetch and download tasks in parallel
-    let fetch_pool = pool.clone();
     let fetch_client = Arc::clone(&client);
-
-    let download_pool = pool.clone();
     let download_client = Arc::clone(&client);
 
-    let fetch_task =
-        tokio::spawn(async move { fetch_all_metadata(&fetch_pool, &fetch_client).await });
+    let fetch_task = tokio::spawn(async move { fetch_all_metadata(&fetch_client).await });
 
-    let download_task =
-        tokio::spawn(async move { download_all_replays(&download_pool, download_client).await });
+    let download_task = tokio::spawn(async move { download_all_replays(download_client).await });
 
     // Wait for both tasks
     let (fetch_result, download_result) = tokio::join!(fetch_task, download_task);
@@ -75,20 +68,20 @@ pub async fn run(pool: &PgPool, config: &Config) -> Result<()> {
     download_result??;
 
     info!("Download process complete");
-    print_stats(&pool).await?;
+    print_stats().await?;
 
     Ok(())
 }
 
 /// Fetches metadata for all ranks until we have enough replays.
-async fn fetch_all_metadata(pool: &PgPool, client: &BallchasingClient) -> Result<()> {
+async fn fetch_all_metadata(client: &BallchasingClient) -> Result<()> {
     info!("Starting metadata fetch (target: {TARGET_REPLAYS_PER_RANK} per rank)");
 
     loop {
         let mut all_complete = true;
 
         for rank in BallchasingRank::all_ranked() {
-            let current = BallchasingReplayRepository::count_by_rank(pool, rank).await?;
+            let current = BallchasingReplayRepository::count_by_rank(rank).await?;
 
             if current >= TARGET_REPLAYS_PER_RANK as i64 {
                 continue;
@@ -100,7 +93,7 @@ async fn fetch_all_metadata(pool: &PgPool, client: &BallchasingClient) -> Result
             info!("Rank {rank}: have {current}, fetching up to {needed} more");
 
             // Get existing IDs
-            let existing = BallchasingReplayRepository::list_by_rank(pool, rank, None).await?;
+            let existing = BallchasingReplayRepository::list_by_rank(rank, None).await?;
             let existing_ids: HashSet<Uuid> = existing.iter().map(|r| r.id).collect();
 
             // Fetch from API
@@ -125,7 +118,7 @@ async fn fetch_all_metadata(pool: &PgPool, client: &BallchasingClient) -> Result
             }
 
             if !to_create.is_empty() {
-                let created = BallchasingReplayRepository::create_many(pool, to_create).await?;
+                let created = BallchasingReplayRepository::create_many(to_create).await?;
                 info!("Stored {created} new replays for rank {rank}");
             }
         }
@@ -143,7 +136,7 @@ async fn fetch_all_metadata(pool: &PgPool, client: &BallchasingClient) -> Result
 }
 
 /// Downloads all pending replays.
-async fn download_all_replays(pool: &PgPool, client: Arc<BallchasingClient>) -> Result<()> {
+async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
     info!("Starting replay downloads");
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
@@ -151,21 +144,20 @@ async fn download_all_replays(pool: &PgPool, client: Arc<BallchasingClient>) -> 
 
     loop {
         // Get batch of pending downloads
-        let pending = BallchasingReplayRepository::list_pending_downloads(pool, None, 100).await?;
+        let pending = BallchasingReplayRepository::list_pending_downloads(None, 100).await?;
 
         if pending.is_empty() {
             // Check if fetch is still running by waiting a bit and checking again
             sleep(Duration::from_secs(2)).await;
 
             let still_pending =
-                BallchasingReplayRepository::list_pending_downloads(pool, None, 1).await?;
+                BallchasingReplayRepository::list_pending_downloads(None, 1).await?;
 
             if still_pending.is_empty() {
                 // Double-check all ranks are complete
                 let mut all_downloaded = true;
                 for rank in BallchasingRank::all_ranked() {
                     let not_downloaded = BallchasingReplayRepository::count_by_rank_and_status(
-                        pool,
                         rank,
                         DownloadStatus::NotDownloaded,
                     )
@@ -186,7 +178,7 @@ async fn download_all_replays(pool: &PgPool, client: Arc<BallchasingClient>) -> 
 
         // Log progress periodically
         if last_progress_log.elapsed() > Duration::from_secs(PROGRESS_LOG_INTERVAL_SECONDS) {
-            log_download_progress(pool).await?;
+            log_download_progress().await?;
             last_progress_log = std::time::Instant::now();
         }
 
@@ -195,11 +187,10 @@ async fn download_all_replays(pool: &PgPool, client: Arc<BallchasingClient>) -> 
 
         for replay in pending {
             let permit = Arc::clone(&semaphore).acquire_owned().await?;
-            let pool = pool.clone();
             let client = Arc::clone(&client);
 
             let handle = tokio::spawn(async move {
-                let result = download_single(&pool, &client, replay.id, replay.rank).await;
+                let result = download_single(&client, replay.id, replay.rank).await;
                 drop(permit);
                 result
             });
@@ -220,24 +211,23 @@ async fn download_all_replays(pool: &PgPool, client: Arc<BallchasingClient>) -> 
 
 /// Downloads a single replay file.
 async fn download_single(
-    pool: &PgPool,
     client: &BallchasingClient,
     replay_id: Uuid,
     rank: BallchasingRank,
 ) -> Result<()> {
     // Mark as in progress
-    BallchasingReplayRepository::mark_in_progress(pool, replay_id).await?;
+    BallchasingReplayRepository::mark_in_progress(replay_id).await?;
 
     // Attempt download
     match download_and_save(client, replay_id, rank).await {
         Ok(file_path) => {
-            BallchasingReplayRepository::mark_downloaded(pool, replay_id, &file_path).await?;
+            BallchasingReplayRepository::mark_downloaded(replay_id, &file_path).await?;
             debug!("Downloaded {replay_id}");
             Ok(())
         }
         Err(error) => {
             let error_msg = format!("{error:#}");
-            BallchasingReplayRepository::mark_failed(pool, replay_id, &error_msg).await?;
+            BallchasingReplayRepository::mark_failed(replay_id, &error_msg).await?;
             error!("Failed to download {replay_id}: {error}");
             Err(error)
         }
@@ -274,20 +264,16 @@ async fn download_and_save(
 }
 
 /// Logs current download progress.
-async fn log_download_progress(pool: &PgPool) -> Result<()> {
+async fn log_download_progress() -> Result<()> {
     let mut total_downloaded = 0i64;
     let mut total_pending = 0i64;
     let mut status = String::new();
 
     for rank in BallchasingRank::all_ranked() {
-        let downloaded = BallchasingReplayRepository::count_by_rank_and_status(
-            pool,
-            rank,
-            DownloadStatus::Downloaded,
-        )
-        .await?;
+        let downloaded =
+            BallchasingReplayRepository::count_by_rank_and_status(rank, DownloadStatus::Downloaded)
+                .await?;
         let pending = BallchasingReplayRepository::count_by_rank_and_status(
-            pool,
             rank,
             DownloadStatus::NotDownloaded,
         )
@@ -314,33 +300,26 @@ async fn log_download_progress(pool: &PgPool) -> Result<()> {
 }
 
 /// Prints final statistics.
-async fn print_stats(pool: &PgPool) -> Result<()> {
-    println!();
-    println!(
+async fn print_stats() -> Result<()> {
+    info!(
         "{:<20} {:>12} {:>12} {:>12}",
         "Rank", "Downloaded", "Failed", "Total"
     );
-    println!("{}", "-".repeat(58));
+    info!("{}", "-".repeat(58));
 
     let mut grand_downloaded = 0i64;
     let mut grand_failed = 0i64;
 
     for rank in BallchasingRank::all_ranked() {
-        let downloaded = BallchasingReplayRepository::count_by_rank_and_status(
-            pool,
-            rank,
-            DownloadStatus::Downloaded,
-        )
-        .await?;
-        let failed = BallchasingReplayRepository::count_by_rank_and_status(
-            pool,
-            rank,
-            DownloadStatus::Failed,
-        )
-        .await?;
+        let downloaded =
+            BallchasingReplayRepository::count_by_rank_and_status(rank, DownloadStatus::Downloaded)
+                .await?;
+        let failed =
+            BallchasingReplayRepository::count_by_rank_and_status(rank, DownloadStatus::Failed)
+                .await?;
         let total = downloaded + failed;
 
-        println!(
+        info!(
             "{:<20} {:>12} {:>12} {:>12}",
             rank.as_api_string(),
             downloaded,
@@ -352,15 +331,14 @@ async fn print_stats(pool: &PgPool) -> Result<()> {
         grand_failed += failed;
     }
 
-    println!("{}", "-".repeat(58));
-    println!(
+    info!("{}", "-".repeat(58));
+    info!(
         "{:<20} {:>12} {:>12} {:>12}",
         "TOTAL",
         grand_downloaded,
         grand_failed,
         grand_downloaded + grand_failed
     );
-    println!();
 
     Ok(())
 }

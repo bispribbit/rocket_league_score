@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use database::create_pool;
+use database::initialize_pool;
 use rocket_league_score::commands;
 use tracing_subscriber::EnvFilter;
 
@@ -22,11 +22,11 @@ async fn main() -> Result<()> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = create_pool(&database_url).await?;
+    initialize_pool(&database_url).await?;
 
     let folder = PathBuf::from(REPLAY_FOLDER);
 
-    commands::ingest::run(&pool, &folder, GAME_MODE, None).await?;
+    commands::ingest::run(&folder, GAME_MODE, None).await?;
 
     Ok(())
 }

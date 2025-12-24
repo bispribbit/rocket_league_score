@@ -5,7 +5,7 @@
 //! Requires `DATABASE_URL` environment variable to be set.
 
 use anyhow::Result;
-use database::{create_pool, run_migrations};
+use database::{initialize_pool, run_migrations};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -17,9 +17,9 @@ async fn main() -> Result<()> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = create_pool(&database_url).await?;
+    initialize_pool(&database_url).await?;
 
-    run_migrations(&pool).await?;
+    run_migrations().await?;
     info!("Migrations completed successfully");
 
     Ok(())

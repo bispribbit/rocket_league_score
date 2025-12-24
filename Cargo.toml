@@ -16,6 +16,7 @@ database = { path = "crates/database" }
 replay_parser = { path = "crates/replay_parser" }
 feature_extractor = { path = "crates/feature_extractor" }
 ml_model = { path = "crates/ml_model" }
+replay_structs = { path = "crates/replay_structs" }
 
 # External workspace dependencies
 anyhow = { version = "1.0.100" }

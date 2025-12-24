@@ -1,27 +1,25 @@
 //! Ingest command - imports replay files into the database.
 
-use std::path::Path;
 use core::str::FromStr;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use database::{
-    CreateReplay, CreateReplayPlayer, GameMode, ReplayPlayerRepository, ReplayRepository,
+    BallchasingReplayRepository, CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode,
+    ReplayPlayerRepository, ReplayRepository,
 };
-use replay_parser::parse_replay;
-use sqlx::PgPool;
+use replay_parser::{ExtractedPlayer, extract_players_from_metadata, parse_replay};
 use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::rank::Rank;
 
 /// Runs the ingest command.
 ///
 /// # Errors
 ///
 /// Returns an error if ingestion fails.
-pub async fn run(
-    pool: &PgPool,
-    folder: &Path,
-    game_mode_str: &str,
-    ratings_file: Option<&Path>,
-) -> Result<()> {
+pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>) -> Result<()> {
     info!(folder = %folder.display(), "Ingesting replays");
 
     let game_mode = GameMode::from_str(game_mode_str)
@@ -47,7 +45,7 @@ pub async fn run(
         let file_path_str = replay_path.to_string_lossy().to_string();
 
         // Check if already ingested
-        if ReplayRepository::find_by_path(pool, &file_path_str)
+        if ReplayRepository::find_by_path(&file_path_str)
             .await?
             .is_some()
         {
@@ -58,37 +56,71 @@ pub async fn run(
         // Parse the replay to validate it
         match parse_replay(replay_path) {
             Ok(_parsed) => {
-                // TODO: Extract metadata from parsed replay
-
                 // Create replay record
-                let replay = ReplayRepository::create(
-                    pool,
-                    CreateReplay {
-                        file_path: file_path_str.clone(),
-                        game_mode,
-                    },
-                )
+                let replay = ReplayRepository::create(CreateReplay {
+                    file_path: file_path_str.clone(),
+                    game_mode,
+                })
                 .await?;
 
-                // Add player ratings if available
                 let file_name = replay_path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("");
 
-                let players_for_replay: Vec<_> = ratings
-                    .iter()
-                    .filter(|r| r.replay_filename == file_name)
-                    .map(|r| CreateReplayPlayer {
-                        replay_id: replay.id,
-                        player_name: r.player_name.clone(),
-                        team: r.team,
-                        skill_rating: r.skill_rating,
-                    })
-                    .collect();
+                // Try to find ballchasing metadata
+                let mut players_for_replay: Vec<CreateReplayPlayer> = Vec::new();
+
+                // Try to match by file_path first
+                let ballchasing_replay = find_ballchasing_replay_by_path(&file_path_str).await?;
+
+                if let Some(ballchasing) = ballchasing_replay {
+                    // Extract players from ballchasing metadata
+                    match extract_players_from_metadata(&ballchasing.metadata, |rank_info| {
+                        Rank::from_rank_id(&rank_info.id, rank_info.division).map(Rank::mmr_middle)
+                    }) {
+                        Ok(extracted_players) => {
+                            players_for_replay = extracted_players
+                                .into_iter()
+                                .map(|p: ExtractedPlayer| CreateReplayPlayer {
+                                    replay_id: replay.id,
+                                    player_name: p.player_name,
+                                    team: p.team,
+                                    skill_rating: p.skill_rating,
+                                })
+                                .collect();
+                            info!(
+                                replay_id = %replay.id,
+                                players = players_for_replay.len(),
+                                "Extracted players from ballchasing metadata"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                replay_id = %replay.id,
+                                error = %e,
+                                "Failed to extract players from ballchasing metadata"
+                            );
+                        }
+                    }
+                }
+
+                // Fall back to CSV ratings if no ballchasing metadata found
+                if players_for_replay.is_empty() {
+                    players_for_replay = ratings
+                        .iter()
+                        .filter(|r| r.replay_filename == file_name)
+                        .map(|r| CreateReplayPlayer {
+                            replay_id: replay.id,
+                            player_name: r.player_name.clone(),
+                            team: r.team,
+                            skill_rating: r.skill_rating,
+                        })
+                        .collect();
+                }
 
                 if !players_for_replay.is_empty() {
-                    ReplayPlayerRepository::create_many(pool, players_for_replay).await?;
+                    ReplayPlayerRepository::create_many(players_for_replay).await?;
                 }
 
                 ingested += 1;
@@ -150,4 +182,39 @@ fn find_replay_files(folder: &Path) -> Result<Vec<std::path::PathBuf>> {
     }
 
     Ok(files)
+}
+
+/// Finds a ballchasing replay by file path.
+///
+/// Tries to match by `file_path` field first, then by extracting UUID from filename.
+async fn find_ballchasing_replay_by_path(
+    file_path: &str,
+) -> Result<Option<database::BallchasingReplay>> {
+    // Try to find by file_path field
+    let all_ranks = database::BallchasingRank::all_ranked();
+    for rank in all_ranks {
+        let replays =
+            BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded))
+                .await?;
+
+        for replay in replays {
+            if let Some(replay_file_path) = &replay.file_path
+                && replay_file_path == file_path
+            {
+                return Ok(Some(replay));
+            }
+        }
+    }
+
+    // Try to extract UUID from filename and match by ID
+    if let Some(file_name) = std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        && let Ok(replay_id) = Uuid::parse_str(file_name)
+        && let Some(replay) = BallchasingReplayRepository::find_by_id(replay_id).await?
+    {
+        return Ok(Some(replay));
+    }
+
+    Ok(None)
 }

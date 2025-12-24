@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use database::create_pool;
+use database::initialize_pool;
 use rocket_league_score::commands;
 use tracing_subscriber::EnvFilter;
 
@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL")?;
-    let pool = create_pool(&database_url).await?;
+    initialize_pool(&database_url).await?;
 
     // Find the first replay in the folder
     let replay_folder = PathBuf::from(REPLAY_FOLDER);
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(replay = %replay_path.display(), "Using replay");
 
-    commands::predict::run(&pool, &replay_path, MODEL_NAME, None).await?;
+    commands::predict::run(&replay_path, MODEL_NAME, None).await?;
 
     Ok(())
 }

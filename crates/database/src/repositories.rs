@@ -1,8 +1,8 @@
 //! Repository functions for database operations.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::get_pool;
 use crate::models::{
     BallchasingRank, BallchasingRankStats, BallchasingReplay, CreateBallchasingReplay, CreateModel,
     CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode, Model, Replay, ReplayPlayer,
@@ -17,8 +17,9 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn create(pool: &PgPool, input: CreateReplay) -> Result<Replay, sqlx::Error> {
+    pub async fn create(input: CreateReplay) -> Result<Replay, sqlx::Error> {
         let id = Uuid::new_v4();
+        let pool = get_pool();
 
         sqlx::query_as!(
             Replay,
@@ -40,10 +41,8 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn find_by_path(
-        pool: &PgPool,
-        file_path: &str,
-    ) -> Result<Option<Replay>, sqlx::Error> {
+    pub async fn find_by_path(file_path: &str) -> Result<Option<Replay>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             Replay,
             r#"
@@ -62,7 +61,8 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Replay>, sqlx::Error> {
+    pub async fn find_by_id(id: Uuid) -> Result<Option<Replay>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             Replay,
             r#"
@@ -81,10 +81,8 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn list_by_game_mode(
-        pool: &PgPool,
-        game_mode: GameMode,
-    ) -> Result<Vec<Replay>, sqlx::Error> {
+    pub async fn list_by_game_mode(game_mode: GameMode) -> Result<Vec<Replay>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             Replay,
             r#"
@@ -104,7 +102,8 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn mark_processed(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn mark_processed(id: Uuid) -> Result<(), sqlx::Error> {
+        let pool = get_pool();
         sqlx::query!(
             r#"
             UPDATE replays
@@ -124,10 +123,8 @@ impl ReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn count_by_game_mode(
-        pool: &PgPool,
-        game_mode: GameMode,
-    ) -> Result<i64, sqlx::Error> {
+    pub async fn count_by_game_mode(game_mode: GameMode) -> Result<i64, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"
             SELECT COUNT(*) as "count!" FROM replays WHERE game_mode = $1
@@ -150,11 +147,9 @@ impl ReplayPlayerRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn create(
-        pool: &PgPool,
-        input: CreateReplayPlayer,
-    ) -> Result<ReplayPlayer, sqlx::Error> {
+    pub async fn create(input: CreateReplayPlayer) -> Result<ReplayPlayer, sqlx::Error> {
         let id = Uuid::new_v4();
+        let pool = get_pool();
 
         sqlx::query_as!(
             ReplayPlayer,
@@ -179,13 +174,12 @@ impl ReplayPlayerRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn create_many(
-        pool: &PgPool,
         inputs: Vec<CreateReplayPlayer>,
     ) -> Result<Vec<ReplayPlayer>, sqlx::Error> {
         let mut players = Vec::with_capacity(inputs.len());
 
         for input in inputs {
-            let player = Self::create(pool, input).await?;
+            let player = Self::create(input).await?;
             players.push(player);
         }
 
@@ -197,10 +191,8 @@ impl ReplayPlayerRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn list_by_replay(
-        pool: &PgPool,
-        replay_id: Uuid,
-    ) -> Result<Vec<ReplayPlayer>, sqlx::Error> {
+    pub async fn list_by_replay(replay_id: Uuid) -> Result<Vec<ReplayPlayer>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             ReplayPlayer,
             r#"
@@ -220,10 +212,8 @@ impl ReplayPlayerRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn average_rating_for_replay(
-        pool: &PgPool,
-        replay_id: Uuid,
-    ) -> Result<Option<f64>, sqlx::Error> {
+    pub async fn average_rating_for_replay(replay_id: Uuid) -> Result<Option<f64>, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"
             SELECT AVG(skill_rating::float) as average FROM replay_players WHERE replay_id = $1
@@ -246,8 +236,9 @@ impl ModelRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn create(pool: &PgPool, input: CreateModel) -> Result<Model, sqlx::Error> {
+    pub async fn create(input: CreateModel) -> Result<Model, sqlx::Error> {
         let id = Uuid::new_v4();
+        let pool = get_pool();
 
         sqlx::query_as!(
             Model,
@@ -273,10 +264,10 @@ impl ModelRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn find_by_name_version(
-        pool: &PgPool,
         name: &str,
         version: i32,
     ) -> Result<Option<Model>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             Model,
             r#"
@@ -296,7 +287,8 @@ impl ModelRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn find_latest(pool: &PgPool, name: &str) -> Result<Option<Model>, sqlx::Error> {
+    pub async fn find_latest(name: &str) -> Result<Option<Model>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             Model,
             r#"
@@ -317,7 +309,8 @@ impl ModelRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn next_version(pool: &PgPool, name: &str) -> Result<i32, sqlx::Error> {
+    pub async fn next_version(name: &str) -> Result<i32, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"
             SELECT MAX(version) as max_version FROM models WHERE name = $1
@@ -335,7 +328,8 @@ impl ModelRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn list_versions(pool: &PgPool, name: &str) -> Result<Vec<Model>, sqlx::Error> {
+    pub async fn list_versions(name: &str) -> Result<Vec<Model>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             Model,
             r#"
@@ -364,10 +358,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn create(
-        pool: &PgPool,
-        input: CreateBallchasingReplay,
-    ) -> Result<BallchasingReplay, sqlx::Error> {
+    pub async fn create(input: CreateBallchasingReplay) -> Result<BallchasingReplay, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             BallchasingReplay,
             r#"
@@ -388,10 +380,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn create_many(
-        pool: &PgPool,
-        inputs: Vec<CreateBallchasingReplay>,
-    ) -> Result<usize, sqlx::Error> {
+    pub async fn create_many(inputs: Vec<CreateBallchasingReplay>) -> Result<usize, sqlx::Error> {
+        let pool = get_pool();
         let mut created = 0;
 
         for input in inputs {
@@ -421,7 +411,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn exists(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn exists(id: Uuid) -> Result<bool, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"SELECT EXISTS(SELECT 1 FROM ballchasing_replays WHERE id = $1) as "exists!""#,
             id
@@ -437,10 +428,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn find_by_id(
-        pool: &PgPool,
-        id: Uuid,
-    ) -> Result<Option<BallchasingReplay>, sqlx::Error> {
+    pub async fn find_by_id(id: Uuid) -> Result<Option<BallchasingReplay>, sqlx::Error> {
+        let pool = get_pool();
         sqlx::query_as!(
             BallchasingReplay,
             r#"
@@ -460,10 +449,10 @@ impl BallchasingReplayRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn list_by_rank(
-        pool: &PgPool,
         rank: BallchasingRank,
         status: Option<DownloadStatus>,
     ) -> Result<Vec<BallchasingReplay>, sqlx::Error> {
+        let pool = get_pool();
         match status {
             Some(status) => {
                 sqlx::query_as!(
@@ -503,10 +492,10 @@ impl BallchasingReplayRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn list_pending_downloads(
-        pool: &PgPool,
         rank: Option<BallchasingRank>,
         limit: i64,
     ) -> Result<Vec<BallchasingReplay>, sqlx::Error> {
+        let pool = get_pool();
         match rank {
             Some(rank) => {
                 sqlx::query_as!(
@@ -548,12 +537,12 @@ impl BallchasingReplayRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn update_status(
-        pool: &PgPool,
         id: Uuid,
         status: DownloadStatus,
         file_path: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        let pool = get_pool();
         sqlx::query!(
             r#"
             UPDATE ballchasing_replays
@@ -580,8 +569,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn mark_in_progress(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
-        Self::update_status(pool, id, DownloadStatus::InProgress, None, None).await
+    pub async fn mark_in_progress(id: Uuid) -> Result<(), sqlx::Error> {
+        Self::update_status(id, DownloadStatus::InProgress, None, None).await
     }
 
     /// Marks a replay as downloaded with its file path.
@@ -589,12 +578,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn mark_downloaded(
-        pool: &PgPool,
-        id: Uuid,
-        file_path: &str,
-    ) -> Result<(), sqlx::Error> {
-        Self::update_status(pool, id, DownloadStatus::Downloaded, Some(file_path), None).await
+    pub async fn mark_downloaded(id: Uuid, file_path: &str) -> Result<(), sqlx::Error> {
+        Self::update_status(id, DownloadStatus::Downloaded, Some(file_path), None).await
     }
 
     /// Marks a replay as failed with an error message.
@@ -602,12 +587,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn mark_failed(
-        pool: &PgPool,
-        id: Uuid,
-        error_message: &str,
-    ) -> Result<(), sqlx::Error> {
-        Self::update_status(pool, id, DownloadStatus::Failed, None, Some(error_message)).await
+    pub async fn mark_failed(id: Uuid, error_message: &str) -> Result<(), sqlx::Error> {
+        Self::update_status(id, DownloadStatus::Failed, None, Some(error_message)).await
     }
 
     /// Resets failed downloads back to `not_downloaded` status.
@@ -615,7 +596,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn reset_failed(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    pub async fn reset_failed() -> Result<u64, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"
             UPDATE ballchasing_replays
@@ -638,7 +620,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn reset_in_progress(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    pub async fn reset_in_progress() -> Result<u64, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"
             UPDATE ballchasing_replays
@@ -659,7 +642,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn count_by_rank(pool: &PgPool, rank: BallchasingRank) -> Result<i64, sqlx::Error> {
+    pub async fn count_by_rank(rank: BallchasingRank) -> Result<i64, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"SELECT COUNT(*) as "count!" FROM ballchasing_replays WHERE rank = $1"#,
             rank as BallchasingRank
@@ -676,10 +660,10 @@ impl BallchasingReplayRepository {
     ///
     /// Returns an error if the database operation fails.
     pub async fn count_by_rank_and_status(
-        pool: &PgPool,
         rank: BallchasingRank,
         status: DownloadStatus,
     ) -> Result<i64, sqlx::Error> {
+        let pool = get_pool();
         let result = sqlx::query!(
             r#"SELECT COUNT(*) as "count!" FROM ballchasing_replays WHERE rank = $1 AND download_status = $2"#,
             rank as BallchasingRank,
@@ -696,7 +680,8 @@ impl BallchasingReplayRepository {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn get_stats(pool: &PgPool) -> Result<Vec<BallchasingRankStats>, sqlx::Error> {
+    pub async fn get_stats() -> Result<Vec<BallchasingRankStats>, sqlx::Error> {
+        let pool = get_pool();
         let rows = sqlx::query!(
             r#"
             SELECT 
