@@ -3,11 +3,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use burn::backend::wgpu::WgpuDevice;
 use burn::backend::Wgpu;
+use burn::backend::wgpu::WgpuDevice;
 use database::ModelRepository;
 use feature_extractor::extract_frame_features;
-use ml_model::{load_checkpoint, predict, ImpactModel};
+use ml_model::{ImpactModel, load_checkpoint, predict};
 use replay_parser::parse_replay;
 use tracing::{info, warn};
 
@@ -18,11 +18,7 @@ type Backend = Wgpu;
 /// # Errors
 ///
 /// Returns an error if prediction fails.
-pub async fn run(
-    replay_path: &Path,
-    model_name: &str,
-    version: Option<i32>,
-) -> Result<()> {
+pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> Result<()> {
     info!(replay = %replay_path.display(), "Predicting impact scores");
 
     // Load the model
@@ -97,4 +93,3 @@ const fn interpret_score(score: f32) -> &'static str {
         _ => "Supersonic Legend",
     }
 }
-

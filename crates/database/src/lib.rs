@@ -19,7 +19,9 @@ static POOL_INNER: std::sync::OnceLock<PgPool> = std::sync::OnceLock::new();
 
 /// Global database connection pool.
 static POOL: LazyLock<&'static PgPool> = LazyLock::new(|| {
-    POOL_INNER.get().expect("Database pool not initialized. Call initialize_pool() before using database functions.")
+    POOL_INNER.get().expect(
+        "Database pool not initialized. Call initialize_pool() before using database functions.",
+    )
 });
 
 /// Initializes the global database connection pool.
@@ -32,11 +34,13 @@ pub async fn initialize_pool(database_url: &str) -> Result<(), sqlx::Error> {
         .max_connections(5)
         .connect(database_url)
         .await?;
-    
+
     if POOL_INNER.set(pool).is_err() {
-        return Err(sqlx::Error::Configuration("Pool already initialized".into()));
+        return Err(sqlx::Error::Configuration(
+            "Pool already initialized".into(),
+        ));
     }
-    
+
     Ok(())
 }
 

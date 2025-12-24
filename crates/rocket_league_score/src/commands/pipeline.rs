@@ -31,15 +31,15 @@ fn rank_to_mmr(rank_info: &RankInfo) -> Option<i32> {
 }
 
 /// Loads metadata for replays from the database.
-async fn load_metadata(
-    limit: Option<usize>,
-) -> Result<HashMap<String, Vec<PlayerWithRating>>> {
+async fn load_metadata(limit: Option<usize>) -> Result<HashMap<String, Vec<PlayerWithRating>>> {
     // Get all downloaded replays
     let all_ranks = database::BallchasingRank::all_ranked();
     let mut all_replays = Vec::new();
 
     for rank in all_ranks {
-        let replays = BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded)).await?;
+        let replays =
+            BallchasingReplayRepository::list_by_rank(rank, Some(DownloadStatus::Downloaded))
+                .await?;
         all_replays.extend(replays);
     }
 
@@ -66,7 +66,9 @@ async fn load_metadata(
             for player in team_players {
                 let mmr = if let Some(rank) = &player.rank {
                     rank_to_mmr(rank)
-                } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank) {
+                } else if let (Some(min_rank), Some(max_rank)) =
+                    (&summary.min_rank, &summary.max_rank)
+                {
                     // Use middle of min and max rank if player rank is null
                     let min_mmr = rank_to_mmr(min_rank)
                         .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
@@ -93,7 +95,9 @@ async fn load_metadata(
             for player in team_players {
                 let mmr = if let Some(rank) = &player.rank {
                     rank_to_mmr(rank)
-                } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank) {
+                } else if let (Some(min_rank), Some(max_rank)) =
+                    (&summary.min_rank, &summary.max_rank)
+                {
                     // Use middle of min and max rank if player rank is null
                     let min_mmr = rank_to_mmr(min_rank)
                         .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;

@@ -1,7 +1,8 @@
-# rust-setup
-A depot to start a Rust monorepo with good defaults.
+# Rocket League MMR
+Are you a champion stuck in plat? This project wants to find it out.
+It analyze your replay and based on how you played, tells you what MMR skill level you played at.
 
-The settings are heavily inspired by https://github.com/legion-labs/legion/tree/main
+This is calculated based on a machine learning model tranined on thousands of replays of all ranks.
 
 # License
 This repository is free, open source and permissively licensed. All code in this repository is dual-licensed under either:

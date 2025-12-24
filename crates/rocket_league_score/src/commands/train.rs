@@ -65,15 +65,13 @@ pub async fn run(
         "hidden_size_2": model_config.hidden_size_2,
     });
 
-    ModelRepository::create(
-        CreateModel {
-            name: model_name.to_string(),
-            version: next_version,
-            checkpoint_path: checkpoint_path.clone(),
-            training_config: Some(training_config_json),
-            metrics: None, // TODO: Add training metrics
-        },
-    )
+    ModelRepository::create(CreateModel {
+        name: model_name.to_string(),
+        version: next_version,
+        checkpoint_path: checkpoint_path.clone(),
+        training_config: Some(training_config_json),
+        metrics: None, // TODO: Add training metrics
+    })
     .await?;
 
     info!(

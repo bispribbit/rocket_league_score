@@ -217,4 +217,3 @@ pub struct PlayerWithRating {
     /// Player MMR
     pub mmr: i32,
 }
-

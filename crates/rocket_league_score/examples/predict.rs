@@ -52,4 +52,3 @@ fn find_first_replay(folder: &std::path::Path) -> Result<PathBuf> {
 
     anyhow::bail!("No .replay files found in {}", folder.display())
 }
-
