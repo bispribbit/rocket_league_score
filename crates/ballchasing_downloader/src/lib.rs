@@ -9,7 +9,6 @@
 )]
 
 pub mod api;
-pub mod config;
 mod downloader;
 
 pub use api::client::BallchasingClient;

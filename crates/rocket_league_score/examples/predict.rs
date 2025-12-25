@@ -12,7 +12,7 @@ use database::initialize_pool;
 use rocket_league_score::commands;
 use tracing_subscriber::EnvFilter;
 
-const REPLAY_FOLDER: &str = "/workspace/replays/3v3";
+const REPLAY_FOLDER: &str = "C:/GitHub/rocket_league_score/workspace/replays/3v3";
 const MODEL_NAME: &str = "impact_model";
 
 #[tokio::main]

@@ -3,15 +3,15 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use burn::backend::Wgpu;
-use burn::backend::wgpu::WgpuDevice;
+use burn::backend::Cuda;
+use burn::backend::cuda::CudaDevice;
 use database;
 use feature_extractor::extract_frame_features;
 use ml_model::{ImpactModel, load_checkpoint, predict};
 use replay_parser::parse_replay;
 use tracing::{info, warn};
 
-type Backend = Wgpu;
+type Backend = Cuda;
 
 /// Runs the predict command.
 ///
@@ -39,7 +39,7 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
     );
 
     // Load model weights
-    let device = WgpuDevice::default();
+    let device = CudaDevice::default();
     let model: ImpactModel<Backend> = load_checkpoint(&model_record.checkpoint_path, &device)?;
 
     // Parse the replay

@@ -5,6 +5,8 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use config::CONFIG;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -14,7 +16,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::models::ReplayListResponse;
-use crate::Config;
 
 /// Rate limit: 2 requests per second
 const RATE_LIMIT_PER_SECOND: u32 = 2;
@@ -30,7 +31,6 @@ type RateLimiterType = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 /// Rate-limited client for ballchasing.com API.
 pub struct BallchasingClient {
     client: Client,
-    api_key: String,
     per_second_limiter: Arc<RateLimiterType>,
     per_hour_limiter: Arc<RateLimiterType>,
 }
@@ -41,7 +41,7 @@ impl BallchasingClient {
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be created.
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -61,7 +61,6 @@ impl BallchasingClient {
 
         Ok(Self {
             client,
-            api_key: config.ballchasing_api_key.clone(),
             per_second_limiter,
             per_hour_limiter,
         })
@@ -122,7 +121,7 @@ impl BallchasingClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", &self.api_key)
+            .header("Authorization", &CONFIG.ballchasing_api_key)
             .send()
             .await
             .context("Failed to send request to ballchasing API")?;
@@ -156,7 +155,7 @@ impl BallchasingClient {
     /// # Errors
     ///
     /// Returns an error if the download fails.
-    pub async fn download_replay(&self, replay_id: Uuid) -> Result<Vec<u8>> {
+    pub async fn download_replay(&self, replay_id: Uuid) -> Result<Bytes> {
         self.wait_for_rate_limit().await;
 
         info!("Downloading replay: {replay_id}", replay_id = replay_id,);
@@ -166,7 +165,7 @@ impl BallchasingClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", &self.api_key)
+            .header("Authorization", &CONFIG.ballchasing_api_key)
             .send()
             .await
             .context("Failed to send download request")?;
@@ -184,7 +183,7 @@ impl BallchasingClient {
 
         info!("Downloaded {} bytes for replay {replay_id}", bytes.len());
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Fetches replays for a specific rank, handling pagination.

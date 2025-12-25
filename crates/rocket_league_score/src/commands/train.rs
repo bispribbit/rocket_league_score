@@ -1,16 +1,16 @@
 //! Train command - trains the ML model on ingested replays.
 
 use anyhow::Result;
-use burn::backend::wgpu::WgpuDevice;
-use burn::backend::{Autodiff, Wgpu};
-use database::{CreateModel, GameMode};
+use burn::backend::cuda::CudaDevice;
+use burn::backend::{Autodiff, Cuda};
+use database::{CreateModel, GameMode, read_from_object_store};
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
-use replay_parser::{parse_replay, segment_by_goals};
+use replay_parser::{parse_replay_from_bytes, segment_by_goals};
 use tracing::info;
 
 // Training requires Autodiff wrapper for automatic differentiation
-type TrainBackend = Autodiff<Wgpu>;
+type TrainBackend = Autodiff<Cuda>;
 
 /// Runs the train command.
 ///
@@ -42,7 +42,7 @@ pub async fn run(
     info!(samples = training_data.len(), "Loaded training samples");
 
     // Create model with Autodiff backend for training
-    let device = WgpuDevice::default();
+    let device = CudaDevice::default();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 
     // Train model
@@ -109,8 +109,13 @@ async fn load_training_data() -> Result<TrainingData> {
             })
             .collect();
 
-        // Parse the replay file
-        let Ok(parsed) = parse_replay(std::path::Path::new(&replay.file_path)) else {
+        // Read from object_store as bytes
+        let Ok(replay_data) = read_from_object_store(&replay.file_path).await else {
+            continue;
+        };
+
+        // Parse the replay from bytes
+        let Ok(parsed) = parse_replay_from_bytes(&replay_data) else {
             continue;
         };
 

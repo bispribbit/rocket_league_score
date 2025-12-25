@@ -11,19 +11,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use burn::backend::wgpu::WgpuDevice;
-use burn::backend::{Autodiff, Wgpu};
+use burn::backend::cuda::CudaDevice;
+use burn::backend::{Autodiff, Cuda};
 use burn::module::AutodiffModule;
-use database::DownloadStatus;
+use database::{DownloadStatus, read_from_object_store};
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
-use replay_parser::{parse_replay, segment_by_goals};
+use replay_parser::{parse_replay_from_bytes, segment_by_goals};
 use replay_structs::{PlayerWithRating, RankInfo, ReplaySummary};
 use tracing::info;
 
 use crate::rank::Rank;
 
-type TrainBackend = Autodiff<Wgpu>;
+type TrainBackend = Autodiff<Cuda>;
 
 /// Converts a rank ID and division to MMR using the Rank enum.
 fn rank_to_mmr(rank_info: &RankInfo) -> Option<i32> {
@@ -120,10 +120,11 @@ async fn load_metadata(limit: Option<usize>) -> Result<HashMap<PathBuf, Vec<Play
             }
         }
 
-        if let Some(filepath) = replay.file_path
+        if let Some(relative_path) = replay.file_path
             && !players.is_empty()
         {
-            metadata_map.insert(PathBuf::from(filepath), players);
+            // Store relative path - we'll resolve it when reading
+            metadata_map.insert(PathBuf::from(relative_path), players);
         }
     }
 
@@ -152,20 +153,30 @@ pub async fn run(num_replays: usize) -> Result<()> {
     let mut replays_processed = 0;
     let mut total_frames = 0;
 
-    for (file_name, players) in &metadata {
+    for (relative_path, players) in &metadata {
         if replays_processed >= num_replays {
             break;
         }
 
-        if !file_name.exists() {
-            continue;
-        }
+        // Read from object_store as bytes
+        let replay_data =
+            match read_from_object_store(relative_path.to_string_lossy().as_ref()).await {
+                Ok(data) => data,
+                Err(e) => {
+                    info!(
+                        replay = %relative_path.display(),
+                        error = %e,
+                        "Failed to read replay from object_store, skipping"
+                    );
+                    continue;
+                }
+            };
 
-        // Parse replay
-        let parsed = match parse_replay(file_name) {
+        // Parse replay from bytes
+        let parsed = match parse_replay_from_bytes(&replay_data) {
             Ok(p) => p,
             Err(e) => {
-                info!(replay = %file_name.display(), error = %e, "Failed to parse replay, skipping");
+                info!(replay = %relative_path.display(), error = %e, "Failed to parse replay, skipping");
                 continue;
             }
         };
@@ -198,7 +209,7 @@ pub async fn run(num_replays: usize) -> Result<()> {
 
         replays_processed += 1;
         info!(
-            replay = %file_name.display(),
+            replay = %relative_path.display(),
             frames = parsed.frames.len(),
             "Processed replay"
         );
@@ -220,7 +231,7 @@ pub async fn run(num_replays: usize) -> Result<()> {
 
     // Step 3: Create model
     info!("Step 3: Creating model...");
-    let device = WgpuDevice::default();
+    let device = CudaDevice::default();
     let model_config = ModelConfig::new();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 

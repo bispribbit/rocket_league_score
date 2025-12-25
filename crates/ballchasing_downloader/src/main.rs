@@ -3,7 +3,7 @@
 //! Downloads Rocket League replays from ballchasing.com organized by rank.
 
 use anyhow::Result;
-use ballchasing_downloader::Config;
+use config::CONFIG;
 use database::{initialize_pool, run_migrations};
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -12,9 +12,6 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file
-    dotenvy::dotenv().ok();
-
     // Initialize logging with console and file output
     // Ensure directory exists
     std::fs::create_dir_all("/workspace/target/logs").expect("Failed to create .cursor directory");
@@ -45,17 +42,14 @@ async fn main() -> Result<()> {
 
     info!("Ballchasing replay downloader starting");
 
-    // Load config
-    let config = Config::from_env()?;
-
     // Connect to database
-    initialize_pool(&config.database_url).await?;
+    initialize_pool(&CONFIG.database_url).await?;
 
     // Run migrations
     run_migrations().await?;
 
     // Run the downloader
-    ballchasing_downloader::run(&config).await?;
+    ballchasing_downloader::run().await?;
 
     Ok(())
 }

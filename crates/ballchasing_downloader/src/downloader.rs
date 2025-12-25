@@ -3,30 +3,24 @@
 use core::fmt::Write as _;
 use core::time::Duration;
 use std::collections::HashSet;
-use std::fs;
-use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use database::{
-    BallchasingRank, CreateBallchasingReplay, DownloadStatus,
-};
+use bytes::Bytes;
+use config::OBJECT_STORE;
+use database::{BallchasingRank, CreateBallchasingReplay, DownloadStatus};
+use object_store::ObjectStoreExt;
+use object_store::path::Path as ObjectStorePath;
 use replay_structs::ReplaySummary;
-use tempfile::NamedTempFile;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::Config;
 use crate::api::client::BallchasingClient;
 
 /// Target number of replays per rank.
 const TARGET_REPLAYS_PER_RANK: usize = 1100;
-
-/// Output directory for replay files.
-const OUTPUT_DIR: &str = "/workspace/ballchasing/replays/3v3";
 
 /// How often to log progress (in seconds).
 const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
@@ -41,17 +35,14 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 /// # Errors
 ///
 /// Returns an error if the process fails.
-pub async fn run(config: &Config) -> Result<()> {
-    let client = Arc::new(BallchasingClient::new(config)?);
+pub async fn run() -> Result<()> {
+    let client = Arc::new(BallchasingClient::new()?);
 
     // Reset any stuck in-progress downloads
     let reset_count = database::reset_in_progress_ballchasing_downloads().await?;
     if reset_count > 0 {
         info!("Reset {reset_count} in-progress downloads");
     }
-
-    // Create output directory
-    fs::create_dir_all(OUTPUT_DIR).context("Failed to create output directory")?;
 
     // Run fetch and download tasks in parallel
     let fetch_client = Arc::clone(&client);
@@ -150,8 +141,7 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
             // Check if fetch is still running by waiting a bit and checking again
             sleep(Duration::from_secs(2)).await;
 
-            let still_pending =
-                database::list_pending_ballchasing_downloads(None, 1).await?;
+            let still_pending = database::list_pending_ballchasing_downloads(None, 1).await?;
 
             if still_pending.is_empty() {
                 // Double-check all ranks are complete
@@ -220,8 +210,8 @@ async fn download_single(
 
     // Attempt download
     match download_and_save(client, replay_id, rank).await {
-        Ok(file_path) => {
-            database::mark_ballchasing_replay_downloaded(replay_id, &file_path).await?;
+        Ok(relative_path) => {
+            database::mark_ballchasing_replay_downloaded(replay_id, &relative_path).await?;
             debug!("Downloaded {replay_id}");
             Ok(())
         }
@@ -235,32 +225,34 @@ async fn download_single(
 }
 
 /// Downloads replay data and saves to file.
+///
+/// Returns a relative path from the base data directory.
 async fn download_and_save(
     client: &BallchasingClient,
     replay_id: Uuid,
     rank: BallchasingRank,
 ) -> Result<String> {
-    let data: Vec<u8> = client.download_replay(replay_id).await?;
+    let data: Bytes = client.download_replay(replay_id).await?;
 
     if data.is_empty() {
         anyhow::bail!("Downloaded replay is empty");
     }
 
-    let rank_dir = Path::new(OUTPUT_DIR).join(rank.as_folder_name());
-    fs::create_dir_all(&rank_dir).context("Failed to create rank directory")?;
+    // Build object store path using forward slashes (object_store handles normalization)
+    let object_path = ObjectStorePath::from(format!(
+        "replays/3v3/{}/{}.replay",
+        rank.as_folder_name(),
+        replay_id
+    ));
 
-    let mut temp_file = NamedTempFile::new_in(&rank_dir).context("Failed to create temp file")?;
-    temp_file
-        .write_all(&data)
-        .context("Failed to write replay data")?;
-    temp_file.flush().context("Failed to flush temp file")?;
+    // Write to object store
+    OBJECT_STORE
+        .put(&object_path, data.into())
+        .await
+        .context("Failed to write replay to object store")?;
 
-    let final_path = rank_dir.join(format!("{replay_id}.replay"));
-    temp_file
-        .persist(&final_path)
-        .context("Failed to persist temp file")?;
-
-    Ok(final_path.to_string_lossy().into_owned())
+    // Return relative path (object_store paths use forward slashes)
+    Ok(object_path.to_string())
 }
 
 /// Logs current download progress.
@@ -270,9 +262,11 @@ async fn log_download_progress() -> Result<()> {
     let mut status = String::new();
 
     for rank in BallchasingRank::all_ranked() {
-        let downloaded =
-            database::count_ballchasing_replays_by_rank_and_status(rank, DownloadStatus::Downloaded)
-                .await?;
+        let downloaded = database::count_ballchasing_replays_by_rank_and_status(
+            rank,
+            DownloadStatus::Downloaded,
+        )
+        .await?;
         let pending = database::count_ballchasing_replays_by_rank_and_status(
             rank,
             DownloadStatus::NotDownloaded,
@@ -311,9 +305,11 @@ async fn print_stats() -> Result<()> {
     let mut grand_failed = 0i64;
 
     for rank in BallchasingRank::all_ranked() {
-        let downloaded =
-            database::count_ballchasing_replays_by_rank_and_status(rank, DownloadStatus::Downloaded)
-                .await?;
+        let downloaded = database::count_ballchasing_replays_by_rank_and_status(
+            rank,
+            DownloadStatus::Downloaded,
+        )
+        .await?;
         let failed =
             database::count_ballchasing_replays_by_rank_and_status(rank, DownloadStatus::Failed)
                 .await?;

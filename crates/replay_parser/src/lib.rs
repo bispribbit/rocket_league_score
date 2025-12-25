@@ -131,7 +131,16 @@ struct PlayerInfo {
 /// Returns an error if the file cannot be read or parsed.
 pub fn parse_replay(path: &Path) -> anyhow::Result<ParsedReplay> {
     let raw_data = std::fs::read(path)?;
-    let replay = ParserBuilder::new(&raw_data)
+    parse_replay_from_bytes(&raw_data)
+}
+
+/// Parses a replay from raw bytes.
+///
+/// # Errors
+///
+/// Returns an error if the data cannot be parsed.
+pub fn parse_replay_from_bytes(data: &[u8]) -> anyhow::Result<ParsedReplay> {
+    let replay = ParserBuilder::new(data)
         .must_parse_network_data()
         .parse()?;
 

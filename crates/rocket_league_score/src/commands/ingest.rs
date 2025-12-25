@@ -1,7 +1,7 @@
 //! Ingest command - imports replay files into the database.
 
 use core::str::FromStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use database::{
@@ -12,6 +12,31 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::rank::Rank;
+
+/// Gets the base replay path from environment variable or uses default.
+fn get_replay_base_path() -> PathBuf {
+    std::env::var("REPLAY_BASE_PATH")
+        .map_or_else(|_| PathBuf::from("/workspace/ballchasing"), PathBuf::from)
+}
+
+/// Converts an absolute file path to a relative path from the base data directory.
+///
+/// Returns the relative path using forward slashes, or the original path if it's not under the base.
+fn to_relative_path(absolute_path: &Path, base_path: &Path) -> String {
+    absolute_path
+        .strip_prefix(base_path)
+        .map_or_else(
+            |_| absolute_path.to_string_lossy().to_string(),
+            |relative| {
+                // Normalize to forward slashes for cross-platform compatibility
+                relative
+                    .iter()
+                    .map(|c| c.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+        )
+}
 
 /// Runs the ingest command.
 ///
@@ -33,6 +58,10 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
         Vec::new()
     };
 
+    // Get base replay path for computing relative paths
+    let base_path = get_replay_base_path();
+    info!(base_path = %base_path.display(), "Using base replay path");
+
     // Find all .replay files in the folder
     let replay_files = find_replay_files(folder)?;
     info!(count = replay_files.len(), "Found replay files");
@@ -41,10 +70,11 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
     let mut skipped = 0;
 
     for replay_path in &replay_files {
-        let file_path_str = replay_path.to_string_lossy().to_string();
+        // Convert to relative path for storage
+        let relative_path = to_relative_path(replay_path, &base_path);
 
         // Check if already ingested
-        if database::find_replay_by_path(&file_path_str)
+        if database::find_replay_by_path(&relative_path)
             .await?
             .is_some()
         {
@@ -55,9 +85,9 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
         // Parse the replay to validate it
         match parse_replay(replay_path) {
             Ok(_parsed) => {
-                // Create replay record
+                // Create replay record with relative path
                 let replay = database::insert_replay(CreateReplay {
-                    file_path: file_path_str.clone(),
+                    file_path: relative_path.clone(),
                     game_mode,
                 })
                 .await?;
@@ -70,8 +100,8 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
                 // Try to find ballchasing metadata
                 let mut players_for_replay: Vec<CreateReplayPlayer> = Vec::new();
 
-                // Try to match by file_path first
-                let ballchasing_replay = find_ballchasing_replay_by_path(&file_path_str).await?;
+                // Try to match by file_path first (using relative path)
+                let ballchasing_replay = find_ballchasing_replay_by_path(&relative_path).await?;
 
                 if let Some(ballchasing) = ballchasing_replay {
                     // Extract players from ballchasing metadata
