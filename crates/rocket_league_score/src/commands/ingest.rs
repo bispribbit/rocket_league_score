@@ -4,9 +4,7 @@ use core::str::FromStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use database::{
-    CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode,
-};
+use database::{CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode};
 use replay_parser::{ExtractedPlayer, extract_players_from_metadata, parse_replay};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -17,25 +15,6 @@ use crate::rank::Rank;
 fn get_replay_base_path() -> PathBuf {
     std::env::var("REPLAY_BASE_PATH")
         .map_or_else(|_| PathBuf::from("/workspace/ballchasing"), PathBuf::from)
-}
-
-/// Converts an absolute file path to a relative path from the base data directory.
-///
-/// Returns the relative path using forward slashes, or the original path if it's not under the base.
-fn to_relative_path(absolute_path: &Path, base_path: &Path) -> String {
-    absolute_path
-        .strip_prefix(base_path)
-        .map_or_else(
-            |_| absolute_path.to_string_lossy().to_string(),
-            |relative| {
-                // Normalize to forward slashes for cross-platform compatibility
-                relative
-                    .iter()
-                    .map(|c| c.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            },
-        )
 }
 
 /// Runs the ingest command.
@@ -70,14 +49,8 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
     let mut skipped = 0;
 
     for replay_path in &replay_files {
-        // Convert to relative path for storage
-        let relative_path = to_relative_path(replay_path, &base_path);
-
         // Check if already ingested
-        if database::find_replay_by_path(&relative_path)
-            .await?
-            .is_some()
-        {
+        if database::find_replay_by_path(&replay_path).await?.is_some() {
             skipped += 1;
             continue;
         }

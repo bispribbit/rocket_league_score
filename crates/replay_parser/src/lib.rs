@@ -140,9 +140,7 @@ pub fn parse_replay(path: &Path) -> anyhow::Result<ParsedReplay> {
 ///
 /// Returns an error if the data cannot be parsed.
 pub fn parse_replay_from_bytes(data: &[u8]) -> anyhow::Result<ParsedReplay> {
-    let replay = ParserBuilder::new(data)
-        .must_parse_network_data()
-        .parse()?;
+    let replay = ParserBuilder::new(data).must_parse_network_data().parse()?;
 
     parse_boxcars_replay(&replay)
 }

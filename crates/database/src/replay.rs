@@ -129,4 +129,3 @@ pub async fn count_replays_by_game_mode(game_mode: GameMode) -> Result<i64, sqlx
 
     Ok(result.count)
 }
-
