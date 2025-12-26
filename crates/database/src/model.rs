@@ -1,16 +1,22 @@
 //! Repository functions for model operations.
 
+use replay_structs::Model;
 use uuid::Uuid;
 
 use crate::get_pool;
-use crate::models::{CreateModel, Model};
 
 /// Creates a new model record.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn insert_model(input: CreateModel) -> Result<Model, sqlx::Error> {
+pub async fn insert_model(
+    name: &str,
+    version: i32,
+    checkpoint_path: &str,
+    training_config: Option<serde_json::Value>,
+    metrics: Option<serde_json::Value>,
+) -> Result<Model, sqlx::Error> {
     let id = Uuid::new_v4();
     let pool = get_pool();
 
@@ -22,11 +28,11 @@ pub async fn insert_model(input: CreateModel) -> Result<Model, sqlx::Error> {
         RETURNING id, name, version, checkpoint_path, training_config, metrics, trained_at
         "#,
         id,
-        input.name,
-        input.version,
-        input.checkpoint_path,
-        input.training_config,
-        input.metrics
+        name,
+        version,
+        checkpoint_path,
+        training_config,
+        metrics
     )
     .fetch_one(pool)
     .await

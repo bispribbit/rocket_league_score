@@ -8,10 +8,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use config::OBJECT_STORE;
-use database::{BallchasingRank, CreateBallchasingReplay, DownloadStatus};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
-use replay_structs::ReplaySummary;
+use replay_structs::{BallchasingRank, DownloadStatus, ReplaySummary};
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -93,7 +92,10 @@ async fn fetch_all_metadata(client: &BallchasingClient) -> Result<()> {
                 .await?;
 
             // Store new replays
-            let mut to_create = Vec::new();
+            let mut ids = Vec::new();
+            let mut ranks = Vec::new();
+            let mut metadata_values = Vec::new();
+
             for replay in replays {
                 let Ok(id) = replay.id.parse::<Uuid>() else {
                     warn!("Invalid replay ID: {}", replay.id);
@@ -105,11 +107,14 @@ async fn fetch_all_metadata(client: &BallchasingClient) -> Result<()> {
                 }
 
                 let metadata = serde_json::to_value(&replay)?;
-                to_create.push(CreateBallchasingReplay { id, rank, metadata });
+                ids.push(id);
+                ranks.push(rank);
+                metadata_values.push(metadata);
             }
 
-            if !to_create.is_empty() {
-                let created = database::insert_ballchasing_replays(to_create).await?;
+            if !ids.is_empty() {
+                let created =
+                    database::insert_ballchasing_replays(&ids, &ranks, &metadata_values).await?;
                 info!("Stored {created} new replays for rank {rank}");
             }
         }

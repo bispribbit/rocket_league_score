@@ -14,11 +14,11 @@ use anyhow::{Context, Result};
 use burn::backend::cuda::CudaDevice;
 use burn::backend::{Autodiff, Cuda};
 use burn::module::AutodiffModule;
-use database::{DownloadStatus, read_from_object_store};
+use database::read_from_object_store;
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
 use replay_parser::{parse_replay_from_bytes, segment_by_goals};
-use replay_structs::{PlayerWithRating, RankInfo, ReplaySummary};
+use replay_structs::{BallchasingRank, DownloadStatus, PlayerWithRating, RankInfo, ReplaySummary};
 use tracing::info;
 
 use crate::rank::Rank;
@@ -33,7 +33,7 @@ fn rank_to_mmr(rank_info: &RankInfo) -> Option<i32> {
 /// Loads metadata for replays from the database.
 async fn load_metadata(limit: Option<usize>) -> Result<HashMap<PathBuf, Vec<PlayerWithRating>>> {
     // Get all downloaded replays
-    let all_ranks = database::BallchasingRank::all_ranked();
+    let all_ranks = BallchasingRank::all_ranked();
     let mut all_replays = Vec::new();
 
     for rank in all_ranks {

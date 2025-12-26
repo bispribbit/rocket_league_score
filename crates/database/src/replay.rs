@@ -1,16 +1,18 @@
 //! Repository functions for replay operations.
 
+use std::path::Path;
+
+use replay_structs::{GameMode, Replay};
 use uuid::Uuid;
 
 use crate::get_pool;
-use crate::models::{CreateReplay, GameMode, Replay};
 
 /// Creates a new replay record.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn insert_replay(input: CreateReplay) -> Result<Replay, sqlx::Error> {
+pub async fn insert_replay(file_path: &Path, game_mode: GameMode) -> Result<Replay, sqlx::Error> {
     let id = Uuid::new_v4();
     let pool = get_pool();
 
@@ -22,8 +24,8 @@ pub async fn insert_replay(input: CreateReplay) -> Result<Replay, sqlx::Error> {
         RETURNING id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
         "#,
         id,
-        input.file_path,
-        input.game_mode as GameMode
+        file_path.to_string_lossy().to_string(),
+        game_mode as GameMode
     )
     .fetch_one(pool)
     .await
@@ -34,8 +36,9 @@ pub async fn insert_replay(input: CreateReplay) -> Result<Replay, sqlx::Error> {
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn find_replay_by_path(file_path: &str) -> Result<Option<Replay>, sqlx::Error> {
+pub async fn find_replay_by_path(file_path: &Path) -> Result<Option<Replay>, sqlx::Error> {
     let pool = get_pool();
+    let file_path = file_path.to_string_lossy();
     sqlx::query_as!(
         Replay,
         r#"
@@ -43,7 +46,7 @@ pub async fn find_replay_by_path(file_path: &str) -> Result<Option<Replay>, sqlx
         FROM replays
         WHERE file_path = $1
         "#,
-        file_path
+        &file_path
     )
     .fetch_optional(pool)
     .await

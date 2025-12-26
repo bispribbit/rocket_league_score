@@ -3,11 +3,13 @@
 //! A machine learning-based tool for evaluating player performance
 //! in Rocket League replays.
 
+use core::str::FromStr;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use database::{initialize_pool, run_migrations};
+use replay_structs::GameMode;
 use rocket_league_score::commands;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -111,7 +113,8 @@ async fn main() -> Result<()> {
             game_mode,
             ratings_file,
         } => {
-            commands::ingest::run(&folder, &game_mode, ratings_file.as_deref()).await?;
+            let game_mode = GameMode::from_str(&game_mode)?;
+            commands::ingest::run(&folder, game_mode, ratings_file.as_deref()).await?;
         }
         Commands::Train {
             name,

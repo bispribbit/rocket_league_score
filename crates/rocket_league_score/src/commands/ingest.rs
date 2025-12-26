@@ -1,11 +1,10 @@
 //! Ingest command - imports replay files into the database.
 
-use core::str::FromStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use database::{CreateReplay, CreateReplayPlayer, DownloadStatus, GameMode};
-use replay_parser::{ExtractedPlayer, extract_players_from_metadata, parse_replay};
+use replay_parser::{extract_players_from_metadata, parse_replay};
+use replay_structs::{BallchasingRank, BallchasingReplay, DownloadStatus, GameMode};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -22,59 +21,55 @@ fn get_replay_base_path() -> PathBuf {
 /// # Errors
 ///
 /// Returns an error if ingestion fails.
-pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>) -> Result<()> {
+pub async fn run(folder: &Path, game_mode: GameMode, ratings_file: Option<&Path>) -> Result<()> {
     info!(folder = %folder.display(), "Ingesting replays");
 
-    let game_mode = GameMode::from_str(game_mode_str)
-        .context("Invalid game mode. Use: 3v3, 2v2, 1v1, hoops, rumble, dropshot, snowday")?;
-
-    // TODO: Parse ratings file if provided
-    let ratings = if let Some(path) = ratings_file {
-        info!(path = %path.display(), "Loading ratings file");
-        load_ratings_file(path)?
+    // Load ratings from CSV if provided
+    let ratings = if let Some(ratings_path) = ratings_file {
+        load_ratings_from_csv(ratings_path)?
     } else {
-        info!("No ratings file provided, using default ratings");
         Vec::new()
     };
-
-    // Get base replay path for computing relative paths
-    let base_path = get_replay_base_path();
-    info!(base_path = %base_path.display(), "Using base replay path");
 
     // Find all .replay files in the folder
     let replay_files = find_replay_files(folder)?;
     info!(count = replay_files.len(), "Found replay files");
 
+    let base_path = get_replay_base_path();
     let mut ingested = 0;
     let mut skipped = 0;
 
     for replay_path in &replay_files {
         // Check if already ingested
-        if database::find_replay_by_path(&replay_path).await?.is_some() {
+        if database::find_replay_by_path(replay_path).await?.is_some() {
             skipped += 1;
             continue;
         }
+
+        // Compute relative path from base
+        let relative_path = replay_path.strip_prefix(&base_path).unwrap_or(replay_path);
 
         // Parse the replay to validate it
         match parse_replay(replay_path) {
             Ok(_parsed) => {
                 // Create replay record with relative path
-                let replay = database::insert_replay(CreateReplay {
-                    file_path: relative_path.clone(),
-                    game_mode,
-                })
-                .await?;
+                let replay = database::insert_replay(relative_path, game_mode).await?;
 
                 let file_name = replay_path
                     .file_name()
-                    .and_then(|n| n.to_str())
+                    .and_then(|os_str| os_str.to_str())
                     .unwrap_or("");
 
                 // Try to find ballchasing metadata
-                let mut players_for_replay: Vec<CreateReplayPlayer> = Vec::new();
+                let mut replay_ids = Vec::new();
+                let mut player_names = Vec::new();
+                let mut teams = Vec::new();
+                let mut skill_ratings = Vec::new();
 
                 // Try to match by file_path first (using relative path)
-                let ballchasing_replay = find_ballchasing_replay_by_path(&relative_path).await?;
+                let relative_path_str = relative_path.to_string_lossy().to_string();
+                let ballchasing_replay =
+                    find_ballchasing_replay_by_path(&relative_path_str).await?;
 
                 if let Some(ballchasing) = ballchasing_replay {
                     // Extract players from ballchasing metadata
@@ -82,18 +77,15 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
                         Rank::from_rank_id(&rank_info.id, rank_info.division).map(Rank::mmr_middle)
                     }) {
                         Ok(extracted_players) => {
-                            players_for_replay = extracted_players
-                                .into_iter()
-                                .map(|p: ExtractedPlayer| CreateReplayPlayer {
-                                    replay_id: replay.id,
-                                    player_name: p.player_name,
-                                    team: p.team,
-                                    skill_rating: p.skill_rating,
-                                })
-                                .collect();
+                            for p in extracted_players {
+                                replay_ids.push(replay.id);
+                                player_names.push(p.player_name);
+                                teams.push(p.team);
+                                skill_ratings.push(p.skill_rating);
+                            }
                             info!(
                                 replay_id = %replay.id,
-                                players = players_for_replay.len(),
+                                players = replay_ids.len(),
                                 "Extracted players from ballchasing metadata"
                             );
                         }
@@ -108,21 +100,23 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
                 }
 
                 // Fall back to CSV ratings if no ballchasing metadata found
-                if players_for_replay.is_empty() {
-                    players_for_replay = ratings
-                        .iter()
-                        .filter(|r| r.replay_filename == file_name)
-                        .map(|r| CreateReplayPlayer {
-                            replay_id: replay.id,
-                            player_name: r.player_name.clone(),
-                            team: r.team,
-                            skill_rating: r.skill_rating,
-                        })
-                        .collect();
+                if replay_ids.is_empty() {
+                    for rating in ratings.iter().filter(|r| r.replay_filename == file_name) {
+                        replay_ids.push(replay.id);
+                        player_names.push(rating.player_name.clone());
+                        teams.push(rating.team);
+                        skill_ratings.push(rating.skill_rating);
+                    }
                 }
 
-                if !players_for_replay.is_empty() {
-                    database::insert_replay_players(players_for_replay).await?;
+                if !replay_ids.is_empty() {
+                    database::insert_replay_players(
+                        &replay_ids,
+                        &player_names,
+                        &teams,
+                        &skill_ratings,
+                    )
+                    .await?;
                 }
 
                 ingested += 1;
@@ -139,7 +133,7 @@ pub async fn run(folder: &Path, game_mode_str: &str, ratings_file: Option<&Path>
 }
 
 /// Rating entry from a CSV file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct RatingEntry {
     replay_filename: String,
     player_name: String,
@@ -147,16 +141,18 @@ struct RatingEntry {
     skill_rating: i32,
 }
 
-/// Loads player ratings from a CSV file.
-fn load_ratings_file(path: &Path) -> Result<Vec<RatingEntry>> {
-    // TODO: Implement actual CSV parsing
-    // Expected format: replay_filename,player_name,team,skill_rating
-    // Example: "abc123.replay,PlayerOne,0,1547"
+/// Loads ratings from a CSV file.
+fn load_ratings_from_csv(path: &Path) -> Result<Vec<RatingEntry>> {
+    let mut reader = csv::Reader::from_path(path)
+        .with_context(|| format!("Failed to open ratings file: {}", path.display()))?;
 
-    let _content = std::fs::read_to_string(path)?;
+    let mut ratings = Vec::new();
+    for result in reader.deserialize() {
+        let record: RatingEntry = result.with_context(|| "Failed to parse CSV record")?;
+        ratings.push(record);
+    }
 
-    // Mock implementation - return empty vec
-    Ok(Vec::new())
+    Ok(ratings)
 }
 
 /// Finds all .replay files in a directory (recursively).
@@ -189,11 +185,9 @@ fn find_replay_files(folder: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// Finds a ballchasing replay by file path.
 ///
 /// Tries to match by `file_path` field first, then by extracting UUID from filename.
-async fn find_ballchasing_replay_by_path(
-    file_path: &str,
-) -> Result<Option<database::BallchasingReplay>> {
+async fn find_ballchasing_replay_by_path(file_path: &str) -> Result<Option<BallchasingReplay>> {
     // Try to find by file_path field
-    let all_ranks = database::BallchasingRank::all_ranked();
+    let all_ranks = BallchasingRank::all_ranked();
     for rank in all_ranks {
         let replays =
             database::list_ballchasing_replays_by_rank(rank, Some(DownloadStatus::Downloaded))

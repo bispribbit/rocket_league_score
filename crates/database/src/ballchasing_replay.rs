@@ -1,12 +1,9 @@
 //! Repository functions for ballchasing replay operations.
 
+use replay_structs::{BallchasingRank, BallchasingRankStats, BallchasingReplay, DownloadStatus};
 use uuid::Uuid;
 
 use crate::get_pool;
-use crate::models::{
-    BallchasingRank, BallchasingRankStats, BallchasingReplay, CreateBallchasingReplay,
-    DownloadStatus,
-};
 
 /// Inserts multiple ballchasing replay records, skipping duplicates.
 ///
@@ -14,17 +11,15 @@ use crate::models::{
 ///
 /// Returns an error if the database operation fails.
 pub async fn insert_ballchasing_replays(
-    inputs: Vec<CreateBallchasingReplay>,
+    ids: &[Uuid],
+    ranks: &[BallchasingRank],
+    metadata: &[serde_json::Value],
 ) -> Result<usize, sqlx::Error> {
-    if inputs.is_empty() {
+    if ids.is_empty() {
         return Ok(0);
     }
 
     let pool = get_pool();
-    let ids: Vec<Uuid> = inputs.iter().map(|i| i.id).collect();
-    let ranks: Vec<BallchasingRank> = inputs.iter().map(|i| i.rank).collect();
-    let metadata_values: Vec<serde_json::Value> =
-        inputs.iter().map(|i| i.metadata.clone()).collect();
 
     let result = sqlx::query!(
         r#"
@@ -32,9 +27,9 @@ pub async fn insert_ballchasing_replays(
         SELECT * FROM unnest($1::uuid[], $2::ballchasing_rank[], $3::jsonb[])
         ON CONFLICT (id) DO NOTHING
         "#,
-        ids.as_slice() as &[Uuid],
-        ranks.as_slice() as &[BallchasingRank],
-        metadata_values.as_slice() as &[serde_json::Value]
+        ids as &[Uuid],
+        ranks as &[BallchasingRank],
+        metadata as &[serde_json::Value]
     )
     .execute(pool)
     .await?;

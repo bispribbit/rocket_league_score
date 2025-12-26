@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use database::initialize_pool;
+use replay_structs::GameMode;
 use rocket_league_score::commands;
 use tracing_subscriber::EnvFilter;
 
 const REPLAY_FOLDER: &str = "C:/GitHub/rocket_league_score/workspace/replays/3v3";
-const GAME_MODE: &str = "3v3";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
 
     let folder = PathBuf::from(REPLAY_FOLDER);
 
-    commands::ingest::run(&folder, GAME_MODE, None).await?;
+    commands::ingest::run(&folder, GameMode::Soccar3v3, None).await?;
 
     Ok(())
 }

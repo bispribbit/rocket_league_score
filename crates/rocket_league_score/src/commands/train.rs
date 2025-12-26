@@ -3,10 +3,11 @@
 use anyhow::Result;
 use burn::backend::cuda::CudaDevice;
 use burn::backend::{Autodiff, Cuda};
-use database::{CreateModel, GameMode, read_from_object_store};
+use database::read_from_object_store;
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
 use replay_parser::{parse_replay_from_bytes, segment_by_goals};
+use replay_structs::GameMode;
 use tracing::info;
 
 // Training requires Autodiff wrapper for automatic differentiation
@@ -65,13 +66,13 @@ pub async fn run(
         "hidden_size_2": model_config.hidden_size_2,
     });
 
-    database::insert_model(CreateModel {
-        name: model_name.to_string(),
-        version: next_version,
-        checkpoint_path: checkpoint_path.clone(),
-        training_config: Some(training_config_json),
-        metrics: None, // TODO: Add training metrics
-    })
+    database::insert_model(
+        model_name,
+        next_version,
+        &checkpoint_path,
+        Some(training_config_json),
+        None, // TODO: Add training metrics
+    )
     .await?;
 
     info!(

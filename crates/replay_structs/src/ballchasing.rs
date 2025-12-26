@@ -36,27 +36,6 @@ impl FromStr for GameMode {
     }
 }
 
-/// Replay metadata stored in the database.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct Replay {
-    pub id: Uuid,
-    pub file_path: String,
-    pub game_mode: GameMode,
-    pub processed_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Player data for a specific replay.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ReplayPlayer {
-    pub id: Uuid,
-    pub replay_id: Uuid,
-    pub player_name: String,
-    pub team: i16,
-    pub skill_rating: i32,
-    pub created_at: DateTime<Utc>,
-}
-
 /// ML model metadata stored in the database.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Model {
@@ -67,32 +46,6 @@ pub struct Model {
     pub training_config: Option<serde_json::Value>,
     pub metrics: Option<serde_json::Value>,
     pub trained_at: DateTime<Utc>,
-}
-
-/// Input for creating a new replay record.
-#[derive(Debug, Clone)]
-pub struct CreateReplay {
-    pub file_path: String,
-    pub game_mode: GameMode,
-}
-
-/// Input for creating a new player record.
-#[derive(Debug, Clone)]
-pub struct CreateReplayPlayer {
-    pub replay_id: Uuid,
-    pub player_name: String,
-    pub team: i16,
-    pub skill_rating: i32,
-}
-
-/// Input for creating a new model record.
-#[derive(Debug, Clone)]
-pub struct CreateModel {
-    pub name: String,
-    pub version: i32,
-    pub checkpoint_path: String,
-    pub training_config: Option<serde_json::Value>,
-    pub metrics: Option<serde_json::Value>,
 }
 
 // ============================================================================
@@ -282,14 +235,6 @@ pub struct BallchasingReplay {
     pub error_message: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Input for creating a new ballchasing replay record.
-#[derive(Debug, Clone)]
-pub struct CreateBallchasingReplay {
-    pub id: Uuid,
-    pub rank: BallchasingRank,
-    pub metadata: serde_json::Value,
 }
 
 /// Statistics for a ballchasing rank showing download status counts.
