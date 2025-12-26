@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE ballchasing_replays\n        SET \n            download_status = $2,\n            file_path = COALESCE($3, file_path),\n            error_message = $4,\n            updated_at = NOW()\n        WHERE id = $1\n        ",
+  "query": "\n        UPDATE replays\n        SET \n            download_status = $2,\n            file_path = COALESCE($3, file_path),\n            error_message = $4,\n            updated_at = NOW()\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -25,5 +25,5 @@
     },
     "nullable": []
   },
-  "hash": "ec9778bf4c81afdbfc4500354291fdd2017b4fb9b26d445724557c6d5cd3c816"
+  "hash": "26f194e0d7364123b900ecdb938d832eede5f1abc791ed8b6511ff08654e6b25"
 }

@@ -1,0 +1,146 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, replay_id, player_name, team, rank_division as \"rank_division: RankDivision\", created_at\n        FROM replay_players\n        WHERE replay_id = $1\n        ORDER BY team, player_name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "replay_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "player_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "team",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 4,
+        "name": "rank_division: RankDivision",
+        "type_info": {
+          "Custom": {
+            "name": "rank_division",
+            "kind": {
+              "Enum": [
+                "unranked",
+                "bronze1_division1",
+                "bronze1_division2",
+                "bronze1_division3",
+                "bronze1_division4",
+                "bronze2_division1",
+                "bronze2_division2",
+                "bronze2_division3",
+                "bronze2_division4",
+                "bronze3_division1",
+                "bronze3_division2",
+                "bronze3_division3",
+                "bronze3_division4",
+                "silver1_division1",
+                "silver1_division2",
+                "silver1_division3",
+                "silver1_division4",
+                "silver2_division1",
+                "silver2_division2",
+                "silver2_division3",
+                "silver2_division4",
+                "silver3_division1",
+                "silver3_division2",
+                "silver3_division3",
+                "silver3_division4",
+                "gold1_division1",
+                "gold1_division2",
+                "gold1_division3",
+                "gold1_division4",
+                "gold2_division1",
+                "gold2_division2",
+                "gold2_division3",
+                "gold2_division4",
+                "gold3_division1",
+                "gold3_division2",
+                "gold3_division3",
+                "gold3_division4",
+                "platinum1_division1",
+                "platinum1_division2",
+                "platinum1_division3",
+                "platinum1_division4",
+                "platinum2_division1",
+                "platinum2_division2",
+                "platinum2_division3",
+                "platinum2_division4",
+                "platinum3_division1",
+                "platinum3_division2",
+                "platinum3_division3",
+                "platinum3_division4",
+                "diamond1_division1",
+                "diamond1_division2",
+                "diamond1_division3",
+                "diamond1_division4",
+                "diamond2_division1",
+                "diamond2_division2",
+                "diamond2_division3",
+                "diamond2_division4",
+                "diamond3_division1",
+                "diamond3_division2",
+                "diamond3_division3",
+                "diamond3_division4",
+                "champion1_division1",
+                "champion1_division2",
+                "champion1_division3",
+                "champion1_division4",
+                "champion2_division1",
+                "champion2_division2",
+                "champion2_division3",
+                "champion2_division4",
+                "champion3_division1",
+                "champion3_division2",
+                "champion3_division3",
+                "champion3_division4",
+                "grand_champion1_division1",
+                "grand_champion1_division2",
+                "grand_champion1_division3",
+                "grand_champion1_division4",
+                "grand_champion2_division1",
+                "grand_champion2_division2",
+                "grand_champion2_division3",
+                "grand_champion2_division4",
+                "grand_champion3_division1",
+                "grand_champion3_division2",
+                "grand_champion3_division3",
+                "grand_champion3_division4",
+                "supersonic_legend"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "221462396e6a38beadd05f353b5de7190aa3ffb9627d536456336d1bb5b35663"
+}

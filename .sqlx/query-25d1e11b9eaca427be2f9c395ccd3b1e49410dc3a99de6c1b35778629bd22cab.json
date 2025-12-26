@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, rank as \"rank: BallchasingRank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n                FROM ballchasing_replays\n                WHERE rank = $1 AND download_status = $2\n                ORDER BY created_at\n                ",
+  "query": "\n                SELECT id, rank as \"rank: Rank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n                FROM replays\n                WHERE rank = $1 AND download_status = $2\n                ORDER BY created_at\n                ",
   "describe": {
     "columns": [
       {
@@ -10,10 +10,10 @@
       },
       {
         "ordinal": 1,
-        "name": "rank: BallchasingRank",
+        "name": "rank: Rank",
         "type_info": {
           "Custom": {
-            "name": "ballchasing_rank",
+            "name": "rank",
             "kind": {
               "Enum": [
                 "unranked",
@@ -88,7 +88,7 @@
       "Left": [
         {
           "Custom": {
-            "name": "ballchasing_rank",
+            "name": "rank",
             "kind": {
               "Enum": [
                 "unranked",
@@ -135,11 +135,11 @@
       false,
       false,
       false,
-      true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "012605bbad4c04dedcaafd02080acfbf353b9e2a34ceed3dd4345146838adf88"
+  "hash": "25d1e11b9eaca427be2f9c395ccd3b1e49410dc3a99de6c1b35778629bd22cab"
 }

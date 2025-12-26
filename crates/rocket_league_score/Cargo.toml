@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 # Internal dependencies
+config.workspace = true
 database.workspace = true
 feature_extractor.workspace = true
 ml_model.workspace = true

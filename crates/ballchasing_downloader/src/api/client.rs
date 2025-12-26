@@ -1,8 +1,8 @@
 //! Rate-limited HTTP client for ballchasing.com API.
 
 use core::num::NonZeroU32;
+use core::str::FromStr;
 use core::time::Duration;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -10,7 +10,7 @@ use config::CONFIG;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use replay_structs::ReplaySummary;
+use replay_structs::{GameMode, Rank, ReplaySummary};
 use reqwest::Client;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -31,8 +31,8 @@ type RateLimiterType = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 /// Rate-limited client for ballchasing.com API.
 pub struct BallchasingClient {
     client: Client,
-    per_second_limiter: Arc<RateLimiterType>,
-    per_hour_limiter: Arc<RateLimiterType>,
+    per_second_limiter: RateLimiterType,
+    per_hour_limiter: RateLimiterType,
 }
 
 impl BallchasingClient {
@@ -51,13 +51,13 @@ impl BallchasingClient {
         let per_second_quota = Quota::per_second(
             NonZeroU32::new(RATE_LIMIT_PER_SECOND).expect("rate limit should be non-zero"),
         );
-        let per_second_limiter = Arc::new(RateLimiter::direct(per_second_quota));
+        let per_second_limiter = RateLimiter::direct(per_second_quota);
 
         // Per-hour rate limiter (500 per hour)
         let per_hour_quota = Quota::per_hour(
             NonZeroU32::new(RATE_LIMIT_PER_HOUR).expect("rate limit should be non-zero"),
         );
-        let per_hour_limiter = Arc::new(RateLimiter::direct(per_hour_quota));
+        let per_hour_limiter = RateLimiter::direct(per_hour_quota);
 
         Ok(Self {
             client,
@@ -88,18 +88,22 @@ impl BallchasingClient {
     /// Returns an error if the API request fails.
     pub async fn list_replays(
         &self,
-        playlist: &str,
-        min_rank: &str,
-        max_rank: &str,
+        playlist: GameMode,
+        min_rank: Rank,
+        max_rank: Rank,
         count: usize,
         after: Option<&str>,
     ) -> Result<ReplayListResponse> {
         self.wait_for_rate_limit().await;
 
+        let playlist_str = playlist.as_api_string();
+        let min_rank_str = min_rank.as_api_string();
+        let max_rank_str = max_rank.as_api_string();
+
         info!(
-            playlist = playlist,
-            min_rank = min_rank,
-            max_rank = max_rank,
+            playlist = playlist_str,
+            min_rank = min_rank_str,
+            max_rank = max_rank_str,
             count = count,
             after = after,
             "Listing replays",
@@ -108,7 +112,7 @@ impl BallchasingClient {
         let count = count.min(200); // API max is 200
 
         let mut url = format!(
-            "{API_BASE_URL}/replays?playlist={playlist}&min-rank={min_rank}&max-rank={max_rank}&count={count}&sort-by=replay-date&sort-dir=desc"
+            "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=replay-date&sort-dir=desc"
         );
 
         if let Some(after_id) = after {
@@ -223,8 +227,17 @@ impl BallchasingClient {
         while all_replays.len() < target_count {
             let batch_size = (target_count - all_replays.len()).min(200);
 
+            let ballchasing_rank =
+                Rank::from_str(rank).with_context(|| format!("Invalid rank: {rank}"))?;
+
             let response = self
-                .list_replays("ranked-standard", rank, rank, batch_size, after.as_deref())
+                .list_replays(
+                    GameMode::RankedStandard,
+                    ballchasing_rank,
+                    ballchasing_rank,
+                    batch_size,
+                    after.as_deref(),
+                )
                 .await?;
 
             if response.list.is_empty() {

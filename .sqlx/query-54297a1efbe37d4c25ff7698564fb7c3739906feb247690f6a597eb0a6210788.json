@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, rank as \"rank: BallchasingRank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n                FROM ballchasing_replays\n                WHERE rank = $1\n                ORDER BY created_at\n                ",
+  "query": "\n        SELECT id, rank as \"rank: Rank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n        FROM replays\n        WHERE file_path = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -10,10 +10,10 @@
       },
       {
         "ordinal": 1,
-        "name": "rank: BallchasingRank",
+        "name": "rank: Rank",
         "type_info": {
           "Custom": {
-            "name": "ballchasing_rank",
+            "name": "rank",
             "kind": {
               "Enum": [
                 "unranked",
@@ -86,35 +86,7 @@
     ],
     "parameters": {
       "Left": [
-        {
-          "Custom": {
-            "name": "ballchasing_rank",
-            "kind": {
-              "Enum": [
-                "unranked",
-                "bronze1",
-                "bronze2",
-                "bronze3",
-                "silver1",
-                "silver2",
-                "silver3",
-                "gold1",
-                "gold2",
-                "gold3",
-                "platinum1",
-                "platinum2",
-                "platinum3",
-                "diamond1",
-                "diamond2",
-                "diamond3",
-                "champion1",
-                "champion2",
-                "champion3",
-                "grand_champion"
-              ]
-            }
-          }
-        }
+        "Text"
       ]
     },
     "nullable": [
@@ -122,11 +94,11 @@
       false,
       false,
       false,
-      true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "1cfb36e6066c25db439d5b7a25fe3bb0191c3ad26d770689f31e3b2d31ba2ea7"
+  "hash": "54297a1efbe37d4c25ff7698564fb7c3739906feb247690f6a597eb0a6210788"
 }

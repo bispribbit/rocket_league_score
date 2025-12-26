@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE replays\n        SET \n            download_status = 'not_downloaded',\n            error_message = NULL,\n            updated_at = NOW()\n        WHERE download_status = 'failed'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "f6dd783ebb7466d29a2131208d7a40739d9e4e92ed15c3a45f9ac8b5278475b2"
+}

@@ -10,8 +10,9 @@ use core::str::FromStr;
 ///
 /// Each rank (except Supersonic Legend) has 4 divisions.
 /// MMR values are based on the 3v3 ranked playlist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Rank {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, sqlx::Type)]
+#[sqlx(type_name = "rank_division", rename_all = "snake_case")]
+pub enum RankDivision {
     // Bronze I
     BronzeIDivision1,
     BronzeIDivision2,
@@ -121,7 +122,7 @@ pub enum Rank {
     SupersonicLegend,
 }
 
-impl Rank {
+impl RankDivision {
     /// Returns the minimum MMR value for this rank.
     #[must_use]
     #[expect(
@@ -362,7 +363,7 @@ impl Rank {
 
     /// Creates a `Rank` from a rank ID string (e.g., "grand-champion-3") and optional division.
     ///
-    /// This is useful for parsing metadata from ballchasing.com API.
+    /// This is useful for parsing metadata from external replay APIs.
     #[must_use]
     pub fn from_rank_id(rank_id: &str, division: Option<i32>) -> Option<Self> {
         let division = division.unwrap_or(1).clamp(1, 4);
@@ -571,7 +572,7 @@ impl Rank {
     }
 }
 
-impl fmt::Display for Rank {
+impl fmt::Display for RankDivision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             // Bronze I
@@ -701,7 +702,7 @@ impl fmt::Display for ParseRankError {
 
 impl core::error::Error for ParseRankError {}
 
-impl FromStr for Rank {
+impl FromStr for RankDivision {
     type Err = ParseRankError;
 
     /// Parses a rank from a string.
@@ -710,7 +711,7 @@ impl FromStr for Rank {
     /// - `SupersonicLegend` or `Supersonic Legend`
     /// - `GrandChampionIIIDivision1` or `Grand Champion III Division 1`
     /// - `gc3d1` (short form)
-    /// - `bronze-1` with division number (ballchasing format)
+    /// - `bronze-1` with division number (external API format)
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Normalize: lowercase and remove spaces/dashes/underscores
         let normalized = s.to_lowercase().replace([' ', '-', '_'], "");
@@ -860,8 +861,8 @@ impl FromStr for Rank {
 
 /// Parses short form ranks like `gc3d1`, `c2d3`, `d1d4`, `ssl`.
 #[expect(clippy::too_many_lines)]
-fn parse_short_form(s: &str) -> Option<Rank> {
-    use Rank::{
+fn parse_short_form(s: &str) -> Option<RankDivision> {
+    use RankDivision::{
         BronzeIDivision1, BronzeIDivision2, BronzeIDivision3, BronzeIDivision4, BronzeIIDivision1,
         BronzeIIDivision2, BronzeIIDivision3, BronzeIIDivision4, BronzeIIIDivision1,
         BronzeIIIDivision2, BronzeIIIDivision3, BronzeIIIDivision4, ChampionIDivision1,
@@ -894,7 +895,7 @@ fn parse_short_form(s: &str) -> Option<Rank> {
     // Pattern: <rank_prefix><tier>d<division>
     // gc = Grand Champion, c = Champion, d = Diamond, p = Platinum,
     // g = Gold, s = Silver, b = Bronze
-    let patterns: &[(&str, fn(i32, i32) -> Option<Rank>)] = &[
+    let patterns: &[(&str, fn(i32, i32) -> Option<RankDivision>)] = &[
         ("gc", |tier, div| match (tier, div) {
             (3, 1) => Some(GrandChampionIIIDivision1),
             (3, 2) => Some(GrandChampionIIIDivision2),
@@ -1014,6 +1015,253 @@ fn parse_short_form(s: &str) -> Option<Rank> {
     None
 }
 
+// ============================================================================
+// Rank Models for External APIs
+// ============================================================================
+
+/// Rank enum for Rocket League competitive ranks.
+///
+/// These correspond to rank filter values used by external replay APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(type_name = "rank", rename_all = "snake_case")]
+pub enum Rank {
+    Unranked,
+    Bronze1,
+    Bronze2,
+    Bronze3,
+    Silver1,
+    Silver2,
+    Silver3,
+    Gold1,
+    Gold2,
+    Gold3,
+    Platinum1,
+    Platinum2,
+    Platinum3,
+    Diamond1,
+    Diamond2,
+    Diamond3,
+    Champion1,
+    Champion2,
+    Champion3,
+    GrandChampion,
+}
+
+impl Rank {
+    /// Returns the API string representation for this rank.
+    #[must_use]
+    pub const fn as_api_string(self) -> &'static str {
+        match self {
+            Self::Unranked => "unranked",
+            Self::Bronze1 => "bronze-1",
+            Self::Bronze2 => "bronze-2",
+            Self::Bronze3 => "bronze-3",
+            Self::Silver1 => "silver-1",
+            Self::Silver2 => "silver-2",
+            Self::Silver3 => "silver-3",
+            Self::Gold1 => "gold-1",
+            Self::Gold2 => "gold-2",
+            Self::Gold3 => "gold-3",
+            Self::Platinum1 => "platinum-1",
+            Self::Platinum2 => "platinum-2",
+            Self::Platinum3 => "platinum-3",
+            Self::Diamond1 => "diamond-1",
+            Self::Diamond2 => "diamond-2",
+            Self::Diamond3 => "diamond-3",
+            Self::Champion1 => "champion-1",
+            Self::Champion2 => "champion-2",
+            Self::Champion3 => "champion-3",
+            Self::GrandChampion => "grand-champion",
+        }
+    }
+
+    /// Returns the folder name for storing replays of this rank.
+    #[must_use]
+    pub const fn as_folder_name(self) -> &'static str {
+        match self {
+            Self::Unranked => "unranked",
+            Self::Bronze1 => "bronze-1",
+            Self::Bronze2 => "bronze-2",
+            Self::Bronze3 => "bronze-3",
+            Self::Silver1 => "silver-1",
+            Self::Silver2 => "silver-2",
+            Self::Silver3 => "silver-3",
+            Self::Gold1 => "gold-1",
+            Self::Gold2 => "gold-2",
+            Self::Gold3 => "gold-3",
+            Self::Platinum1 => "platinum-1",
+            Self::Platinum2 => "platinum-2",
+            Self::Platinum3 => "platinum-3",
+            Self::Diamond1 => "diamond-1",
+            Self::Diamond2 => "diamond-2",
+            Self::Diamond3 => "diamond-3",
+            Self::Champion1 => "champion-1",
+            Self::Champion2 => "champion-2",
+            Self::Champion3 => "champion-3",
+            Self::GrandChampion => "grand-champion",
+        }
+    }
+
+    /// Returns an iterator over all ranked tiers (excluding unranked).
+    pub fn all_ranked() -> impl Iterator<Item = Self> {
+        [
+            Self::Bronze1,
+            Self::Bronze2,
+            Self::Bronze3,
+            Self::Silver1,
+            Self::Silver2,
+            Self::Silver3,
+            Self::Gold1,
+            Self::Gold2,
+            Self::Gold3,
+            Self::Platinum1,
+            Self::Platinum2,
+            Self::Platinum3,
+            Self::Diamond1,
+            Self::Diamond2,
+            Self::Diamond3,
+            Self::Champion1,
+            Self::Champion2,
+            Self::Champion3,
+            Self::GrandChampion,
+        ]
+        .into_iter()
+    }
+
+    /// Returns an iterator over all ranks including unranked.
+    pub fn all() -> impl Iterator<Item = Self> {
+        core::iter::once(Self::Unranked).chain(Self::all_ranked())
+    }
+}
+
+impl core::fmt::Display for Rank {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.as_api_string())
+    }
+}
+
+impl FromStr for Rank {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "unranked" => Ok(Self::Unranked),
+            "bronze-1" => Ok(Self::Bronze1),
+            "bronze-2" => Ok(Self::Bronze2),
+            "bronze-3" => Ok(Self::Bronze3),
+            "silver-1" => Ok(Self::Silver1),
+            "silver-2" => Ok(Self::Silver2),
+            "silver-3" => Ok(Self::Silver3),
+            "gold-1" => Ok(Self::Gold1),
+            "gold-2" => Ok(Self::Gold2),
+            "gold-3" => Ok(Self::Gold3),
+            "platinum-1" => Ok(Self::Platinum1),
+            "platinum-2" => Ok(Self::Platinum2),
+            "platinum-3" => Ok(Self::Platinum3),
+            "diamond-1" => Ok(Self::Diamond1),
+            "diamond-2" => Ok(Self::Diamond2),
+            "diamond-3" => Ok(Self::Diamond3),
+            "champion-1" => Ok(Self::Champion1),
+            "champion-2" => Ok(Self::Champion2),
+            "champion-3" => Ok(Self::Champion3),
+            "grand-champion" => Ok(Self::GrandChampion),
+            _ => Err(anyhow::anyhow!("Invalid rank: {s}")),
+        }
+    }
+}
+
+impl From<RankDivision> for Rank {
+    fn from(division: RankDivision) -> Self {
+        match division {
+            RankDivision::BronzeIDivision1
+            | RankDivision::BronzeIDivision2
+            | RankDivision::BronzeIDivision3
+            | RankDivision::BronzeIDivision4 => Self::Bronze1,
+            RankDivision::BronzeIIDivision1
+            | RankDivision::BronzeIIDivision2
+            | RankDivision::BronzeIIDivision3
+            | RankDivision::BronzeIIDivision4 => Self::Bronze2,
+            RankDivision::BronzeIIIDivision1
+            | RankDivision::BronzeIIIDivision2
+            | RankDivision::BronzeIIIDivision3
+            | RankDivision::BronzeIIIDivision4 => Self::Bronze3,
+            RankDivision::SilverIDivision1
+            | RankDivision::SilverIDivision2
+            | RankDivision::SilverIDivision3
+            | RankDivision::SilverIDivision4 => Self::Silver1,
+            RankDivision::SilverIIDivision1
+            | RankDivision::SilverIIDivision2
+            | RankDivision::SilverIIDivision3
+            | RankDivision::SilverIIDivision4 => Self::Silver2,
+            RankDivision::SilverIIIDivision1
+            | RankDivision::SilverIIIDivision2
+            | RankDivision::SilverIIIDivision3
+            | RankDivision::SilverIIIDivision4 => Self::Silver3,
+            RankDivision::GoldIDivision1
+            | RankDivision::GoldIDivision2
+            | RankDivision::GoldIDivision3
+            | RankDivision::GoldIDivision4 => Self::Gold1,
+            RankDivision::GoldIIDivision1
+            | RankDivision::GoldIIDivision2
+            | RankDivision::GoldIIDivision3
+            | RankDivision::GoldIIDivision4 => Self::Gold2,
+            RankDivision::GoldIIIDivision1
+            | RankDivision::GoldIIIDivision2
+            | RankDivision::GoldIIIDivision3
+            | RankDivision::GoldIIIDivision4 => Self::Gold3,
+            RankDivision::PlatinumIDivision1
+            | RankDivision::PlatinumIDivision2
+            | RankDivision::PlatinumIDivision3
+            | RankDivision::PlatinumIDivision4 => Self::Platinum1,
+            RankDivision::PlatinumIIDivision1
+            | RankDivision::PlatinumIIDivision2
+            | RankDivision::PlatinumIIDivision3
+            | RankDivision::PlatinumIIDivision4 => Self::Platinum2,
+            RankDivision::PlatinumIIIDivision1
+            | RankDivision::PlatinumIIIDivision2
+            | RankDivision::PlatinumIIIDivision3
+            | RankDivision::PlatinumIIIDivision4 => Self::Platinum3,
+            RankDivision::DiamondIDivision1
+            | RankDivision::DiamondIDivision2
+            | RankDivision::DiamondIDivision3
+            | RankDivision::DiamondIDivision4 => Self::Diamond1,
+            RankDivision::DiamondIIDivision1
+            | RankDivision::DiamondIIDivision2
+            | RankDivision::DiamondIIDivision3
+            | RankDivision::DiamondIIDivision4 => Self::Diamond2,
+            RankDivision::DiamondIIIDivision1
+            | RankDivision::DiamondIIIDivision2
+            | RankDivision::DiamondIIIDivision3
+            | RankDivision::DiamondIIIDivision4 => Self::Diamond3,
+            RankDivision::ChampionIDivision1
+            | RankDivision::ChampionIDivision2
+            | RankDivision::ChampionIDivision3
+            | RankDivision::ChampionIDivision4 => Self::Champion1,
+            RankDivision::ChampionIIDivision1
+            | RankDivision::ChampionIIDivision2
+            | RankDivision::ChampionIIDivision3
+            | RankDivision::ChampionIIDivision4 => Self::Champion2,
+            RankDivision::ChampionIIIDivision1
+            | RankDivision::ChampionIIIDivision2
+            | RankDivision::ChampionIIIDivision3
+            | RankDivision::ChampionIIIDivision4 => Self::Champion3,
+            RankDivision::GrandChampionIDivision1
+            | RankDivision::GrandChampionIDivision2
+            | RankDivision::GrandChampionIDivision3
+            | RankDivision::GrandChampionIDivision4
+            | RankDivision::GrandChampionIIDivision1
+            | RankDivision::GrandChampionIIDivision2
+            | RankDivision::GrandChampionIIDivision3
+            | RankDivision::GrandChampionIIDivision4
+            | RankDivision::GrandChampionIIIDivision1
+            | RankDivision::GrandChampionIIIDivision2
+            | RankDivision::GrandChampionIIIDivision3
+            | RankDivision::GrandChampionIIIDivision4
+            | RankDivision::SupersonicLegend => Self::GrandChampion,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,103 +1269,123 @@ mod tests {
     #[test]
     fn test_mmr_values() {
         // Check some known MMR values
-        assert_eq!(Rank::SupersonicLegend.mmr_min(), 1883);
-        assert_eq!(Rank::SupersonicLegend.mmr_max(), 2000);
+        assert_eq!(RankDivision::SupersonicLegend.mmr_min(), 1883);
+        assert_eq!(RankDivision::SupersonicLegend.mmr_max(), 2000);
 
-        assert_eq!(Rank::GrandChampionIIIDivision1.mmr_min(), 1706);
-        assert_eq!(Rank::GrandChampionIIIDivision1.mmr_max(), 1739);
+        assert_eq!(RankDivision::GrandChampionIIIDivision1.mmr_min(), 1706);
+        assert_eq!(RankDivision::GrandChampionIIIDivision1.mmr_max(), 1739);
 
-        assert_eq!(Rank::BronzeIDivision1.mmr_min(), 0);
-        assert_eq!(Rank::BronzeIDivision1.mmr_max(), 117);
+        assert_eq!(RankDivision::BronzeIDivision1.mmr_min(), 0);
+        assert_eq!(RankDivision::BronzeIDivision1.mmr_max(), 117);
     }
 
     #[test]
     fn test_mmr_middle() {
         // BronzeIDivision1: min=0, max=117, middle=58
-        assert_eq!(Rank::BronzeIDivision1.mmr_middle(), 58);
+        assert_eq!(RankDivision::BronzeIDivision1.mmr_middle(), 58);
         // SupersonicLegend: min=1883, max=2000, middle=1941
-        assert_eq!(Rank::SupersonicLegend.mmr_middle(), 1941);
+        assert_eq!(RankDivision::SupersonicLegend.mmr_middle(), 1941);
     }
 
     #[test]
     fn test_from_rank_id() {
         assert_eq!(
-            Rank::from_rank_id("supersonic-legend", None),
-            Some(Rank::SupersonicLegend)
+            RankDivision::from_rank_id("supersonic-legend", None),
+            Some(RankDivision::SupersonicLegend)
         );
         assert_eq!(
-            Rank::from_rank_id("grand-champion-3", Some(1)),
-            Some(Rank::GrandChampionIIIDivision1)
+            RankDivision::from_rank_id("grand-champion-3", Some(1)),
+            Some(RankDivision::GrandChampionIIIDivision1)
         );
         assert_eq!(
-            Rank::from_rank_id("grand-champion-3", Some(2)),
-            Some(Rank::GrandChampionIIIDivision2)
+            RankDivision::from_rank_id("grand-champion-3", Some(2)),
+            Some(RankDivision::GrandChampionIIIDivision2)
         );
         assert_eq!(
-            Rank::from_rank_id("bronze-1", Some(1)),
-            Some(Rank::BronzeIDivision1)
+            RankDivision::from_rank_id("bronze-1", Some(1)),
+            Some(RankDivision::BronzeIDivision1)
         );
-        assert_eq!(Rank::from_rank_id("unknown-rank", Some(1)), None);
+        assert_eq!(RankDivision::from_rank_id("unknown-rank", Some(1)), None);
     }
 
     #[test]
     fn test_from_str() {
         // Full form
         assert_eq!(
-            "SupersonicLegend".parse::<Rank>().unwrap(),
-            Rank::SupersonicLegend
+            "SupersonicLegend".parse::<RankDivision>().unwrap(),
+            RankDivision::SupersonicLegend
         );
         assert_eq!(
-            "Supersonic Legend".parse::<Rank>().unwrap(),
-            Rank::SupersonicLegend
+            "Supersonic Legend".parse::<RankDivision>().unwrap(),
+            RankDivision::SupersonicLegend
         );
         assert_eq!(
-            "Grand Champion III Division 1".parse::<Rank>().unwrap(),
-            Rank::GrandChampionIIIDivision1
+            "Grand Champion III Division 1"
+                .parse::<RankDivision>()
+                .unwrap(),
+            RankDivision::GrandChampionIIIDivision1
         );
 
         // Short form
-        assert_eq!("ssl".parse::<Rank>().unwrap(), Rank::SupersonicLegend);
         assert_eq!(
-            "gc3d1".parse::<Rank>().unwrap(),
-            Rank::GrandChampionIIIDivision1
+            "ssl".parse::<RankDivision>().unwrap(),
+            RankDivision::SupersonicLegend
         );
-        assert_eq!("c2d3".parse::<Rank>().unwrap(), Rank::ChampionIIDivision3);
-        assert_eq!("d1d4".parse::<Rank>().unwrap(), Rank::DiamondIDivision4);
-        assert_eq!("b1d1".parse::<Rank>().unwrap(), Rank::BronzeIDivision1);
+        assert_eq!(
+            "gc3d1".parse::<RankDivision>().unwrap(),
+            RankDivision::GrandChampionIIIDivision1
+        );
+        assert_eq!(
+            "c2d3".parse::<RankDivision>().unwrap(),
+            RankDivision::ChampionIIDivision3
+        );
+        assert_eq!(
+            "d1d4".parse::<RankDivision>().unwrap(),
+            RankDivision::DiamondIDivision4
+        );
+        assert_eq!(
+            "b1d1".parse::<RankDivision>().unwrap(),
+            RankDivision::BronzeIDivision1
+        );
     }
 
     #[test]
     fn test_from_str_error() {
-        assert!("invalid_rank".parse::<Rank>().is_err());
-        assert!("".parse::<Rank>().is_err());
+        assert!("invalid_rank".parse::<RankDivision>().is_err());
+        assert!("".parse::<RankDivision>().is_err());
     }
 
     #[test]
     fn test_display() {
-        assert_eq!(Rank::SupersonicLegend.to_string(), "Supersonic Legend");
         assert_eq!(
-            Rank::GrandChampionIIIDivision1.to_string(),
+            RankDivision::SupersonicLegend.to_string(),
+            "Supersonic Legend"
+        );
+        assert_eq!(
+            RankDivision::GrandChampionIIIDivision1.to_string(),
             "Grand Champion III Division 1"
         );
-        assert_eq!(Rank::BronzeIDivision1.to_string(), "Bronze I Division 1");
+        assert_eq!(
+            RankDivision::BronzeIDivision1.to_string(),
+            "Bronze I Division 1"
+        );
     }
 
     #[test]
     fn test_all_ranks_ordered() {
-        let ranks: Vec<_> = Rank::all().collect();
+        let ranks: Vec<_> = RankDivision::all().collect();
         assert_eq!(ranks.len(), 85); // 21 ranks * 4 divisions + 1 SSL
 
         // First should be Bronze I Div 1
-        assert_eq!(ranks[0], Rank::BronzeIDivision1);
+        assert_eq!(ranks[0], RankDivision::BronzeIDivision1);
         // Last should be SSL
-        assert_eq!(ranks[84], Rank::SupersonicLegend);
+        assert_eq!(ranks[84], RankDivision::SupersonicLegend);
     }
 
     #[test]
     fn test_ord() {
-        assert!(Rank::BronzeIDivision1 < Rank::BronzeIDivision2);
-        assert!(Rank::BronzeIDivision4 < Rank::BronzeIIDivision1);
-        assert!(Rank::GrandChampionIIIDivision4 < Rank::SupersonicLegend);
+        assert!(RankDivision::BronzeIDivision1 < RankDivision::BronzeIDivision2);
+        assert!(RankDivision::BronzeIDivision4 < RankDivision::BronzeIIDivision1);
+        assert!(RankDivision::GrandChampionIIIDivision4 < RankDivision::SupersonicLegend);
     }
 }

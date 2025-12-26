@@ -2,10 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
-mod ballchasing;
+mod game_mode;
+mod model;
+mod rank;
 mod replay;
 
-pub use ballchasing::*;
+pub use game_mode::*;
+pub use model::*;
+pub use rank::*;
 pub use replay::*;
 
 /// Rank information.

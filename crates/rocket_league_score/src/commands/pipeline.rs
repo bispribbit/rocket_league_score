@@ -7,129 +7,20 @@
 //! 4. Verify loss decreases
 //! 5. Run inference and check output is reasonable
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use burn::backend::cuda::CudaDevice;
 use burn::backend::{Autodiff, Cuda};
 use burn::module::AutodiffModule;
-use database::read_from_object_store;
+use config::OBJECT_STORE;
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
+use object_store::ObjectStoreExt;
+use object_store::path::Path as ObjectStorePath;
 use replay_parser::{parse_replay_from_bytes, segment_by_goals};
-use replay_structs::{BallchasingRank, DownloadStatus, PlayerWithRating, RankInfo, ReplaySummary};
-use tracing::info;
-
-use crate::rank::Rank;
+use replay_structs::{DownloadStatus, Rank};
+use tracing::{error, info};
 
 type TrainBackend = Autodiff<Cuda>;
-
-/// Converts a rank ID and division to MMR using the Rank enum.
-fn rank_to_mmr(rank_info: &RankInfo) -> Option<i32> {
-    Rank::from_rank_id(&rank_info.id, rank_info.division).map(Rank::mmr_middle)
-}
-
-/// Loads metadata for replays from the database.
-async fn load_metadata(limit: Option<usize>) -> Result<HashMap<PathBuf, Vec<PlayerWithRating>>> {
-    // Get all downloaded replays
-    let all_ranks = BallchasingRank::all_ranked();
-    let mut all_replays = Vec::new();
-
-    for rank in all_ranks {
-        let replays =
-            database::list_ballchasing_replays_by_rank(rank, Some(DownloadStatus::Downloaded))
-                .await?;
-        if let Some(max) = limit {
-            let remaining = max.saturating_sub(all_replays.len());
-            if remaining == 0 {
-                break;
-            }
-            if replays.len() > remaining {
-                all_replays.extend(replays.into_iter().take(remaining));
-                break;
-            }
-        }
-        all_replays.extend(replays);
-    }
-
-    let mut metadata_map: HashMap<PathBuf, Vec<PlayerWithRating>> = HashMap::new();
-
-    for replay in all_replays {
-        // Deserialize metadata
-        let summary: ReplaySummary = serde_json::from_value(replay.metadata)
-            .context("Failed to deserialize replay metadata")?;
-
-        let mut players = Vec::new();
-
-        // Extract blue team players
-        if let Some(blue_team) = &summary.blue
-            && let Some(team_players) = &blue_team.players
-        {
-            for player in team_players {
-                let mmr = if let Some(rank) = &player.rank {
-                    rank_to_mmr(rank)
-                } else if let (Some(min_rank), Some(max_rank)) =
-                    (&summary.min_rank, &summary.max_rank)
-                {
-                    // Use middle of min and max rank if player rank is null
-                    let min_mmr = rank_to_mmr(min_rank)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
-                    let max_mmr = rank_to_mmr(max_rank)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to MMR"))?;
-                    Some(i32::midpoint(min_mmr, max_mmr))
-                } else {
-                    None
-                };
-
-                if let (Some(name), Some(mmr_value)) = (player.name.as_ref(), mmr) {
-                    players.push(PlayerWithRating {
-                        player_name: name.clone(),
-                        mmr: mmr_value,
-                    });
-                }
-            }
-        }
-
-        // Extract orange team players
-        if let Some(orange_team) = &summary.orange
-            && let Some(team_players) = &orange_team.players
-        {
-            for player in team_players {
-                let mmr = if let Some(rank) = &player.rank {
-                    rank_to_mmr(rank)
-                } else if let (Some(min_rank), Some(max_rank)) =
-                    (&summary.min_rank, &summary.max_rank)
-                {
-                    // Use middle of min and max rank if player rank is null
-                    let min_mmr = rank_to_mmr(min_rank)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to MMR"))?;
-                    let max_mmr = rank_to_mmr(max_rank)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to MMR"))?;
-                    Some(i32::midpoint(min_mmr, max_mmr))
-                } else {
-                    None
-                };
-
-                if let (Some(name), Some(mmr_value)) = (player.name.as_ref(), mmr) {
-                    players.push(PlayerWithRating {
-                        player_name: name.clone(),
-                        mmr: mmr_value,
-                    });
-                }
-            }
-        }
-
-        if let Some(relative_path) = replay.file_path
-            && !players.is_empty()
-        {
-            // Store relative path - we'll resolve it when reading
-            metadata_map.insert(PathBuf::from(relative_path), players);
-        }
-    }
-
-    Ok(metadata_map)
-}
 
 /// Runs the end-to-end pipeline test.
 ///
@@ -139,12 +30,14 @@ async fn load_metadata(limit: Option<usize>) -> Result<HashMap<PathBuf, Vec<Play
 pub async fn run(num_replays: usize) -> Result<()> {
     info!("=== ML Pipeline End-to-End Test ===");
     // Step 1: Load metadata
-    info!("Step 1: Loading metadata...");
-    let metadata = load_metadata(Some(num_replays)).await?;
-    info!(games_with_metadata = metadata.len(), "Metadata loaded");
+    info!("Step 1: Loading replays metadata...");
+    let replays =
+        database::list_replays_by_rank(Rank::Bronze1, Some(DownloadStatus::Downloaded)).await?;
 
-    if metadata.is_empty() {
-        anyhow::bail!("No valid metadata found");
+    info!(replays = replays.len(), "Replays loaded");
+
+    if replays.is_empty() {
+        anyhow::bail!("No valid replays found");
     }
 
     // Step 2: Find matching replays and extract features
@@ -153,30 +46,37 @@ pub async fn run(num_replays: usize) -> Result<()> {
     let mut replays_processed = 0;
     let mut total_frames = 0;
 
-    for (relative_path, players) in &metadata {
+    for replay in &replays {
         if replays_processed >= num_replays {
             break;
         }
 
+        let replay_path = ObjectStorePath::from(replay.file_path.clone());
+
         // Read from object_store as bytes
-        let replay_data =
-            match read_from_object_store(relative_path.to_string_lossy().as_ref()).await {
-                Ok(data) => data,
+        let replay_data = match OBJECT_STORE
+            .get(&replay_path)
+            .await
+            .context("Failed to read from object_store")
+        {
+            Ok(get_result) => match get_result.bytes().await {
+                Ok(bytes) => bytes,
                 Err(e) => {
-                    info!(
-                        replay = %relative_path.display(),
-                        error = %e,
-                        "Failed to read replay from object_store, skipping"
-                    );
+                    error!(replay = %replay_path.to_string(), error = %e, "Failed to read bytes from object_store, skipping");
                     continue;
                 }
-            };
+            },
+            Err(e) => {
+                error!(replay = %replay_path.to_string(), error = %e, "Failed to read from object_store, skipping");
+                continue;
+            }
+        };
 
         // Parse replay from bytes
         let parsed = match parse_replay_from_bytes(&replay_data) {
             Ok(p) => p,
             Err(e) => {
-                info!(replay = %relative_path.display(), error = %e, "Failed to parse replay, skipping");
+                info!(replay = %replay_path.to_string(), error = %e, "Failed to parse replay, skipping");
                 continue;
             }
         };
@@ -185,12 +85,20 @@ pub async fn run(num_replays: usize) -> Result<()> {
             continue;
         }
 
+        // Get player ratings for this replay
+        let db_players = database::list_replay_players_by_replay(replay.id).await?;
+
+        if db_players.is_empty() {
+            // Skip replays without player ratings
+            continue;
+        }
+
         // Convert player ratings
-        let player_ratings: Vec<PlayerRating> = players
+        let player_ratings: Vec<PlayerRating> = db_players
             .iter()
             .map(|player| PlayerRating {
                 player_name: player.player_name.clone(),
-                mmr: player.mmr,
+                mmr: player.rank_division.mmr_middle(),
             })
             .collect();
 
@@ -209,7 +117,7 @@ pub async fn run(num_replays: usize) -> Result<()> {
 
         replays_processed += 1;
         info!(
-            replay = %relative_path.display(),
+            replay = %replay_path.to_string(),
             frames = parsed.frames.len(),
             "Processed replay"
         );
@@ -218,7 +126,7 @@ pub async fn run(num_replays: usize) -> Result<()> {
     if training_data.is_empty() {
         anyhow::bail!(
             "No training data extracted. Found {} replays in metadata but none matched files on disk",
-            metadata.len()
+            replays.len()
         );
     }
 
@@ -323,59 +231,4 @@ pub async fn run(num_replays: usize) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rank_to_mmr() {
-        use replay_structs::RankInfo;
-
-        // Supersonic Legend: mmr_middle = (1883 + 2000) / 2 = 1941
-        let rank = RankInfo {
-            id: "supersonic-legend".to_string(),
-            tier: None,
-            division: Some(1),
-            name: None,
-        };
-        assert_eq!(rank_to_mmr(&rank), Some(1941));
-
-        // Grand Champion 3 Div 1: mmr_middle = (1706 + 1739) / 2 = 1722
-        let rank = RankInfo {
-            id: "grand-champion-3".to_string(),
-            tier: None,
-            division: Some(1),
-            name: None,
-        };
-        assert_eq!(rank_to_mmr(&rank), Some(1722));
-
-        // Grand Champion 3 Div 2: mmr_middle = (1746 + 1780) / 2 = 1763
-        let rank = RankInfo {
-            id: "grand-champion-3".to_string(),
-            tier: None,
-            division: Some(2),
-            name: None,
-        };
-        assert_eq!(rank_to_mmr(&rank), Some(1763));
-
-        // Grand Champion 3 Div 3: mmr_middle = (1794 + 1809) / 2 = 1801
-        let rank = RankInfo {
-            id: "grand-champion-3".to_string(),
-            tier: None,
-            division: Some(3),
-            name: None,
-        };
-        assert_eq!(rank_to_mmr(&rank), Some(1801));
-
-        // Unknown rank
-        let rank = RankInfo {
-            id: "unknown-rank".to_string(),
-            tier: None,
-            division: Some(1),
-            name: None,
-        };
-        assert_eq!(rank_to_mmr(&rank), None);
-    }
 }

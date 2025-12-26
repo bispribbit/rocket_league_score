@@ -2,54 +2,73 @@
 
 use std::path::Path;
 
-use replay_structs::{GameMode, Replay};
+use replay_structs::{DownloadStatus, Rank, Replay};
 use uuid::Uuid;
 
 use crate::get_pool;
 
-/// Creates a new replay record.
+/// Constructs the file path for a replay based on its ID and rank.
 ///
-/// # Errors
-///
-/// Returns an error if the database operation fails.
-pub async fn insert_replay(file_path: &Path, game_mode: GameMode) -> Result<Replay, sqlx::Error> {
-    let id = Uuid::new_v4();
-    let pool = get_pool();
-
-    sqlx::query_as!(
-        Replay,
-        r#"
-        INSERT INTO replays (id, file_path, game_mode)
-        VALUES ($1, $2, $3)
-        RETURNING id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
-        "#,
-        id,
-        file_path.to_string_lossy().to_string(),
-        game_mode as GameMode
-    )
-    .fetch_one(pool)
-    .await
+/// The path format is: `replays/3v3/{rank_folder_name}/{uuid}.replay`
+pub fn construct_replay_file_path(replay_id: Uuid, rank: Rank) -> String {
+    format!("replays/3v3/{}/{}.replay", rank.as_folder_name(), replay_id)
 }
 
-/// Finds a replay by its file path.
+/// Inserts multiple replay records, skipping duplicates.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn find_replay_by_path(file_path: &Path) -> Result<Option<Replay>, sqlx::Error> {
+pub async fn insert_replays(
+    ids: &[Uuid],
+    ranks: &[Rank],
+    metadata: &[serde_json::Value],
+) -> Result<usize, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Construct file paths for all replays
+    let file_paths: Vec<String> = ids
+        .iter()
+        .zip(ranks.iter())
+        .map(|(id, rank)| construct_replay_file_path(*id, *rank))
+        .collect();
+
     let pool = get_pool();
-    let file_path = file_path.to_string_lossy();
-    sqlx::query_as!(
-        Replay,
+
+    let result = sqlx::query!(
         r#"
-        SELECT id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
-        FROM replays
-        WHERE file_path = $1
+        INSERT INTO replays (id, rank, metadata, file_path)
+        SELECT * FROM unnest($1::uuid[], $2::rank[], $3::jsonb[], $4::text[])
+        ON CONFLICT (id) DO NOTHING
         "#,
-        &file_path
+        ids as &[Uuid],
+        ranks as &[Rank],
+        metadata as &[serde_json::Value],
+        &file_paths as &[String]
     )
-    .fetch_optional(pool)
-    .await
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() as usize)
+}
+
+/// Checks if a replay exists by ID.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn replay_exists(id: Uuid) -> Result<bool, sqlx::Error> {
+    let pool = get_pool();
+    let result = sqlx::query!(
+        r#"SELECT EXISTS(SELECT 1 FROM replays WHERE id = $1) as "exists!""#,
+        id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result.exists)
 }
 
 /// Finds a replay by its ID.
@@ -62,7 +81,7 @@ pub async fn find_replay_by_id(id: Uuid) -> Result<Option<Replay>, sqlx::Error> 
     sqlx::query_as!(
         Replay,
         r#"
-        SELECT id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
+        SELECT id, rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
         FROM replays
         WHERE id = $1
         "#,
@@ -72,41 +91,141 @@ pub async fn find_replay_by_id(id: Uuid) -> Result<Option<Replay>, sqlx::Error> 
     .await
 }
 
-/// Lists all replays for a given game mode.
+/// Finds a replay by its file path.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn list_replays_by_game_mode(game_mode: GameMode) -> Result<Vec<Replay>, sqlx::Error> {
+pub async fn find_replay_by_path(file_path: &Path) -> Result<Option<Replay>, sqlx::Error> {
     let pool = get_pool();
+    let file_path_str = file_path.to_string_lossy();
     sqlx::query_as!(
         Replay,
         r#"
-        SELECT id, file_path, game_mode as "game_mode: GameMode", processed_at, created_at
+        SELECT id, rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
         FROM replays
-        WHERE game_mode = $1
-        ORDER BY created_at DESC
+        WHERE file_path = $1
         "#,
-        game_mode as GameMode
+        &file_path_str
     )
-    .fetch_all(pool)
+    .fetch_optional(pool)
     .await
 }
 
-/// Marks a replay as processed.
+/// Lists replays by rank with optional status filter.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn mark_replay_processed(id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn list_replays_by_rank(
+    rank: Rank,
+    status: Option<DownloadStatus>,
+) -> Result<Vec<Replay>, sqlx::Error> {
+    let pool = get_pool();
+    match status {
+        Some(status) => {
+            sqlx::query_as!(
+                Replay,
+                r#"
+                SELECT id, rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                FROM replays
+                WHERE rank = $1 AND download_status = $2
+                ORDER BY created_at
+                "#,
+                rank as Rank,
+                status as DownloadStatus
+            )
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as!(
+                Replay,
+                r#"
+                SELECT id, rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                FROM replays
+                WHERE rank = $1
+                ORDER BY created_at
+                "#,
+                rank as Rank
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+/// Lists replays pending download (status = `not_downloaded`).
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn list_pending_downloads(
+    rank: Option<Rank>,
+    limit: i64,
+) -> Result<Vec<Replay>, sqlx::Error> {
+    let pool = get_pool();
+    match rank {
+        Some(rank) => {
+            sqlx::query_as!(
+                Replay,
+                r#"
+                SELECT id, rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                FROM replays
+                WHERE rank = $1 AND download_status = 'not_downloaded'
+                ORDER BY created_at
+                LIMIT $2
+                "#,
+                rank as Rank,
+                limit
+            )
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as!(
+                Replay,
+                r#"
+                SELECT id, rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                FROM replays
+                WHERE download_status = 'not_downloaded'
+                ORDER BY created_at
+                LIMIT $1
+                "#,
+                limit
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+/// Updates the download status of a replay.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn update_replay_status(
+    id: Uuid,
+    status: DownloadStatus,
+    file_path: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), sqlx::Error> {
     let pool = get_pool();
     sqlx::query!(
         r#"
         UPDATE replays
-        SET processed_at = NOW()
+        SET 
+            download_status = $2,
+            file_path = COALESCE($3, file_path),
+            error_message = $4,
+            updated_at = NOW()
         WHERE id = $1
         "#,
-        id
+        id,
+        status as DownloadStatus,
+        file_path,
+        error_message
     )
     .execute(pool)
     .await?;
@@ -114,18 +233,110 @@ pub async fn mark_replay_processed(id: Uuid) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// Counts replays by game mode.
+/// Marks a replay as in progress.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn count_replays_by_game_mode(game_mode: GameMode) -> Result<i64, sqlx::Error> {
+pub async fn mark_replay_in_progress(id: Uuid) -> Result<(), sqlx::Error> {
+    update_replay_status(id, DownloadStatus::InProgress, None, None).await
+}
+
+/// Marks a replay as downloaded with its file path.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn mark_replay_downloaded(id: Uuid, file_path: &str) -> Result<(), sqlx::Error> {
+    update_replay_status(id, DownloadStatus::Downloaded, Some(file_path), None).await
+}
+
+/// Marks a replay as failed with an error message.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn mark_replay_failed(id: Uuid, error_message: &str) -> Result<(), sqlx::Error> {
+    update_replay_status(id, DownloadStatus::Failed, None, Some(error_message)).await
+}
+
+/// Resets failed downloads back to `not_downloaded` status.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn reset_failed_downloads() -> Result<u64, sqlx::Error> {
     let pool = get_pool();
     let result = sqlx::query!(
         r#"
-        SELECT COUNT(*) as "count!" FROM replays WHERE game_mode = $1
-        "#,
-        game_mode as GameMode
+        UPDATE replays
+        SET 
+            download_status = 'not_downloaded',
+            error_message = NULL,
+            updated_at = NOW()
+        WHERE download_status = 'failed'
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Resets in-progress downloads back to `not_downloaded` status.
+/// Useful for recovering from interrupted downloads.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn reset_in_progress_downloads() -> Result<u64, sqlx::Error> {
+    let pool = get_pool();
+    let result = sqlx::query!(
+        r#"
+        UPDATE replays
+        SET 
+            download_status = 'not_downloaded',
+            updated_at = NOW()
+        WHERE download_status = 'in_progress'
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Counts replays by rank.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn count_replays_by_rank(rank: Rank) -> Result<i64, sqlx::Error> {
+    let pool = get_pool();
+    let result = sqlx::query!(
+        r#"SELECT COUNT(*) as "count!" FROM replays WHERE rank = $1"#,
+        rank as Rank
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result.count)
+}
+
+/// Counts replays by rank and status.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn count_replays_by_rank_and_status(
+    rank: Rank,
+    status: DownloadStatus,
+) -> Result<i64, sqlx::Error> {
+    let pool = get_pool();
+    let result = sqlx::query!(
+        r#"SELECT COUNT(*) as "count!" FROM replays WHERE rank = $1 AND download_status = $2"#,
+        rank as Rank,
+        status as DownloadStatus
     )
     .fetch_one(pool)
     .await?;

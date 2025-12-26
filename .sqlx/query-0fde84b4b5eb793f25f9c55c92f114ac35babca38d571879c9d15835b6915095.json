@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, rank as \"rank: BallchasingRank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n                FROM ballchasing_replays\n                WHERE rank = $1 AND download_status = 'not_downloaded'\n                ORDER BY created_at\n                LIMIT $2\n                ",
+  "query": "\n        SELECT id, rank as \"rank: Rank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n        FROM replays\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -10,10 +10,10 @@
       },
       {
         "ordinal": 1,
-        "name": "rank: BallchasingRank",
+        "name": "rank: Rank",
         "type_info": {
           "Custom": {
-            "name": "ballchasing_rank",
+            "name": "rank",
             "kind": {
               "Enum": [
                 "unranked",
@@ -86,36 +86,7 @@
     ],
     "parameters": {
       "Left": [
-        {
-          "Custom": {
-            "name": "ballchasing_rank",
-            "kind": {
-              "Enum": [
-                "unranked",
-                "bronze1",
-                "bronze2",
-                "bronze3",
-                "silver1",
-                "silver2",
-                "silver3",
-                "gold1",
-                "gold2",
-                "gold3",
-                "platinum1",
-                "platinum2",
-                "platinum3",
-                "diamond1",
-                "diamond2",
-                "diamond3",
-                "champion1",
-                "champion2",
-                "champion3",
-                "grand_champion"
-              ]
-            }
-          }
-        },
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -123,11 +94,11 @@
       false,
       false,
       false,
-      true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "dcfc634b148432145b3c87e1c4a9c335ea5bfc14c92bdcd4f3860041b16e1c18"
+  "hash": "0fde84b4b5eb793f25f9c55c92f114ac35babca38d571879c9d15835b6915095"
 }

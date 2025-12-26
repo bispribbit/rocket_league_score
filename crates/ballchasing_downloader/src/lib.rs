@@ -10,6 +10,7 @@
 
 pub mod api;
 mod downloader;
+mod players;
 
 pub use api::client::BallchasingClient;
 pub use config::Config;

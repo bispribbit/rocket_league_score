@@ -1,14 +1,15 @@
 //! Train command - trains the ML model on ingested replays.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use burn::backend::cuda::CudaDevice;
 use burn::backend::{Autodiff, Cuda};
-use database::read_from_object_store;
+use config::OBJECT_STORE;
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
+use object_store::ObjectStoreExt;
+use object_store::path::Path as ObjectStorePath;
 use replay_parser::{parse_replay_from_bytes, segment_by_goals};
-use replay_structs::GameMode;
-use tracing::info;
+use tracing::{error, info};
 
 // Training requires Autodiff wrapper for automatic differentiation
 type TrainBackend = Autodiff<Cuda>;
@@ -90,7 +91,16 @@ async fn load_training_data() -> Result<TrainingData> {
     let mut data = TrainingData::new();
 
     // Get all 3v3 replays (our primary training data)
-    let replays = database::list_replays_by_game_mode(GameMode::Soccar3v3).await?;
+    // Note: Since we unified to ballchasing replays, we get all downloaded replays
+    // The metadata should contain game mode information if needed
+    let mut all_replays = Vec::new();
+    for rank in replay_structs::Rank::all_ranked() {
+        let rank_replays =
+            database::list_replays_by_rank(rank, Some(replay_structs::DownloadStatus::Downloaded))
+                .await?;
+        all_replays.extend(rank_replays);
+    }
+    let replays = all_replays;
 
     for replay in replays {
         // Get player ratings for this replay
@@ -106,13 +116,28 @@ async fn load_training_data() -> Result<TrainingData> {
             .iter()
             .map(|p| PlayerRating {
                 player_name: p.player_name.clone(),
-                mmr: p.skill_rating,
+                mmr: p.rank_division.mmr_middle(),
             })
             .collect();
 
         // Read from object_store as bytes
-        let Ok(replay_data) = read_from_object_store(&replay.file_path).await else {
-            continue;
+        let object_path = ObjectStorePath::from(replay.file_path.clone());
+        let replay_data = match OBJECT_STORE
+            .get(&object_path)
+            .await
+            .context("Failed to read from object_store")
+        {
+            Ok(get_result) => match get_result.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!(replay = %object_path.to_string(), error = %e, "Failed to read bytes from object_store, skipping");
+                    continue;
+                }
+            },
+            Err(e) => {
+                error!(replay = %object_path.to_string(), error = %e, "Failed to read from object_store, skipping");
+                continue;
+            }
         };
 
         // Parse the replay from bytes

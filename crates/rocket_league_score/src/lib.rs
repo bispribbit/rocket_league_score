@@ -4,4 +4,3 @@
 //! in Rocket League replays.
 
 pub mod commands;
-pub mod rank;

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT COUNT(*) as \"count!\" FROM ballchasing_replays WHERE rank = $1",
+  "query": "SELECT COUNT(*) as \"count!\" FROM replays WHERE rank = $1 AND download_status = $2",
   "describe": {
     "columns": [
       {
@@ -13,7 +13,7 @@
       "Left": [
         {
           "Custom": {
-            "name": "ballchasing_rank",
+            "name": "rank",
             "kind": {
               "Enum": [
                 "unranked",
@@ -39,6 +39,19 @@
               ]
             }
           }
+        },
+        {
+          "Custom": {
+            "name": "download_status",
+            "kind": {
+              "Enum": [
+                "not_downloaded",
+                "in_progress",
+                "downloaded",
+                "failed"
+              ]
+            }
+          }
         }
       ]
     },
@@ -46,5 +59,5 @@
       null
     ]
   },
-  "hash": "ba0387467c1ac00f5e16cfd7dcd2f82856a05484d81ad6ffcb5925c652548f46"
+  "hash": "1eb99606320f4bd151bdf79a333987a527ed45b222860eb4b9a84470ccb3d039"
 }

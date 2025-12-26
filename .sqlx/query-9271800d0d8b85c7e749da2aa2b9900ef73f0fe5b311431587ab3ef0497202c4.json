@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO ballchasing_replays (id, rank, metadata)\n        SELECT * FROM unnest($1::uuid[], $2::ballchasing_rank[], $3::jsonb[])\n        ON CONFLICT (id) DO NOTHING\n        ",
+  "query": "\n        INSERT INTO replays (id, rank, metadata, file_path)\n        SELECT * FROM unnest($1::uuid[], $2::rank[], $3::jsonb[], $4::text[])\n        ON CONFLICT (id) DO NOTHING\n        ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -8,11 +8,11 @@
         "UuidArray",
         {
           "Custom": {
-            "name": "ballchasing_rank[]",
+            "name": "rank[]",
             "kind": {
               "Array": {
                 "Custom": {
-                  "name": "ballchasing_rank",
+                  "name": "rank",
                   "kind": {
                     "Enum": [
                       "unranked",
@@ -42,10 +42,11 @@
             }
           }
         },
-        "JsonbArray"
+        "JsonbArray",
+        "TextArray"
       ]
     },
     "nullable": []
   },
-  "hash": "3c011831534988410aee0d01926d1d13213c92c22ba2b4007eeda631ba59257f"
+  "hash": "9271800d0d8b85c7e749da2aa2b9900ef73f0fe5b311431587ab3ef0497202c4"
 }
