@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO replays (id, file_path, game_mode)\n        VALUES ($1, $2, $3)\n        RETURNING id, file_path, game_mode as \"game_mode: GameMode\", processed_at, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "file_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "game_mode: GameMode",
+        "type_info": {
+          "Custom": {
+            "name": "game_mode",
+            "kind": {
+              "Enum": [
+                "soccar_3v3",
+                "soccar_2v2",
+                "soccar_1v1",
+                "hoops",
+                "rumble",
+                "dropshot",
+                "snowday"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "processed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        {
+          "Custom": {
+            "name": "game_mode",
+            "kind": {
+              "Enum": [
+                "soccar_3v3",
+                "soccar_2v2",
+                "soccar_1v1",
+                "hoops",
+                "rumble",
+                "dropshot",
+                "snowday"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "71094ff0aea06c54a81cdaad4ec64b511fe683446a2516c39f3163d38b5f6cb5"
+}

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE ballchasing_replays\n        SET \n            download_status = $2,\n            file_path = COALESCE($3, file_path),\n            error_message = $4,\n            updated_at = NOW()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "download_status",
+            "kind": {
+              "Enum": [
+                "not_downloaded",
+                "in_progress",
+                "downloaded",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ec9778bf4c81afdbfc4500354291fdd2017b4fb9b26d445724557c6d5cd3c816"
+}

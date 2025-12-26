@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, name, version, checkpoint_path, training_config, metrics, trained_at\n        FROM models\n        WHERE name = $1\n        ORDER BY version DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "checkpoint_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "training_config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "metrics",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "trained_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "87b1ae78d887e464693e7e1186e5274d575cec325cb3a8f8961182c341d21b7f"
+}

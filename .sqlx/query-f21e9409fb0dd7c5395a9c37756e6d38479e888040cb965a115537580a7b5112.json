@@ -1,0 +1,63 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) as \"count!\" FROM ballchasing_replays WHERE rank = $1 AND download_status = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "ballchasing_rank",
+            "kind": {
+              "Enum": [
+                "unranked",
+                "bronze1",
+                "bronze2",
+                "bronze3",
+                "silver1",
+                "silver2",
+                "silver3",
+                "gold1",
+                "gold2",
+                "gold3",
+                "platinum1",
+                "platinum2",
+                "platinum3",
+                "diamond1",
+                "diamond2",
+                "diamond3",
+                "champion1",
+                "champion2",
+                "champion3",
+                "grand_champion"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "download_status",
+            "kind": {
+              "Enum": [
+                "not_downloaded",
+                "in_progress",
+                "downloaded",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f21e9409fb0dd7c5395a9c37756e6d38479e888040cb965a115537580a7b5112"
+}
