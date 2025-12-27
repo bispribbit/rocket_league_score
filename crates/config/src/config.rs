@@ -7,6 +7,8 @@ use object_store::local::LocalFileSystem;
 
 /// Global object store instance, lazily initialized.
 pub static OBJECT_STORE: LazyLock<Arc<dyn ObjectStore>> = LazyLock::new(|| {
+    dotenvy::dotenv().ok();
+
     let base_path = std::env::var("REPLAY_BASE_PATH")
         .map_or_else(|_| PathBuf::from("/workspace/ballchasing"), PathBuf::from);
 

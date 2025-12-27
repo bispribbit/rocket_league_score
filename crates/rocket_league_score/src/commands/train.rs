@@ -1,8 +1,7 @@
 //! Train command - trains the ML model on ingested replays.
 
 use anyhow::{Context, Result};
-use burn::backend::cuda::CudaDevice;
-use burn::backend::{Autodiff, Cuda};
+use burn::backend::{Autodiff, Wgpu};
 use config::OBJECT_STORE;
 use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
@@ -11,8 +10,10 @@ use object_store::path::Path as ObjectStorePath;
 use replay_parser::{parse_replay_from_bytes, segment_by_goals};
 use tracing::{error, info};
 
+use super::init_wgpu_device;
+
 // Training requires Autodiff wrapper for automatic differentiation
-type TrainBackend = Autodiff<Cuda>;
+type TrainBackend = Autodiff<Wgpu>;
 
 /// Runs the train command.
 ///
@@ -44,7 +45,7 @@ pub async fn run(
     info!(samples = training_data.len(), "Loaded training samples");
 
     // Create model with Autodiff backend for training
-    let device = CudaDevice::default();
+    let device = init_wgpu_device()?;
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 
     // Train model

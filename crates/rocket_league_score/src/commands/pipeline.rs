@@ -8,8 +8,7 @@
 //! 5. Run inference and check output is reasonable
 
 use anyhow::{Context, Result};
-use burn::backend::cuda::CudaDevice;
-use burn::backend::{Autodiff, Cuda};
+use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
 use config::OBJECT_STORE;
 use feature_extractor::{PlayerRating, extract_segment_samples};
@@ -20,7 +19,9 @@ use replay_parser::{parse_replay_from_bytes, segment_by_goals};
 use replay_structs::{DownloadStatus, Rank};
 use tracing::{error, info};
 
-type TrainBackend = Autodiff<Cuda>;
+use super::init_wgpu_device;
+
+type TrainBackend = Autodiff<Wgpu>;
 
 /// Runs the end-to-end pipeline test.
 ///
@@ -139,7 +140,7 @@ pub async fn run(num_replays: usize) -> Result<()> {
 
     // Step 3: Create model
     info!("Step 3: Creating model...");
-    let device = CudaDevice::default();
+    let device = init_wgpu_device()?;
     let model_config = ModelConfig::new();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 
