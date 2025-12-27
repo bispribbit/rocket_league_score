@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::GameMode;
 use crate::Rank;
 use crate::rank::RankDivision;
 
@@ -40,6 +41,7 @@ impl core::fmt::Display for DownloadStatus {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Replay {
     pub id: Uuid,
+    pub game_mode: GameMode,
     pub rank: Rank,
     pub metadata: serde_json::Value,
     pub download_status: DownloadStatus,

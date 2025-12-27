@@ -5,12 +5,13 @@ use core::str::FromStr;
 use core::time::Duration;
 
 use anyhow::{Context, Result};
+use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
 use config::CONFIG;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use replay_structs::{GameMode, Rank, ReplaySummary};
+use replay_structs::{GameMode, Rank, Replay, ReplaySummary};
 use reqwest::Client;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use super::models::ReplayListResponse;
 
 /// Rate limit: 2 requests per second
-const RATE_LIMIT_PER_SECOND: u32 = 2;
+const RATE_LIMIT_PER_SECOND: u32 = 1;
 
 /// Rate limit: 500 requests per hour
 const RATE_LIMIT_PER_HOUR: u32 = 500;
@@ -146,7 +147,7 @@ impl BallchasingClient {
         Ok(data)
     }
 
-    /// Downloads a replay file by ID.
+    /// Downloads a replay file by ID with retry logic for rate limiting.
     ///
     /// # Arguments
     ///
@@ -158,36 +159,65 @@ impl BallchasingClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the download fails.
-    pub async fn download_replay(&self, replay_id: Uuid) -> Result<Bytes> {
-        self.wait_for_rate_limit().await;
+    /// Returns an error if the download fails after retries.
+    pub async fn download_replay(&self, replay: &Replay) -> Result<Bytes> {
+        let client = &self.client;
+        let replay_id_for_closure = replay.id;
 
-        info!("Downloading replay: {replay_id}", replay_id = replay_id,);
+        (|| async {
+            self.wait_for_rate_limit().await;
 
-        let url = format!("{API_BASE_URL}/replays/{replay_id}/file");
+            info!(
+                replay_id = %replay_id_for_closure,
+                "Downloading replay"
+            );
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", &CONFIG.ballchasing_api_key)
-            .send()
-            .await
-            .context("Failed to send download request")?;
+            let url = format!("{API_BASE_URL}/replays/{replay_id_for_closure}/file");
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Download failed with status {status}: {body}");
-        }
+            let response = client
+                .get(&url)
+                .header("Authorization", &CONFIG.ballchasing_api_key)
+                .send()
+                .await
+                .context("Failed to send download request")?;
 
-        let bytes = response
-            .bytes()
-            .await
-            .context("Failed to read replay file bytes")?;
+            let status = response.status();
 
-        info!("Downloaded {} bytes for replay {replay_id}", bytes.len());
+            // Only retry on 429 Too Many Requests
+            if status == 429 {
+                let body = response.text().await.unwrap_or_default();
+                warn!(
+                    replay_id = %replay_id_for_closure,
+                    "Rate limited (429), will retry"
+                );
+                anyhow::bail!("Rate limited (429): {body}");
+            }
 
-        Ok(bytes)
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("Download failed with status {status}: {body}");
+            }
+
+            let bytes = response
+                .bytes()
+                .await
+                .context("Failed to read replay file bytes")?;
+
+            info!(
+                replay_id = %replay_id_for_closure,
+                bytes = bytes.len(),
+                "Downloaded replay"
+            );
+
+            Ok(bytes)
+        })
+        .retry(
+            &ExponentialBuilder::default()
+                .with_max_times(3)
+                .with_min_delay(Duration::from_secs(1))
+                .with_max_delay(Duration::from_secs(8)),
+        )
+        .await
     }
 
     /// Fetches replays for a specific rank, handling pagination.

@@ -173,6 +173,7 @@ CREATE TYPE download_status AS ENUM (
 -- Replay metadata and download tracking
 CREATE TABLE replays (
     id UUID PRIMARY KEY,  -- replay ID (from external API)
+    game_mode game_mode NOT NULL,
     rank rank NOT NULL,
     metadata JSONB NOT NULL,
     download_status download_status NOT NULL DEFAULT 'not_downloaded',
@@ -182,6 +183,9 @@ CREATE TABLE replays (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Index for querying by game mode
+CREATE INDEX idx_replays_game_mode ON replays(game_mode);
+
 -- Index for querying by rank
 CREATE INDEX idx_replays_rank ON replays(rank);
 
@@ -190,6 +194,9 @@ CREATE INDEX idx_replays_download_status ON replays(download_status);
 
 -- Composite index for fetching pending downloads by rank
 CREATE INDEX idx_replays_rank_status ON replays(rank, download_status);
+
+-- Composite index for fetching pending downloads by game mode and rank
+CREATE INDEX idx_replays_game_mode_rank_status ON replays(game_mode, rank, download_status);
 
 
 -- Player ratings per replay (rank division for training labels)

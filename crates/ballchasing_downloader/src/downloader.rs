@@ -1,6 +1,7 @@
 //! Core downloader logic that runs fetch and download in parallel.
 
 use core::fmt::Write as _;
+use core::str::FromStr;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use chrono::Utc;
 use config::OBJECT_STORE;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
-use replay_structs::{DownloadStatus, Rank, ReplayPlayer, ReplaySummary};
+use replay_structs::{DownloadStatus, GameMode, Rank, Replay, ReplayPlayer, ReplaySummary};
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -27,7 +28,7 @@ const TARGET_REPLAYS_PER_RANK: usize = 1100;
 const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
 
 /// Maximum concurrent downloads.
-const MAX_CONCURRENT_DOWNLOADS: usize = 2;
+const MAX_CONCURRENT_DOWNLOADS: usize = 1;
 
 /// Runs the complete download process.
 ///
@@ -94,6 +95,7 @@ async fn fetch_all_metadata(client: Arc<BallchasingClient>) -> Result<()> {
 
             // Store new replays
             let mut ids = Vec::new();
+            let mut game_modes = Vec::new();
             let mut ranks = Vec::new();
             let mut metadata_values = Vec::new();
 
@@ -107,8 +109,24 @@ async fn fetch_all_metadata(client: Arc<BallchasingClient>) -> Result<()> {
                     continue;
                 }
 
+                // Extract game_mode from playlist_id, default to RankedStandard if not available
+                let game_mode =
+                    replay
+                        .playlist_id
+                        .as_ref()
+                        .map_or(GameMode::RankedStandard, |playlist_id| {
+                            GameMode::from_str(playlist_id).unwrap_or_else(|_| {
+                                warn!(
+                                    "Invalid playlist_id: {}, defaulting to ranked_standard",
+                                    playlist_id
+                                );
+                                GameMode::RankedStandard
+                            })
+                        });
+
                 let metadata = serde_json::to_value(&replay)?;
                 ids.push(id);
+                game_modes.push(game_mode);
                 ranks.push(rank);
                 metadata_values.push(metadata);
             }
@@ -117,7 +135,8 @@ async fn fetch_all_metadata(client: Arc<BallchasingClient>) -> Result<()> {
                 continue;
             }
 
-            let created = database::insert_replays(&ids, &ranks, &metadata_values).await?;
+            let created =
+                database::insert_replays(&ids, &game_modes, &ranks, &metadata_values).await?;
             info!("Stored {created} new replays for rank {rank}");
 
             // Extract and insert players for each new replay
@@ -225,7 +244,7 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
             let client = Arc::clone(&client);
 
             let handle = tokio::spawn(async move {
-                let result = download_single(&client, replay.id, replay.rank).await;
+                let result = download_single(&client, &replay).await;
                 drop(permit);
                 result
             });
@@ -245,21 +264,21 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
 }
 
 /// Downloads a single replay file.
-async fn download_single(client: &BallchasingClient, replay_id: Uuid, rank: Rank) -> Result<()> {
+async fn download_single(client: &BallchasingClient, replay: &Replay) -> Result<()> {
     // Mark as in progress
-    database::mark_replay_in_progress(replay_id).await?;
+    database::mark_replay_download_in_progress(replay.id).await?;
 
     // Attempt download
-    match download_and_save(client, replay_id, rank).await {
+    match download_and_save(client, replay).await {
         Ok(relative_path) => {
-            database::mark_replay_downloaded(replay_id, &relative_path).await?;
-            debug!("Downloaded {replay_id}");
+            database::mark_replay_downloaded(replay.id, &relative_path).await?;
+            debug!("Downloaded {}", replay.id);
             Ok(())
         }
         Err(error) => {
             let error_msg = format!("{error:#}");
-            database::mark_replay_failed(replay_id, &error_msg).await?;
-            error!("Failed to download {replay_id}: {error}");
+            database::mark_replay_failed(replay.id, &error_msg).await?;
+            error!("Failed to download {}: {error}", replay.id);
             Err(error)
         }
     }
@@ -268,23 +287,14 @@ async fn download_single(client: &BallchasingClient, replay_id: Uuid, rank: Rank
 /// Downloads replay data and saves to file.
 ///
 /// Returns a relative path from the base data directory.
-async fn download_and_save(
-    client: &BallchasingClient,
-    replay_id: Uuid,
-    rank: Rank,
-) -> Result<String> {
-    let data: Bytes = client.download_replay(replay_id).await?;
+async fn download_and_save(client: &BallchasingClient, replay: &Replay) -> Result<String> {
+    let data: Bytes = client.download_replay(replay).await?;
 
     if data.is_empty() {
         anyhow::bail!("Downloaded replay is empty");
     }
 
-    // Build object store path using forward slashes (object_store handles normalization)
-    let object_path = ObjectStorePath::from(format!(
-        "replays/3v3/{}/{}.replay",
-        rank.as_folder_name(),
-        replay_id
-    ));
+    let object_path = ObjectStorePath::from(replay.file_path.as_str());
 
     // Write to object store
     OBJECT_STORE

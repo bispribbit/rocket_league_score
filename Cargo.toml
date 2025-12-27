@@ -21,6 +21,7 @@ replay_structs = { path = "crates/replay_structs" }
 
 # External workspace dependencies
 anyhow = { version = "1.0.100" }
+backon = { version = "1.6.0" }
 boxcars = { version = "0.10.9" }
 burn = { version = "0.19.1", default-features = false, features = ["train", "cuda", "ndarray", "std", "autodiff"] }
 bytes = { version = "1.11.0" }

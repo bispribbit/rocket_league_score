@@ -6,123 +6,355 @@
 use core::fmt;
 use core::str::FromStr;
 
+use strum::IntoEnumIterator;
+
 /// Represents a Rocket League competitive rank with division.
 ///
 /// Each rank (except Supersonic Legend) has 4 divisions.
 /// MMR values are based on the 3v3 ranked playlist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, sqlx::Type)]
-#[sqlx(type_name = "rank_division", rename_all = "snake_case")]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    sqlx::Type,
+    strum::EnumIter,
+    strum::EnumCount,
+)]
+#[sqlx(type_name = "rank_division")]
 pub enum RankDivision {
     // Bronze I
+    #[sqlx(rename = "bronze1_division1")]
     BronzeIDivision1,
+    #[sqlx(rename = "bronze1_division2")]
     BronzeIDivision2,
+    #[sqlx(rename = "bronze1_division3")]
     BronzeIDivision3,
+    #[sqlx(rename = "bronze1_division4")]
     BronzeIDivision4,
     // Bronze II
+    #[sqlx(rename = "bronze2_division1")]
     BronzeIIDivision1,
+    #[sqlx(rename = "bronze2_division2")]
     BronzeIIDivision2,
+    #[sqlx(rename = "bronze2_division3")]
     BronzeIIDivision3,
+    #[sqlx(rename = "bronze2_division4")]
     BronzeIIDivision4,
     // Bronze III
+    #[sqlx(rename = "bronze3_division1")]
     BronzeIIIDivision1,
+    #[sqlx(rename = "bronze3_division2")]
     BronzeIIIDivision2,
+    #[sqlx(rename = "bronze3_division3")]
     BronzeIIIDivision3,
+    #[sqlx(rename = "bronze3_division4")]
     BronzeIIIDivision4,
     // Silver I
+    #[sqlx(rename = "silver1_division1")]
     SilverIDivision1,
+    #[sqlx(rename = "silver1_division2")]
     SilverIDivision2,
+    #[sqlx(rename = "silver1_division3")]
     SilverIDivision3,
+    #[sqlx(rename = "silver1_division4")]
     SilverIDivision4,
     // Silver II
+    #[sqlx(rename = "silver2_division1")]
     SilverIIDivision1,
+    #[sqlx(rename = "silver2_division2")]
     SilverIIDivision2,
+    #[sqlx(rename = "silver2_division3")]
     SilverIIDivision3,
+    #[sqlx(rename = "silver2_division4")]
     SilverIIDivision4,
     // Silver III
+    #[sqlx(rename = "silver3_division1")]
     SilverIIIDivision1,
+    #[sqlx(rename = "silver3_division2")]
     SilverIIIDivision2,
+    #[sqlx(rename = "silver3_division3")]
     SilverIIIDivision3,
+    #[sqlx(rename = "silver3_division4")]
     SilverIIIDivision4,
     // Gold I
+    #[sqlx(rename = "gold1_division1")]
     GoldIDivision1,
+    #[sqlx(rename = "gold1_division2")]
     GoldIDivision2,
+    #[sqlx(rename = "gold1_division3")]
     GoldIDivision3,
+    #[sqlx(rename = "gold1_division4")]
     GoldIDivision4,
     // Gold II
+    #[sqlx(rename = "gold2_division1")]
     GoldIIDivision1,
+    #[sqlx(rename = "gold2_division2")]
     GoldIIDivision2,
+    #[sqlx(rename = "gold2_division3")]
     GoldIIDivision3,
+    #[sqlx(rename = "gold2_division4")]
     GoldIIDivision4,
     // Gold III
+    #[sqlx(rename = "gold3_division1")]
     GoldIIIDivision1,
+    #[sqlx(rename = "gold3_division2")]
     GoldIIIDivision2,
+    #[sqlx(rename = "gold3_division3")]
     GoldIIIDivision3,
+    #[sqlx(rename = "gold3_division4")]
     GoldIIIDivision4,
     // Platinum I
+    #[sqlx(rename = "platinum1_division1")]
     PlatinumIDivision1,
+    #[sqlx(rename = "platinum1_division2")]
     PlatinumIDivision2,
+    #[sqlx(rename = "platinum1_division3")]
     PlatinumIDivision3,
+    #[sqlx(rename = "platinum1_division4")]
     PlatinumIDivision4,
     // Platinum II
+    #[sqlx(rename = "platinum2_division1")]
     PlatinumIIDivision1,
+    #[sqlx(rename = "platinum2_division2")]
     PlatinumIIDivision2,
+    #[sqlx(rename = "platinum2_division3")]
     PlatinumIIDivision3,
+    #[sqlx(rename = "platinum2_division4")]
     PlatinumIIDivision4,
     // Platinum III
+    #[sqlx(rename = "platinum3_division1")]
     PlatinumIIIDivision1,
+    #[sqlx(rename = "platinum3_division2")]
     PlatinumIIIDivision2,
+    #[sqlx(rename = "platinum3_division3")]
     PlatinumIIIDivision3,
+    #[sqlx(rename = "platinum3_division4")]
     PlatinumIIIDivision4,
     // Diamond I
+    #[sqlx(rename = "diamond1_division1")]
     DiamondIDivision1,
+    #[sqlx(rename = "diamond1_division2")]
     DiamondIDivision2,
+    #[sqlx(rename = "diamond1_division3")]
     DiamondIDivision3,
+    #[sqlx(rename = "diamond1_division4")]
     DiamondIDivision4,
     // Diamond II
+    #[sqlx(rename = "diamond2_division1")]
     DiamondIIDivision1,
+    #[sqlx(rename = "diamond2_division2")]
     DiamondIIDivision2,
+    #[sqlx(rename = "diamond2_division3")]
     DiamondIIDivision3,
+    #[sqlx(rename = "diamond2_division4")]
     DiamondIIDivision4,
     // Diamond III
+    #[sqlx(rename = "diamond3_division1")]
     DiamondIIIDivision1,
+    #[sqlx(rename = "diamond3_division2")]
     DiamondIIIDivision2,
+    #[sqlx(rename = "diamond3_division3")]
     DiamondIIIDivision3,
+    #[sqlx(rename = "diamond3_division4")]
     DiamondIIIDivision4,
     // Champion I
+    #[sqlx(rename = "champion1_division1")]
     ChampionIDivision1,
+    #[sqlx(rename = "champion1_division2")]
     ChampionIDivision2,
+    #[sqlx(rename = "champion1_division3")]
     ChampionIDivision3,
+    #[sqlx(rename = "champion1_division4")]
     ChampionIDivision4,
     // Champion II
+    #[sqlx(rename = "champion2_division1")]
     ChampionIIDivision1,
+    #[sqlx(rename = "champion2_division2")]
     ChampionIIDivision2,
+    #[sqlx(rename = "champion2_division3")]
     ChampionIIDivision3,
+    #[sqlx(rename = "champion2_division4")]
     ChampionIIDivision4,
     // Champion III
+    #[sqlx(rename = "champion3_division1")]
     ChampionIIIDivision1,
+    #[sqlx(rename = "champion3_division2")]
     ChampionIIIDivision2,
+    #[sqlx(rename = "champion3_division3")]
     ChampionIIIDivision3,
+    #[sqlx(rename = "champion3_division4")]
     ChampionIIIDivision4,
     // Grand Champion I
+    #[sqlx(rename = "grand_champion1_division1")]
     GrandChampionIDivision1,
+    #[sqlx(rename = "grand_champion1_division2")]
     GrandChampionIDivision2,
+    #[sqlx(rename = "grand_champion1_division3")]
     GrandChampionIDivision3,
+    #[sqlx(rename = "grand_champion1_division4")]
     GrandChampionIDivision4,
     // Grand Champion II
+    #[sqlx(rename = "grand_champion2_division1")]
     GrandChampionIIDivision1,
+    #[sqlx(rename = "grand_champion2_division2")]
     GrandChampionIIDivision2,
+    #[sqlx(rename = "grand_champion2_division3")]
     GrandChampionIIDivision3,
+    #[sqlx(rename = "grand_champion2_division4")]
     GrandChampionIIDivision4,
     // Grand Champion III
+    #[sqlx(rename = "grand_champion3_division1")]
     GrandChampionIIIDivision1,
+    #[sqlx(rename = "grand_champion3_division2")]
     GrandChampionIIIDivision2,
+    #[sqlx(rename = "grand_champion3_division3")]
     GrandChampionIIIDivision3,
+    #[sqlx(rename = "grand_champion3_division4")]
     GrandChampionIIIDivision4,
     // Supersonic Legend
+    #[sqlx(rename = "supersonic_legend")]
     SupersonicLegend,
 }
 
 impl RankDivision {
+    /// Converts tier and division to `RankDivision`.
+    ///
+    /// # Arguments
+    ///
+    /// * `tier` - Tier number (1 = Bronze1, 21 = GC3, 22 = SSL)
+    /// * `division` - Division number (1-4), ignored for SSL (tier 22)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(RankDivision)` if the tier and division are valid, `None` otherwise.
+    #[must_use]
+    pub fn from_tier_and_division(tier: i32, division: Option<i32>) -> Option<Self> {
+        let division = division.unwrap_or(1).clamp(1, 4);
+
+        match (tier, division) {
+            (22, _) => Some(Self::SupersonicLegend),
+            // Grand Champion III (tier 21)
+            (21, 1) => Some(Self::GrandChampionIIIDivision1),
+            (21, 2) => Some(Self::GrandChampionIIIDivision2),
+            (21, 3) => Some(Self::GrandChampionIIIDivision3),
+            (21, 4) => Some(Self::GrandChampionIIIDivision4),
+            // Grand Champion II (tier 20)
+            (20, 1) => Some(Self::GrandChampionIIDivision1),
+            (20, 2) => Some(Self::GrandChampionIIDivision2),
+            (20, 3) => Some(Self::GrandChampionIIDivision3),
+            (20, 4) => Some(Self::GrandChampionIIDivision4),
+            // Grand Champion I (tier 19)
+            (19, 1) => Some(Self::GrandChampionIDivision1),
+            (19, 2) => Some(Self::GrandChampionIDivision2),
+            (19, 3) => Some(Self::GrandChampionIDivision3),
+            (19, 4) => Some(Self::GrandChampionIDivision4),
+            // Champion III (tier 18)
+            (18, 1) => Some(Self::ChampionIIIDivision1),
+            (18, 2) => Some(Self::ChampionIIIDivision2),
+            (18, 3) => Some(Self::ChampionIIIDivision3),
+            (18, 4) => Some(Self::ChampionIIIDivision4),
+            // Champion II (tier 17)
+            (17, 1) => Some(Self::ChampionIIDivision1),
+            (17, 2) => Some(Self::ChampionIIDivision2),
+            (17, 3) => Some(Self::ChampionIIDivision3),
+            (17, 4) => Some(Self::ChampionIIDivision4),
+            // Champion I (tier 16)
+            (16, 1) => Some(Self::ChampionIDivision1),
+            (16, 2) => Some(Self::ChampionIDivision2),
+            (16, 3) => Some(Self::ChampionIDivision3),
+            (16, 4) => Some(Self::ChampionIDivision4),
+            // Diamond III (tier 15)
+            (15, 1) => Some(Self::DiamondIIIDivision1),
+            (15, 2) => Some(Self::DiamondIIIDivision2),
+            (15, 3) => Some(Self::DiamondIIIDivision3),
+            (15, 4) => Some(Self::DiamondIIIDivision4),
+            // Diamond II (tier 14)
+            (14, 1) => Some(Self::DiamondIIDivision1),
+            (14, 2) => Some(Self::DiamondIIDivision2),
+            (14, 3) => Some(Self::DiamondIIDivision3),
+            (14, 4) => Some(Self::DiamondIIDivision4),
+            // Diamond I (tier 13)
+            (13, 1) => Some(Self::DiamondIDivision1),
+            (13, 2) => Some(Self::DiamondIDivision2),
+            (13, 3) => Some(Self::DiamondIDivision3),
+            (13, 4) => Some(Self::DiamondIDivision4),
+            // Platinum III (tier 12)
+            (12, 1) => Some(Self::PlatinumIIIDivision1),
+            (12, 2) => Some(Self::PlatinumIIIDivision2),
+            (12, 3) => Some(Self::PlatinumIIIDivision3),
+            (12, 4) => Some(Self::PlatinumIIIDivision4),
+            // Platinum II (tier 11)
+            (11, 1) => Some(Self::PlatinumIIDivision1),
+            (11, 2) => Some(Self::PlatinumIIDivision2),
+            (11, 3) => Some(Self::PlatinumIIDivision3),
+            (11, 4) => Some(Self::PlatinumIIDivision4),
+            // Platinum I (tier 10)
+            (10, 1) => Some(Self::PlatinumIDivision1),
+            (10, 2) => Some(Self::PlatinumIDivision2),
+            (10, 3) => Some(Self::PlatinumIDivision3),
+            (10, 4) => Some(Self::PlatinumIDivision4),
+            // Gold III (tier 9)
+            (9, 1) => Some(Self::GoldIIIDivision1),
+            (9, 2) => Some(Self::GoldIIIDivision2),
+            (9, 3) => Some(Self::GoldIIIDivision3),
+            (9, 4) => Some(Self::GoldIIIDivision4),
+            // Gold II (tier 8)
+            (8, 1) => Some(Self::GoldIIDivision1),
+            (8, 2) => Some(Self::GoldIIDivision2),
+            (8, 3) => Some(Self::GoldIIDivision3),
+            (8, 4) => Some(Self::GoldIIDivision4),
+            // Gold I (tier 7)
+            (7, 1) => Some(Self::GoldIDivision1),
+            (7, 2) => Some(Self::GoldIDivision2),
+            (7, 3) => Some(Self::GoldIDivision3),
+            (7, 4) => Some(Self::GoldIDivision4),
+            // Silver III (tier 6)
+            (6, 1) => Some(Self::SilverIIIDivision1),
+            (6, 2) => Some(Self::SilverIIIDivision2),
+            (6, 3) => Some(Self::SilverIIIDivision3),
+            (6, 4) => Some(Self::SilverIIIDivision4),
+            // Silver II (tier 5)
+            (5, 1) => Some(Self::SilverIIDivision1),
+            (5, 2) => Some(Self::SilverIIDivision2),
+            (5, 3) => Some(Self::SilverIIDivision3),
+            (5, 4) => Some(Self::SilverIIDivision4),
+            // Silver I (tier 4)
+            (4, 1) => Some(Self::SilverIDivision1),
+            (4, 2) => Some(Self::SilverIDivision2),
+            (4, 3) => Some(Self::SilverIDivision3),
+            (4, 4) => Some(Self::SilverIDivision4),
+            // Bronze III (tier 3)
+            (3, 1) => Some(Self::BronzeIIIDivision1),
+            (3, 2) => Some(Self::BronzeIIIDivision2),
+            (3, 3) => Some(Self::BronzeIIIDivision3),
+            (3, 4) => Some(Self::BronzeIIIDivision4),
+            // Bronze II (tier 2)
+            (2, 1) => Some(Self::BronzeIIDivision1),
+            (2, 2) => Some(Self::BronzeIIDivision2),
+            (2, 3) => Some(Self::BronzeIIDivision3),
+            (2, 4) => Some(Self::BronzeIIDivision4),
+            // Bronze I (tier 1)
+            (1, 1) => Some(Self::BronzeIDivision1),
+            (1, 2) => Some(Self::BronzeIDivision2),
+            (1, 3) => Some(Self::BronzeIDivision3),
+            (1, 4) => Some(Self::BronzeIDivision4),
+            _ => None,
+        }
+    }
+
+    /// Returns the numeric index of this rank division (0-based).
+    ///
+    /// `BronzeIDivision1` = 0, `SupersonicLegend` = 84.
+    #[must_use]
+    pub const fn as_index(self) -> usize {
+        self as usize
+    }
+
     /// Returns the minimum MMR value for this rank.
     #[must_use]
     #[expect(
@@ -361,214 +593,9 @@ impl RankDivision {
         i32::midpoint(self.mmr_min(), self.mmr_max())
     }
 
-    /// Creates a `Rank` from a rank ID string (e.g., "grand-champion-3") and optional division.
-    ///
-    /// This is useful for parsing metadata from external replay APIs.
-    #[must_use]
-    pub fn from_rank_id(rank_id: &str, division: Option<i32>) -> Option<Self> {
-        let division = division.unwrap_or(1).clamp(1, 4);
-
-        match (rank_id, division) {
-            ("supersonic-legend", _) => Some(Self::SupersonicLegend),
-            // Grand Champion III
-            ("grand-champion-3", 1) => Some(Self::GrandChampionIIIDivision1),
-            ("grand-champion-3", 2) => Some(Self::GrandChampionIIIDivision2),
-            ("grand-champion-3", 3) => Some(Self::GrandChampionIIIDivision3),
-            ("grand-champion-3", 4) => Some(Self::GrandChampionIIIDivision4),
-            // Grand Champion II
-            ("grand-champion-2", 1) => Some(Self::GrandChampionIIDivision1),
-            ("grand-champion-2", 2) => Some(Self::GrandChampionIIDivision2),
-            ("grand-champion-2", 3) => Some(Self::GrandChampionIIDivision3),
-            ("grand-champion-2", 4) => Some(Self::GrandChampionIIDivision4),
-            // Grand Champion I
-            ("grand-champion-1", 1) => Some(Self::GrandChampionIDivision1),
-            ("grand-champion-1", 2) => Some(Self::GrandChampionIDivision2),
-            ("grand-champion-1", 3) => Some(Self::GrandChampionIDivision3),
-            ("grand-champion-1", 4) => Some(Self::GrandChampionIDivision4),
-            // Champion III
-            ("champion-3", 1) => Some(Self::ChampionIIIDivision1),
-            ("champion-3", 2) => Some(Self::ChampionIIIDivision2),
-            ("champion-3", 3) => Some(Self::ChampionIIIDivision3),
-            ("champion-3", 4) => Some(Self::ChampionIIIDivision4),
-            // Champion II
-            ("champion-2", 1) => Some(Self::ChampionIIDivision1),
-            ("champion-2", 2) => Some(Self::ChampionIIDivision2),
-            ("champion-2", 3) => Some(Self::ChampionIIDivision3),
-            ("champion-2", 4) => Some(Self::ChampionIIDivision4),
-            // Champion I
-            ("champion-1", 1) => Some(Self::ChampionIDivision1),
-            ("champion-1", 2) => Some(Self::ChampionIDivision2),
-            ("champion-1", 3) => Some(Self::ChampionIDivision3),
-            ("champion-1", 4) => Some(Self::ChampionIDivision4),
-            // Diamond III
-            ("diamond-3", 1) => Some(Self::DiamondIIIDivision1),
-            ("diamond-3", 2) => Some(Self::DiamondIIIDivision2),
-            ("diamond-3", 3) => Some(Self::DiamondIIIDivision3),
-            ("diamond-3", 4) => Some(Self::DiamondIIIDivision4),
-            // Diamond II
-            ("diamond-2", 1) => Some(Self::DiamondIIDivision1),
-            ("diamond-2", 2) => Some(Self::DiamondIIDivision2),
-            ("diamond-2", 3) => Some(Self::DiamondIIDivision3),
-            ("diamond-2", 4) => Some(Self::DiamondIIDivision4),
-            // Diamond I
-            ("diamond-1", 1) => Some(Self::DiamondIDivision1),
-            ("diamond-1", 2) => Some(Self::DiamondIDivision2),
-            ("diamond-1", 3) => Some(Self::DiamondIDivision3),
-            ("diamond-1", 4) => Some(Self::DiamondIDivision4),
-            // Platinum III
-            ("platinum-3", 1) => Some(Self::PlatinumIIIDivision1),
-            ("platinum-3", 2) => Some(Self::PlatinumIIIDivision2),
-            ("platinum-3", 3) => Some(Self::PlatinumIIIDivision3),
-            ("platinum-3", 4) => Some(Self::PlatinumIIIDivision4),
-            // Platinum II
-            ("platinum-2", 1) => Some(Self::PlatinumIIDivision1),
-            ("platinum-2", 2) => Some(Self::PlatinumIIDivision2),
-            ("platinum-2", 3) => Some(Self::PlatinumIIDivision3),
-            ("platinum-2", 4) => Some(Self::PlatinumIIDivision4),
-            // Platinum I
-            ("platinum-1", 1) => Some(Self::PlatinumIDivision1),
-            ("platinum-1", 2) => Some(Self::PlatinumIDivision2),
-            ("platinum-1", 3) => Some(Self::PlatinumIDivision3),
-            ("platinum-1", 4) => Some(Self::PlatinumIDivision4),
-            // Gold III
-            ("gold-3", 1) => Some(Self::GoldIIIDivision1),
-            ("gold-3", 2) => Some(Self::GoldIIIDivision2),
-            ("gold-3", 3) => Some(Self::GoldIIIDivision3),
-            ("gold-3", 4) => Some(Self::GoldIIIDivision4),
-            // Gold II
-            ("gold-2", 1) => Some(Self::GoldIIDivision1),
-            ("gold-2", 2) => Some(Self::GoldIIDivision2),
-            ("gold-2", 3) => Some(Self::GoldIIDivision3),
-            ("gold-2", 4) => Some(Self::GoldIIDivision4),
-            // Gold I
-            ("gold-1", 1) => Some(Self::GoldIDivision1),
-            ("gold-1", 2) => Some(Self::GoldIDivision2),
-            ("gold-1", 3) => Some(Self::GoldIDivision3),
-            ("gold-1", 4) => Some(Self::GoldIDivision4),
-            // Silver III
-            ("silver-3", 1) => Some(Self::SilverIIIDivision1),
-            ("silver-3", 2) => Some(Self::SilverIIIDivision2),
-            ("silver-3", 3) => Some(Self::SilverIIIDivision3),
-            ("silver-3", 4) => Some(Self::SilverIIIDivision4),
-            // Silver II
-            ("silver-2", 1) => Some(Self::SilverIIDivision1),
-            ("silver-2", 2) => Some(Self::SilverIIDivision2),
-            ("silver-2", 3) => Some(Self::SilverIIDivision3),
-            ("silver-2", 4) => Some(Self::SilverIIDivision4),
-            // Silver I
-            ("silver-1", 1) => Some(Self::SilverIDivision1),
-            ("silver-1", 2) => Some(Self::SilverIDivision2),
-            ("silver-1", 3) => Some(Self::SilverIDivision3),
-            ("silver-1", 4) => Some(Self::SilverIDivision4),
-            // Bronze III
-            ("bronze-3", 1) => Some(Self::BronzeIIIDivision1),
-            ("bronze-3", 2) => Some(Self::BronzeIIIDivision2),
-            ("bronze-3", 3) => Some(Self::BronzeIIIDivision3),
-            ("bronze-3", 4) => Some(Self::BronzeIIIDivision4),
-            // Bronze II
-            ("bronze-2", 1) => Some(Self::BronzeIIDivision1),
-            ("bronze-2", 2) => Some(Self::BronzeIIDivision2),
-            ("bronze-2", 3) => Some(Self::BronzeIIDivision3),
-            ("bronze-2", 4) => Some(Self::BronzeIIDivision4),
-            // Bronze I
-            ("bronze-1", 1) => Some(Self::BronzeIDivision1),
-            ("bronze-1", 2) => Some(Self::BronzeIDivision2),
-            ("bronze-1", 3) => Some(Self::BronzeIDivision3),
-            ("bronze-1", 4) => Some(Self::BronzeIDivision4),
-            _ => None,
-        }
-    }
-
     /// Returns an iterator over all possible ranks in order from lowest to highest.
     pub fn all() -> impl Iterator<Item = Self> {
-        [
-            Self::BronzeIDivision1,
-            Self::BronzeIDivision2,
-            Self::BronzeIDivision3,
-            Self::BronzeIDivision4,
-            Self::BronzeIIDivision1,
-            Self::BronzeIIDivision2,
-            Self::BronzeIIDivision3,
-            Self::BronzeIIDivision4,
-            Self::BronzeIIIDivision1,
-            Self::BronzeIIIDivision2,
-            Self::BronzeIIIDivision3,
-            Self::BronzeIIIDivision4,
-            Self::SilverIDivision1,
-            Self::SilverIDivision2,
-            Self::SilverIDivision3,
-            Self::SilverIDivision4,
-            Self::SilverIIDivision1,
-            Self::SilverIIDivision2,
-            Self::SilverIIDivision3,
-            Self::SilverIIDivision4,
-            Self::SilverIIIDivision1,
-            Self::SilverIIIDivision2,
-            Self::SilverIIIDivision3,
-            Self::SilverIIIDivision4,
-            Self::GoldIDivision1,
-            Self::GoldIDivision2,
-            Self::GoldIDivision3,
-            Self::GoldIDivision4,
-            Self::GoldIIDivision1,
-            Self::GoldIIDivision2,
-            Self::GoldIIDivision3,
-            Self::GoldIIDivision4,
-            Self::GoldIIIDivision1,
-            Self::GoldIIIDivision2,
-            Self::GoldIIIDivision3,
-            Self::GoldIIIDivision4,
-            Self::PlatinumIDivision1,
-            Self::PlatinumIDivision2,
-            Self::PlatinumIDivision3,
-            Self::PlatinumIDivision4,
-            Self::PlatinumIIDivision1,
-            Self::PlatinumIIDivision2,
-            Self::PlatinumIIDivision3,
-            Self::PlatinumIIDivision4,
-            Self::PlatinumIIIDivision1,
-            Self::PlatinumIIIDivision2,
-            Self::PlatinumIIIDivision3,
-            Self::PlatinumIIIDivision4,
-            Self::DiamondIDivision1,
-            Self::DiamondIDivision2,
-            Self::DiamondIDivision3,
-            Self::DiamondIDivision4,
-            Self::DiamondIIDivision1,
-            Self::DiamondIIDivision2,
-            Self::DiamondIIDivision3,
-            Self::DiamondIIDivision4,
-            Self::DiamondIIIDivision1,
-            Self::DiamondIIIDivision2,
-            Self::DiamondIIIDivision3,
-            Self::DiamondIIIDivision4,
-            Self::ChampionIDivision1,
-            Self::ChampionIDivision2,
-            Self::ChampionIDivision3,
-            Self::ChampionIDivision4,
-            Self::ChampionIIDivision1,
-            Self::ChampionIIDivision2,
-            Self::ChampionIIDivision3,
-            Self::ChampionIIDivision4,
-            Self::ChampionIIIDivision1,
-            Self::ChampionIIIDivision2,
-            Self::ChampionIIIDivision3,
-            Self::ChampionIIIDivision4,
-            Self::GrandChampionIDivision1,
-            Self::GrandChampionIDivision2,
-            Self::GrandChampionIDivision3,
-            Self::GrandChampionIDivision4,
-            Self::GrandChampionIIDivision1,
-            Self::GrandChampionIIDivision2,
-            Self::GrandChampionIIDivision3,
-            Self::GrandChampionIIDivision4,
-            Self::GrandChampionIIIDivision1,
-            Self::GrandChampionIIIDivision2,
-            Self::GrandChampionIIIDivision3,
-            Self::GrandChampionIIIDivision4,
-            Self::SupersonicLegend,
-        ]
-        .into_iter()
+        Self::iter()
     }
 }
 
@@ -1170,6 +1197,14 @@ impl FromStr for Rank {
     }
 }
 
+impl From<crate::RankInfo> for RankDivision {
+    fn from(rank_info: crate::RankInfo) -> Self {
+        let tier = rank_info.tier.unwrap_or(1);
+        let division = rank_info.division;
+        Self::from_tier_and_division(tier, division).unwrap_or(Self::BronzeIDivision1)
+    }
+}
+
 impl From<RankDivision> for Rank {
     fn from(division: RankDivision) -> Self {
         match division {
@@ -1288,24 +1323,63 @@ mod tests {
     }
 
     #[test]
-    fn test_from_rank_id() {
+    fn test_from_tier_and_division() {
         assert_eq!(
-            RankDivision::from_rank_id("supersonic-legend", None),
+            RankDivision::from_tier_and_division(22, None),
             Some(RankDivision::SupersonicLegend)
         );
         assert_eq!(
-            RankDivision::from_rank_id("grand-champion-3", Some(1)),
+            RankDivision::from_tier_and_division(21, Some(1)),
             Some(RankDivision::GrandChampionIIIDivision1)
         );
         assert_eq!(
-            RankDivision::from_rank_id("grand-champion-3", Some(2)),
+            RankDivision::from_tier_and_division(21, Some(2)),
             Some(RankDivision::GrandChampionIIIDivision2)
         );
         assert_eq!(
-            RankDivision::from_rank_id("bronze-1", Some(1)),
+            RankDivision::from_tier_and_division(1, Some(1)),
             Some(RankDivision::BronzeIDivision1)
         );
-        assert_eq!(RankDivision::from_rank_id("unknown-rank", Some(1)), None);
+        assert_eq!(RankDivision::from_tier_and_division(0, Some(1)), None);
+        assert_eq!(RankDivision::from_tier_and_division(23, Some(1)), None);
+    }
+
+    #[test]
+    fn test_from_rank_info() {
+        use crate::RankInfo;
+        assert_eq!(
+            RankDivision::from(RankInfo {
+                id: "supersonic-legend".to_string(),
+                tier: Some(22),
+                division: None,
+                name: None,
+            }),
+            RankDivision::SupersonicLegend
+        );
+        assert_eq!(
+            RankDivision::from(RankInfo {
+                id: "grand-champion-3".to_string(),
+                tier: Some(21),
+                division: Some(1),
+                name: None,
+            }),
+            RankDivision::GrandChampionIIIDivision1
+        );
+        assert_eq!(
+            RankDivision::from(RankInfo {
+                id: "bronze-1".to_string(),
+                tier: Some(1),
+                division: Some(1),
+                name: None,
+            }),
+            RankDivision::BronzeIDivision1
+        );
+    }
+
+    #[test]
+    fn test_as_index() {
+        assert_eq!(RankDivision::BronzeIDivision1.as_index(), 0);
+        assert_eq!(RankDivision::SupersonicLegend.as_index(), 84);
     }
 
     #[test]

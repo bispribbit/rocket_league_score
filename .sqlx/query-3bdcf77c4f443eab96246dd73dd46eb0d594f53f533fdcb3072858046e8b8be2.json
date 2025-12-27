@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO replays (id, game_mode, rank, metadata, file_path)\n        SELECT * FROM unnest($1::uuid[], $2::game_mode[], $3::rank[], $4::jsonb[], $5::text[])\n        ON CONFLICT (id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        {
+          "Custom": {
+            "name": "game_mode[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "game_mode",
+                  "kind": {
+                    "Enum": [
+                      "unranked_duels",
+                      "unranked_doubles",
+                      "unranked_standard",
+                      "unranked_chaos",
+                      "private",
+                      "season",
+                      "offline",
+                      "ranked_duels",
+                      "ranked_doubles",
+                      "ranked_solo_standard",
+                      "ranked_standard",
+                      "snowday",
+                      "rocketlabs",
+                      "hoops",
+                      "rumble",
+                      "tournament",
+                      "dropshot",
+                      "ranked_hoops",
+                      "ranked_rumble",
+                      "ranked_dropshot",
+                      "ranked_snowday",
+                      "dropshot_rumble",
+                      "heatseeker"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "rank[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "rank",
+                  "kind": {
+                    "Enum": [
+                      "unranked",
+                      "bronze1",
+                      "bronze2",
+                      "bronze3",
+                      "silver1",
+                      "silver2",
+                      "silver3",
+                      "gold1",
+                      "gold2",
+                      "gold3",
+                      "platinum1",
+                      "platinum2",
+                      "platinum3",
+                      "diamond1",
+                      "diamond2",
+                      "diamond3",
+                      "champion1",
+                      "champion2",
+                      "champion3",
+                      "grand_champion"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "JsonbArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3bdcf77c4f443eab96246dd73dd46eb0d594f53f533fdcb3072858046e8b8be2"
+}

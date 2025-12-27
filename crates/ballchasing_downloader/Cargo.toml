@@ -21,6 +21,7 @@ replay_structs.workspace = true
 
 # External dependencies
 anyhow.workspace = true
+backon.workspace = true
 governor.workspace = true
 object_store.workspace = true
 reqwest.workspace = true

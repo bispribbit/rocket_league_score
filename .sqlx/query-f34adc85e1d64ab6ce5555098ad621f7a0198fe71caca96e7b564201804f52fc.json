@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, rank as \"rank: Rank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n        FROM replays\n        WHERE file_path = $1\n        ",
+  "query": "\n        SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n        FROM replays\n        WHERE file_path = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -10,6 +10,42 @@
       },
       {
         "ordinal": 1,
+        "name": "game_mode: GameMode",
+        "type_info": {
+          "Custom": {
+            "name": "game_mode",
+            "kind": {
+              "Enum": [
+                "unranked_duels",
+                "unranked_doubles",
+                "unranked_standard",
+                "unranked_chaos",
+                "private",
+                "season",
+                "offline",
+                "ranked_duels",
+                "ranked_doubles",
+                "ranked_solo_standard",
+                "ranked_standard",
+                "snowday",
+                "rocketlabs",
+                "hoops",
+                "rumble",
+                "tournament",
+                "dropshot",
+                "ranked_hoops",
+                "ranked_rumble",
+                "ranked_dropshot",
+                "ranked_snowday",
+                "dropshot_rumble",
+                "heatseeker"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 2,
         "name": "rank: Rank",
         "type_info": {
           "Custom": {
@@ -42,12 +78,12 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "metadata",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "download_status: DownloadStatus",
         "type_info": {
           "Custom": {
@@ -64,22 +100,22 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "file_path",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "error_message",
         "type_info": "Text"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -95,10 +131,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "54297a1efbe37d4c25ff7698564fb7c3739906feb247690f6a597eb0a6210788"
+  "hash": "f34adc85e1d64ab6ce5555098ad621f7a0198fe71caca96e7b564201804f52fc"
 }

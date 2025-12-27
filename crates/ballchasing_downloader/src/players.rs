@@ -27,97 +27,85 @@ pub struct ExtractedPlayer {
 /// # Errors
 ///
 /// Returns an error if the metadata cannot be deserialized or if rank conversion fails.
+#[expect(clippy::option_if_let_else, reason = "readibility")]
 pub fn extract_players_from_metadata(
     metadata: &serde_json::Value,
 ) -> anyhow::Result<Vec<ExtractedPlayer>> {
     use anyhow::Context;
-    use replay_structs::{RankDivision, ReplaySummary};
+    use replay_structs::{RankDivision, RankInfo, ReplaySummary};
 
     let summary: ReplaySummary = serde_json::from_value(metadata.clone())
         .context("Failed to deserialize replay metadata")?;
 
     let mut players = Vec::new();
 
-    // Extract blue team players (team 0)
-    if let Some(blue_team) = &summary.blue
-        && let Some(team_players) = &blue_team.players
-    {
+    // Helper function to extract rank division from a player's rank or use midpoint
+    let get_rank_division = |player_rank: &Option<RankInfo>,
+                             min_rank: &Option<RankInfo>,
+                             max_rank: &Option<RankInfo>|
+     -> anyhow::Result<Option<RankDivision>> {
+        if let Some(rank) = player_rank {
+            Ok(Some(rank.clone().into()))
+        } else if let (Some(min_rank), Some(max_rank)) = (min_rank, max_rank) {
+            // Use middle division if player rank is null
+            let min_division: RankDivision = min_rank.clone().into();
+            let max_division: RankDivision = max_rank.clone().into();
+
+            // Find middle division between min and max using indices
+            let min_idx = min_division.as_index();
+            let max_idx = max_division.as_index();
+            let mid_idx = usize::midpoint(min_idx, max_idx);
+
+            // Convert index back to RankDivision
+            let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
+            Ok(all_divisions.get(mid_idx).copied())
+        } else {
+            Ok(None)
+        }
+    };
+
+    // Helper function to process a team's players
+    let process_team = |team_players: &[replay_structs::PlayerSummary],
+                        team_number: i16,
+                        min_rank: &Option<RankInfo>,
+                        max_rank: &Option<RankInfo>|
+     -> anyhow::Result<Vec<ExtractedPlayer>> {
+        let mut team_players_vec = Vec::new();
         for player in team_players {
-            let rank_division = if let Some(rank) = &player.rank {
-                RankDivision::from_rank_id(&rank.id, rank.division)
-            } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank)
-            {
-                // Use middle division if player rank is null
-                let min_division = RankDivision::from_rank_id(&min_rank.id, min_rank.division)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to RankDivision"))?;
-                let max_division = RankDivision::from_rank_id(&max_rank.id, max_rank.division)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to RankDivision"))?;
-
-                // Find middle division between min and max
-                let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
-                let min_idx = all_divisions
-                    .iter()
-                    .position(|&d| d == min_division)
-                    .ok_or_else(|| anyhow::anyhow!("min_rank not found in all divisions"))?;
-                let max_idx = all_divisions
-                    .iter()
-                    .position(|&d| d == max_division)
-                    .ok_or_else(|| anyhow::anyhow!("max_rank not found in all divisions"))?;
-                let mid_idx = usize::midpoint(min_idx, max_idx);
-                all_divisions.get(mid_idx).copied()
-            } else {
-                None
-            };
-
+            let rank_division = get_rank_division(&player.rank, min_rank, max_rank)?;
             if let (Some(name), Some(rank_div)) = (player.name.as_ref(), rank_division) {
-                players.push(ExtractedPlayer {
+                team_players_vec.push(ExtractedPlayer {
                     player_name: name.clone(),
-                    team: 0,
+                    team: team_number,
                     rank_division: rank_div,
                 });
             }
         }
+        Ok(team_players_vec)
+    };
+
+    // Extract blue team players (team 0)
+    if let Some(blue_team) = &summary.blue
+        && let Some(team_players) = &blue_team.players
+    {
+        players.extend(process_team(
+            team_players,
+            0,
+            &summary.min_rank,
+            &summary.max_rank,
+        )?);
     }
 
     // Extract orange team players (team 1)
     if let Some(orange_team) = &summary.orange
         && let Some(team_players) = &orange_team.players
     {
-        for player in team_players {
-            let rank_division = if let Some(rank) = &player.rank {
-                RankDivision::from_rank_id(&rank.id, rank.division)
-            } else if let (Some(min_rank), Some(max_rank)) = (&summary.min_rank, &summary.max_rank)
-            {
-                // Use middle division if player rank is null
-                let min_division = RankDivision::from_rank_id(&min_rank.id, min_rank.division)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to convert min_rank to RankDivision"))?;
-                let max_division = RankDivision::from_rank_id(&max_rank.id, max_rank.division)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to convert max_rank to RankDivision"))?;
-
-                // Find middle division between min and max
-                let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
-                let min_idx = all_divisions
-                    .iter()
-                    .position(|&d| d == min_division)
-                    .ok_or_else(|| anyhow::anyhow!("min_rank not found in all divisions"))?;
-                let max_idx = all_divisions
-                    .iter()
-                    .position(|&d| d == max_division)
-                    .ok_or_else(|| anyhow::anyhow!("max_rank not found in all divisions"))?;
-                let mid_idx = usize::midpoint(min_idx, max_idx);
-                all_divisions.get(mid_idx).copied()
-            } else {
-                None
-            };
-
-            if let (Some(name), Some(rank_div)) = (player.name.as_ref(), rank_division) {
-                players.push(ExtractedPlayer {
-                    player_name: name.clone(),
-                    team: 1,
-                    rank_division: rank_div,
-                });
-            }
-        }
+        players.extend(process_team(
+            team_players,
+            1,
+            &summary.min_rank,
+            &summary.max_rank,
+        )?);
     }
 
     Ok(players)
