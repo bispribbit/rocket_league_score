@@ -36,11 +36,8 @@ fn find_pri_for_car(
     // Find all actors that reference this car (components)
     if let Some(referencers) = reverse_actor_links.get(&car_id) {
         for &referencer in referencers {
-            // Check if this referencer is a PRI with a name
-            if player_infos
-                .get(&referencer)
-                .is_some_and(|p| !p.name.is_empty())
-            {
+            // Check if this referencer is a PRI (name may come later)
+            if player_infos.contains_key(&referencer) {
                 return Some(referencer);
             }
 
@@ -48,10 +45,7 @@ fn find_pri_for_car(
             if let Some(referenced_list) = actor_links.get(&referencer) {
                 for &referenced_by_component in referenced_list {
                     // Check if the referenced actor is a PRI
-                    if player_infos
-                        .get(&referenced_by_component)
-                        .is_some_and(|p| !p.name.is_empty())
-                    {
+                    if player_infos.contains_key(&referenced_by_component) {
                         return Some(referenced_by_component);
                     }
                     // Recursively check
@@ -117,6 +111,10 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     let goals = extract_goals(replay);
     let goal_frames: Vec<usize> = goals.iter().map(|goal| goal.frame).collect();
 
+    // Extract player name -> team mapping from header's PlayerStats
+    // This is the authoritative source and helps with reconnecting players
+    let header_player_teams = extract_player_teams_from_header(replay);
+
     // Find object IDs for important types
     let ball_object_id = find_object_id(&replay.objects, "Archetypes.Ball.Ball_Default");
     let car_object_id = find_object_id(&replay.objects, "Archetypes.Car.Car_Default");
@@ -151,6 +149,10 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
 
     // Cache for player names to reuse Arc<String> across frames
     let mut name_cache: HashMap<String, Arc<String>> = HashMap::new();
+
+    // Persistent cache: player name -> team mapping (survives reconnections)
+    // Initialize with authoritative data from replay header
+    let mut player_name_to_team: HashMap<String, Team> = header_player_teams;
 
     // State tracking for frame reconstruction
     let mut current_seconds_remaining: i32 = 300;
@@ -190,6 +192,8 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             boost_actors.remove(&actor_id);
             player_infos.remove(&actor_id);
             car_to_actor_id.remove(&actor_id);
+            // Also remove any car_to_actor_id entries that point TO this deleted actor (PRI deletion)
+            car_to_actor_id.retain(|_, &mut pri_id| pri_id != actor_id);
             actor_links.remove(&actor_id);
             // Remove any links that point to this actor
             for links in actor_links.values_mut() {
@@ -251,6 +255,16 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         let info = player_infos.entry(actor_id).or_default();
                         info.name.clone_from(name);
 
+                        // If we already know this player's team from a previous session, restore it
+                        if info.team.is_none() {
+                            if let Some(&cached_team) = player_name_to_team.get(name) {
+                                info.team = Some(cached_team);
+                            }
+                        } else if let Some(team) = info.team {
+                            // Cache the player name -> team mapping
+                            player_name_to_team.insert(name.clone(), team);
+                        }
+
                         // Update all cars that might link to this PRI
                         for &car_id in car_actors.keys() {
                             if !car_to_actor_id.contains_key(&car_id) {
@@ -268,7 +282,12 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                 Attribute::TeamPaint(team_paint) => {
                     // Also check if this is a player info
                     if let Some(info) = player_infos.get_mut(&actor_id) {
-                        info.team = Some(Team::from(team_paint.team));
+                        let team = Team::from(team_paint.team);
+                        info.team = Some(team);
+                        // Cache the player name -> team mapping for reconnection handling
+                        if !info.name.is_empty() {
+                            player_name_to_team.insert(info.name.clone(), team);
+                        }
                     }
                 }
                 Attribute::FlaggedByte(flagged, team_id) => {
@@ -279,7 +298,12 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         && let Some(info) = player_infos.get_mut(&actor_id)
                     {
                         // team_id typically encodes the team (0 or 1)
-                        info.team = Some(Team::from(*team_id % 2));
+                        let team = Team::from(*team_id % 2);
+                        info.team = Some(team);
+                        // Cache the player name -> team mapping for reconnection handling
+                        if !info.name.is_empty() {
+                            player_name_to_team.insert(info.name.clone(), team);
+                        }
                     }
                 }
                 Attribute::ActiveActor(active_actor) => {
@@ -310,10 +334,9 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
 
                     // KEY INSIGHT: A car actor can directly reference its PRI via ActiveActor!
                     // If THIS actor is a car and the referenced actor is a PRI, link them directly
+                    // Note: We link even if the PRI doesn't have a name yet - the name may come later
                     if car_actors.contains_key(&actor_id)
-                        && player_infos
-                            .get(&referenced_actor)
-                            .is_some_and(|p| !p.name.is_empty())
+                        && player_infos.contains_key(&referenced_actor)
                     {
                         car_to_actor_id.insert(actor_id, referenced_actor);
                     }
@@ -324,9 +347,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         if let Some(component_refs) = actor_links.get(&actor_id) {
                             for &component_ref in component_refs {
                                 if component_ref != referenced_actor
-                                    && player_infos
-                                        .get(&component_ref)
-                                        .is_some_and(|p| !p.name.is_empty())
+                                    && player_infos.contains_key(&component_ref)
                                 {
                                     car_to_actor_id.insert(referenced_actor, component_ref);
                                     break;
@@ -347,10 +368,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                     }
 
                     // If this component references a PRI, check if any cars reference this component
-                    if player_infos
-                        .get(&referenced_actor)
-                        .is_some_and(|p| !p.name.is_empty())
-                    {
+                    if player_infos.contains_key(&referenced_actor) {
                         // This component references a PRI - check if any cars reference this component
                         if let Some(car_referencers) = reverse_actor_links.get(&actor_id) {
                             for &car_id in car_referencers {
@@ -447,11 +465,20 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
 
                 let boost = boost_amounts.get(&car_id).copied().unwrap_or(car.boost);
 
-                // Determine team - try player info first, otherwise use car position heuristic
-                let team = player_info.and_then(|p| p.team).unwrap_or_else(|| {
-                    // Heuristic: cars on positive Y side at start are team 1
-                    Team::from(u8::from(car.position.y > 0.0))
-                });
+                // Get the player name if available
+                let player_name = player_info.filter(|p| !p.name.is_empty()).map(|p| &p.name);
+
+                // Determine team - try player info first, then cached team by name, finally position heuristic
+                let team = player_info
+                    .and_then(|p| p.team)
+                    .or_else(|| {
+                        // Try the persistent name -> team cache (from header or previous frames)
+                        player_name.and_then(|n| player_name_to_team.get(n).copied())
+                    })
+                    .unwrap_or_else(|| {
+                        // Heuristic: cars on positive Y side at start are team 1
+                        Team::from(u8::from(car.position.y > 0.0))
+                    });
 
                 let mut actor_state = car.clone();
                 actor_state.boost = boost;
@@ -516,11 +543,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                 };
 
                 for &component_ref in component_refs {
-                    if component_ref != car_id
-                        && player_infos
-                            .get(&component_ref)
-                            .is_some_and(|p| !p.name.is_empty())
-                    {
+                    if component_ref != car_id && player_infos.contains_key(&component_ref) {
                         car_to_actor_id.insert(car_id, component_ref);
                         break;
                     }
@@ -580,6 +603,39 @@ fn extract_goals(replay: &Replay) -> Vec<GoalEvent> {
 
 fn find_object_id(objects: &[String], name: &str) -> Option<usize> {
     objects.iter().position(|o| o == name)
+}
+
+/// Extract player name -> team mapping from the replay header's `PlayerStats`.
+/// This is the authoritative source for team assignments.
+fn extract_player_teams_from_header(replay: &Replay) -> HashMap<String, Team> {
+    let mut player_teams = HashMap::new();
+
+    for (key, value) in &replay.properties {
+        if key == "PlayerStats"
+            && let HeaderProp::Array(player_stats) = value
+        {
+            for player_props in player_stats {
+                let mut name = String::new();
+                let mut team: Option<u8> = None;
+
+                for (prop_key, prop_value) in player_props {
+                    match (prop_key.as_str(), prop_value) {
+                        ("Name", HeaderProp::Str(n)) => name.clone_from(n),
+                        ("Team", HeaderProp::Int(t)) => team = Some(*t as u8),
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty()
+                    && let Some(t) = team
+                {
+                    player_teams.insert(name, Team::from(t));
+                }
+            }
+        }
+    }
+
+    player_teams
 }
 
 #[cfg(test)]
@@ -656,7 +712,6 @@ mod tests {
 
         // Check player names are properly parsed in player_name field
         info!("=== PLAYER NAMES ===");
-        let mut player_name_to_team: HashMap<String, Team> = HashMap::new();
 
         // Expected players: Blue (team 0) and Orange (team 1)
         let expected_blue_players = ["Dtwlve1", "Rip.the.Trip", "Ah perro!"];
@@ -665,6 +720,10 @@ mod tests {
         // Check frames to find player names in PlayerState.name
         // Also verify each frame that player names match expected teams
         for frame in &parsed.frames {
+            assert!(
+                frame.players.len() >= 5,
+                "There should be at least 5 players in each frame in this replay"
+            );
             for player in &frame.players {
                 // Verify player name is in the expected list for their team
                 match player.team {
