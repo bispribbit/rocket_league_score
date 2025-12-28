@@ -15,11 +15,11 @@ use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
-use replay_parser::{parse_replay_from_bytes, segment_by_goals};
+use replay_parser::parse_replay_from_bytes;
 use replay_structs::{DownloadStatus, Rank};
 use tracing::{error, info};
 
-use super::init_wgpu_device;
+use super::init_device;
 
 type TrainBackend = Autodiff<Wgpu>;
 
@@ -99,22 +99,16 @@ pub async fn run(num_replays: usize) -> Result<()> {
             .iter()
             .map(|player| PlayerRating {
                 player_name: player.player_name.clone(),
+                team: player.team,
                 mmr: player.rank_division.mmr_middle(),
             })
             .collect();
 
-        // Segment by goals and extract features
-        let segments = segment_by_goals(&parsed);
+        info!(replay = %replay.id, "Player ratings {player_ratings:?}. Players: {db_players:?}");
 
-        for segment in segments {
-            let Some(frames) = parsed.frames.get(segment.start_frame..segment.end_frame) else {
-                continue;
-            };
-
-            let samples = extract_segment_samples(frames, &player_ratings);
-            training_data.add_samples(samples);
-            total_frames += frames.len();
-        }
+        let samples = extract_segment_samples(&parsed.frames, &player_ratings);
+        training_data.add_samples(samples);
+        total_frames += parsed.frames.len();
 
         replays_processed += 1;
         info!(
@@ -140,7 +134,7 @@ pub async fn run(num_replays: usize) -> Result<()> {
 
     // Step 3: Create model
     info!("Step 3: Creating model...");
-    let device = init_wgpu_device()?;
+    let device = init_device();
     let model_config = ModelConfig::new();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 

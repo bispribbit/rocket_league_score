@@ -5,4 +5,4 @@ pub mod pipeline;
 pub mod predict;
 pub mod train;
 
-pub use device::init_wgpu_device;
+pub use device::init_device;

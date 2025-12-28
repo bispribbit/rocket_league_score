@@ -1,32 +1,22 @@
 //! Common structs for replay metadata shared across crates.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 mod game_mode;
+mod math;
 mod model;
 mod rank;
 mod replay;
+mod team;
 
 pub use game_mode::*;
+pub use math::*;
 pub use model::*;
 pub use rank::*;
 pub use replay::*;
-
-/// Rank information.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RankInfo {
-    /// Rank ID (e.g., "grand-champion-3")
-    pub id: String,
-
-    /// Tier number
-    pub tier: Option<i32>,
-
-    /// Division number (1-4)
-    pub division: Option<i32>,
-
-    /// Human-readable name
-    pub name: Option<String>,
-}
+pub use team::*;
 
 /// Player ID information.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,19 +48,6 @@ pub struct PlayerSummary {
 
     /// Car name
     pub car_name: Option<String>,
-}
-
-/// Team data.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TeamData {
-    /// Team color
-    pub color: Option<String>,
-
-    /// Team players
-    pub players: Option<Vec<PlayerSummary>>,
-
-    /// Team goals
-    pub goals: Option<i32>,
 }
 
 /// Summary information for a replay from the list endpoint.
@@ -221,9 +198,62 @@ pub struct PlayerRank {
 /// Player with rating information (replaces tuple usage).
 #[derive(Debug, Clone)]
 pub struct PlayerWithRating {
-    /// Player name
-    pub player_name: String,
+    /// Player information
+    pub player_info: PlayerInfo,
 
     /// Player MMR
     pub mmr: i32,
+}
+
+/// State of the ball at a given frame.
+#[derive(Debug, Clone, Default)]
+pub struct BallState {
+    pub position: Vector3,
+    pub velocity: Vector3,
+}
+
+/// State of a player at a given frame.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerState {
+    pub actor_id: i32,
+    pub name: Arc<String>,
+    pub team: Team,
+    pub actor_state: ActorState,
+}
+
+/// A single frame of game state.
+#[derive(Debug, Clone, Default)]
+pub struct GameFrame {
+    pub time: f32,
+    pub delta: f32,
+    pub seconds_remaining: i32,
+    pub ball: BallState,
+    pub players: Vec<PlayerState>,
+}
+
+/// Goal event extracted from replay header.
+#[derive(Debug, Clone)]
+pub struct GoalEvent {
+    pub frame: usize,
+    pub player_name: String,
+    pub player_team: Team,
+}
+
+/// A fully parsed replay containing metadata and all frames.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedReplay {
+    pub frames: Vec<GameFrame>,
+    pub goals: Vec<GoalEvent>,
+    pub goal_frames: Vec<usize>,
+    pub kickoff_frames: Vec<usize>,
+}
+
+/// Internal state for tracking actors during parsing.
+#[derive(Debug, Clone, Default)]
+pub struct ActorState {
+    pub position: Vector3,
+    pub velocity: Vector3,
+    pub rotation: Quaternion,
+    pub boost: f32,
+    pub is_demolished: bool,
 }

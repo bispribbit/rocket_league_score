@@ -7,10 +7,6 @@ license.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "ballchasing-downloader"
-path = "src/main.rs"
-
 [dependencies]
 # Internal dependencies
 bytes.workspace = true

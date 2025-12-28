@@ -206,7 +206,8 @@ CREATE TABLE replay_players (
     player_name TEXT NOT NULL,
     team SMALLINT NOT NULL CHECK (team IN (0, 1)),
     rank_division rank_division NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT replay_players_replay_id_player_name_unique UNIQUE (replay_id, player_name)
 );
 
 -- Index for querying players by replay

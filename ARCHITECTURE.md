@@ -111,10 +111,6 @@ rocket_league_score migrate
   - Detects kickoff frames (ball at center position)
   - Tracks team assignments via TeamPaint and FlaggedByte attributes
   
-- [x] **Implemented `segment_by_goals()`**:
-  - Creates segments between kickoffs and goals
-  - Identifies which team scored from goal events
-  
 - [ ] **Player names**: Currently showing as `Player_X` - need to properly link PlayerReplicationInfo names to car actors
 
 ### ✅ DONE: feature_extractor

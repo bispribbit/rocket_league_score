@@ -17,3 +17,6 @@ tracing.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+feature_extractor.workspace = true
+tokio.workspace = true
+uuid.workspace = true

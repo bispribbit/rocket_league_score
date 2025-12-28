@@ -7,6 +7,7 @@ use core::time::Duration;
 use anyhow::{Context, Result};
 use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use config::CONFIG;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
@@ -82,7 +83,7 @@ impl BallchasingClient {
     /// * `min_rank` - Minimum rank filter (e.g., "bronze-1")
     /// * `max_rank` - Maximum rank filter (same as min for exact rank)
     /// * `count` - Number of results (max 200)
-    /// * `after` - Cursor for pagination (replay ID to start after)
+    /// * `before` - Date filter for pagination (only include replays created before this date)
     ///
     /// # Errors
     ///
@@ -93,7 +94,7 @@ impl BallchasingClient {
         min_rank: Rank,
         max_rank: Rank,
         count: usize,
-        after: Option<&str>,
+        before: Option<DateTime<Utc>>,
     ) -> Result<ReplayListResponse> {
         self.wait_for_rate_limit().await;
 
@@ -106,7 +107,7 @@ impl BallchasingClient {
             min_rank = min_rank_str,
             max_rank = max_rank_str,
             count = count,
-            after = after,
+            before = ?before,
             "Listing replays",
         );
 
@@ -116,9 +117,11 @@ impl BallchasingClient {
             "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=replay-date&sort-dir=desc"
         );
 
-        if let Some(after_id) = after {
+        if let Some(before_date) = before {
+            // Format DateTime as RFC3339 with Z suffix (API requires this format)
+            let rfc3339_date = before_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
             use core::fmt::Write;
-            let _ = write!(url, "&after={after_id}");
+            let _ = write!(url, "&created-before={rfc3339_date}");
         }
 
         info!("Fetching replays: {url}");
@@ -245,7 +248,8 @@ impl BallchasingClient {
         existing_ids: &std::collections::HashSet<Uuid>,
     ) -> Result<Vec<ReplaySummary>> {
         let mut all_replays = Vec::new();
-        let mut after: Option<String> = None;
+        let mut seen_ids = existing_ids.clone();
+        let mut before_date: Option<DateTime<Utc>> = None;
         let mut consecutive_duplicates = 0;
 
         info!(
@@ -266,7 +270,7 @@ impl BallchasingClient {
                     ballchasing_rank,
                     ballchasing_rank,
                     batch_size,
-                    after.as_deref(),
+                    before_date,
                 )
                 .await?;
 
@@ -277,10 +281,14 @@ impl BallchasingClient {
 
             let mut new_count = 0;
             for replay in &response.list {
-                if let Ok(id) = replay.id.parse::<Uuid>()
-                    && !existing_ids.contains(&id)
-                {
+                if let Ok(id) = replay.id.parse::<Uuid>() {
+                    // Skip if already in database or already seen in this fetch
+                    if seen_ids.contains(&id) {
+                        continue;
+                    }
+                    seen_ids.insert(id);
                     new_count += 1;
+                    all_replays.push(replay.clone());
                 }
             }
 
@@ -294,12 +302,43 @@ impl BallchasingClient {
                 consecutive_duplicates = 0;
             }
 
-            // Get the last ID for pagination
+            // Get the created date of the last replay for pagination
+            // Parse the created field (when replay was uploaded) for created-before filter
+            // With created-before and descending sort, we use the exact date to get older replays
             if let Some(last) = response.list.last() {
-                after = Some(last.id.clone());
-            }
+                // Parse the created field (when the replay was uploaded)
+                let parsed_datetime = chrono::DateTime::parse_from_rfc3339(&last.created)
+                    .map_or_else(
+                        |_| {
+                            if let Ok(dt) = chrono::DateTime::parse_from_str(
+                                &last.created,
+                                "%Y-%m-%dT%H:%M:%S%z",
+                            ) {
+                                Some(dt.with_timezone(&Utc))
+                            } else {
+                                warn!(
+                                    replay_id = %last.id,
+                                    created = last.created,
+                                    "Failed to parse replay created date"
+                                );
+                                None
+                            }
+                        },
+                        |dt| Some(dt.with_timezone(&Utc)),
+                    );
 
-            all_replays.extend(response.list);
+                if let Some(dt) = parsed_datetime {
+                    // Use the exact created date - created-before will exclude this date and get older replays
+                    before_date = Some(dt);
+                } else {
+                    // Fallback: use yesterday to ensure we don't get stuck
+                    warn!(
+                        replay_id = %last.id,
+                        "Failed to parse created date, using current date minus 1 day"
+                    );
+                    before_date = Some(Utc::now() - chrono::Duration::days(1));
+                }
+            }
 
             // Check if there are more pages
             if response.next.is_none() {

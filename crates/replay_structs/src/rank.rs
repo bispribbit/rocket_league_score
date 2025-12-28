@@ -6,6 +6,7 @@
 use core::fmt;
 use core::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
 /// Represents a Rocket League competitive rank with division.
@@ -1295,6 +1296,22 @@ impl From<RankDivision> for Rank {
             | RankDivision::SupersonicLegend => Self::GrandChampion,
         }
     }
+}
+
+/// Rank information.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RankInfo {
+    /// Rank ID (e.g., "grand-champion-3")
+    pub id: String,
+
+    /// Tier number
+    pub tier: Option<i32>,
+
+    /// Division number (1-4)
+    pub division: Option<i32>,
+
+    /// Human-readable name
+    pub name: Option<String>,
 }
 
 #[cfg(test)]

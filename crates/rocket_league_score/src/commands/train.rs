@@ -7,10 +7,10 @@ use feature_extractor::{PlayerRating, extract_segment_samples};
 use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
-use replay_parser::{parse_replay_from_bytes, segment_by_goals};
+use replay_parser::parse_replay_from_bytes;
 use tracing::{error, info};
 
-use super::init_wgpu_device;
+use super::init_device;
 
 // Training requires Autodiff wrapper for automatic differentiation
 type TrainBackend = Autodiff<Wgpu>;
@@ -45,7 +45,7 @@ pub async fn run(
     info!(samples = training_data.len(), "Loaded training samples");
 
     // Create model with Autodiff backend for training
-    let device = init_wgpu_device()?;
+    let device = init_device();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 
     // Train model
@@ -117,6 +117,7 @@ async fn load_training_data() -> Result<TrainingData> {
             .iter()
             .map(|p| PlayerRating {
                 player_name: p.player_name.clone(),
+                team: p.team,
                 mmr: p.rank_division.mmr_middle(),
             })
             .collect();
@@ -147,16 +148,8 @@ async fn load_training_data() -> Result<TrainingData> {
         };
 
         // Segment by goals and extract features
-        let segments = segment_by_goals(&parsed);
-
-        for segment in segments {
-            let Some(frames) = parsed.frames.get(segment.start_frame..segment.end_frame) else {
-                continue;
-            };
-
-            let samples = extract_segment_samples(frames, &player_ratings);
-            data.add_samples(samples);
-        }
+        let samples = extract_segment_samples(&parsed.frames, &player_ratings);
+        data.add_samples(samples);
     }
 
     Ok(data)

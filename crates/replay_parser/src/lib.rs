@@ -5,123 +5,91 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use boxcars::{Attribute, HeaderProp, ParserBuilder, Replay};
+use replay_structs::{
+    ActorState, BallState, GameFrame, GoalEvent, ParsedReplay, PlayerState, Team,
+};
 
-/// Represents a 3D vector (position or velocity).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Vector3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-impl From<boxcars::Vector3f> for Vector3 {
-    fn from(v: boxcars::Vector3f) -> Self {
-        Self {
-            x: v.x,
-            y: v.y,
-            z: v.z,
-        }
-    }
-}
-
-/// Represents a quaternion rotation.
-///
-/// Quaternions are preferred over Euler angles for ML because:
-/// - They are continuous (no sudden jumps at angle boundaries)
-/// - No gimbal lock issues
-/// - Neural networks handle them well
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Quaternion {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub w: f32,
-}
-
-impl From<boxcars::Quaternion> for Quaternion {
-    fn from(q: boxcars::Quaternion) -> Self {
-        Self {
-            x: q.x,
-            y: q.y,
-            z: q.z,
-            w: q.w,
-        }
-    }
-}
-
-/// State of the ball at a given frame.
-#[derive(Debug, Clone, Default)]
-pub struct BallState {
-    pub position: Vector3,
-    pub velocity: Vector3,
-}
-
-/// State of a player at a given frame.
-#[derive(Debug, Clone, Default)]
-pub struct PlayerState {
-    pub actor_id: i32,
-    pub name: String,
-    pub team: u8, // 0 or 1
-    pub position: Vector3,
-    pub velocity: Vector3,
-    pub rotation: Quaternion,
-    pub boost: f32, // 0.0 to 1.0
-    pub is_demolished: bool,
-}
-
-/// A single frame of game state.
-#[derive(Debug, Clone, Default)]
-pub struct GameFrame {
-    pub time: f32,
-    pub delta: f32,
-    pub seconds_remaining: i32,
-    pub ball: BallState,
-    pub players: Vec<PlayerState>,
-}
-
-/// Goal event extracted from replay header.
-#[derive(Debug, Clone)]
-pub struct GoalEvent {
-    pub frame: usize,
-    pub player_name: String,
-    pub player_team: u8,
-}
-
-/// A fully parsed replay containing metadata and all frames.
-#[derive(Debug, Clone, Default)]
-pub struct ParsedReplay {
-    pub frames: Vec<GameFrame>,
-    pub goals: Vec<GoalEvent>,
-    pub goal_frames: Vec<usize>,
-    pub kickoff_frames: Vec<usize>,
-}
-
-/// A segment of gameplay between a kickoff and a goal (or end of game).
-#[derive(Debug, Clone)]
-pub struct GameSegment {
-    pub start_frame: usize,
-    pub end_frame: usize,
-    pub ended_with_goal: bool,
-    pub scoring_team: Option<u8>,
-}
-
-/// Internal state for tracking actors during parsing.
+/// Internal player info used during parsing (different from `replay_structs::PlayerInfo`).
 #[derive(Debug, Default)]
-struct ActorState {
-    position: Vector3,
-    velocity: Vector3,
-    rotation: Quaternion,
-    boost: f32,
-    is_demolished: bool,
-}
-
-/// Internal state for tracking player info.
-#[derive(Debug, Default, Clone)]
 struct PlayerInfo {
     name: String,
-    team: i32, // -1 = unknown, 0 or 1
+    team: Option<Team>,
+}
+
+/// Recursively find PRI actor for a given car.
+/// Strategy: Find components that reference the car, then check what those components reference.
+fn find_pri_for_car(
+    car_id: i32,
+    actor_links: &HashMap<i32, Vec<i32>>, // Maps actor -> what it references via ActiveActor
+    reverse_actor_links: &HashMap<i32, Vec<i32>>, // Maps actor -> what references it
+    player_infos: &HashMap<i32, PlayerInfo>,
+    visited: &mut std::collections::HashSet<i32>,
+) -> Option<i32> {
+    if visited.contains(&car_id) {
+        return None; // Cycle detection
+    }
+    visited.insert(car_id);
+
+    // Find all actors that reference this car (components)
+    if let Some(referencers) = reverse_actor_links.get(&car_id) {
+        for &referencer in referencers {
+            // Check if this referencer is a PRI with a name
+            if player_infos
+                .get(&referencer)
+                .is_some_and(|p| !p.name.is_empty())
+            {
+                return Some(referencer);
+            }
+
+            // Check all actors that this referencer references - one might be a PRI
+            if let Some(referenced_list) = actor_links.get(&referencer) {
+                for &referenced_by_component in referenced_list {
+                    // Check if the referenced actor is a PRI
+                    if player_infos
+                        .get(&referenced_by_component)
+                        .is_some_and(|p| !p.name.is_empty())
+                    {
+                        return Some(referenced_by_component);
+                    }
+                    // Recursively check
+                    if let Some(pri_id) = find_pri_for_car(
+                        referenced_by_component,
+                        actor_links,
+                        reverse_actor_links,
+                        player_infos,
+                        visited,
+                    ) {
+                        return Some(pri_id);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Update `car_to_pri` mapping for a specific car.
+fn update_car_to_pri_mapping(
+    car_id: i32,
+    actor_links: &HashMap<i32, Vec<i32>>,
+    reverse_actor_links: &HashMap<i32, Vec<i32>>,
+    car_to_actor_id: &mut HashMap<i32, i32>,
+    player_infos: &HashMap<i32, PlayerInfo>,
+) {
+    let mut visited = std::collections::HashSet::new();
+    if let Some(pri_id) = find_pri_for_car(
+        car_id,
+        actor_links,
+        reverse_actor_links,
+        player_infos,
+        &mut visited,
+    ) {
+        car_to_actor_id.insert(car_id, pri_id);
+    }
 }
 
 /// Parses a replay file from the given path.
@@ -173,7 +141,16 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     let mut boost_actors: HashMap<i32, i32> = HashMap::new(); // boost_actor_id -> car_actor_id
     let mut boost_amounts: HashMap<i32, f32> = HashMap::new(); // car_actor_id -> boost (0-1)
     let mut player_infos: HashMap<i32, PlayerInfo> = HashMap::new(); // PRI actor_id -> PlayerInfo
-    let mut car_to_pri: HashMap<i32, i32> = HashMap::new(); // car_actor_id -> PRI actor_id
+    let mut car_to_actor_id: HashMap<i32, i32> = HashMap::new(); // car_actor_id -> PRI actor_id
+    // Forward mapping: which actors each actor references via ActiveActor (can be multiple)
+    // Maps: actor_id -> Vec<referenced_actor_id>
+    let mut actor_links: HashMap<i32, Vec<i32>> = HashMap::new();
+    // Reverse mapping: which actors reference a given actor
+    // Maps: referenced_actor_id -> Vec<actors_that_reference_it>
+    let mut reverse_actor_links: HashMap<i32, Vec<i32>> = HashMap::new();
+
+    // Cache for player names to reuse Arc<String> across frames
+    let mut name_cache: HashMap<String, Arc<String>> = HashMap::new();
 
     // State tracking for frame reconstruction
     let mut current_seconds_remaining: i32 = 300;
@@ -201,13 +178,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                 && obj_name.contains("PRI_TA")
                 && !obj_name.contains(':')
             {
-                player_infos.insert(
-                    actor_id,
-                    PlayerInfo {
-                        team: -1,
-                        ..Default::default()
-                    },
-                );
+                player_infos.insert(actor_id, PlayerInfo::default());
             }
         }
 
@@ -218,7 +189,17 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             car_actors.remove(&actor_id);
             boost_actors.remove(&actor_id);
             player_infos.remove(&actor_id);
-            car_to_pri.retain(|_, v| *v != actor_id);
+            car_to_actor_id.remove(&actor_id);
+            actor_links.remove(&actor_id);
+            // Remove any links that point to this actor
+            for links in actor_links.values_mut() {
+                links.retain(|&x| x != actor_id);
+            }
+            reverse_actor_links.remove(&actor_id);
+            // Remove this actor from reverse links
+            for referencers in reverse_actor_links.values_mut() {
+                referencers.retain(|&x| x != actor_id);
+            }
         }
 
         // Handle updated actors
@@ -263,18 +244,31 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                 }
                 Attribute::String(name) => {
                     // Player name - check if this is the PlayerName attribute
-                    let stream_id = update.stream_id.0 as usize;
-                    if Some(stream_id) == player_name_attr
-                        && let Some(info) = player_infos.get_mut(&actor_id)
-                        && !name.is_empty()
-                    {
+                    // Check object_id, not stream_id (object_id identifies the attribute type)
+                    let object_id = update.object_id.0 as usize;
+                    if Some(object_id) == player_name_attr && !name.is_empty() {
+                        // Create PRI entry if it doesn't exist
+                        let info = player_infos.entry(actor_id).or_default();
                         info.name.clone_from(name);
+
+                        // Update all cars that might link to this PRI
+                        for &car_id in car_actors.keys() {
+                            if !car_to_actor_id.contains_key(&car_id) {
+                                update_car_to_pri_mapping(
+                                    car_id,
+                                    &actor_links,
+                                    &reverse_actor_links,
+                                    &mut car_to_actor_id,
+                                    &player_infos,
+                                );
+                            }
+                        }
                     }
                 }
                 Attribute::TeamPaint(team_paint) => {
                     // Also check if this is a player info
                     if let Some(info) = player_infos.get_mut(&actor_id) {
-                        info.team = i32::from(team_paint.team);
+                        info.team = Some(Team::from(team_paint.team));
                     }
                 }
                 Attribute::FlaggedByte(flagged, team_id) => {
@@ -285,20 +279,107 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         && let Some(info) = player_infos.get_mut(&actor_id)
                     {
                         // team_id typically encodes the team (0 or 1)
-                        info.team = i32::from(*team_id % 2);
+                        info.team = Some(Team::from(*team_id % 2));
                     }
                 }
                 Attribute::ActiveActor(active_actor) => {
+                    let referenced_actor = active_actor.actor.0;
+
+                    // Build forward mapping: track which actor references which other actor
+                    // Store all links (an actor can have multiple ActiveActor attributes)
+
+                    let links = actor_links.entry(actor_id).or_default();
+
+                    if !links.contains(&referenced_actor) {
+                        links.push(referenced_actor);
+                    }
+
+                    // Build reverse mapping: track which actors reference this one
+                    let reverse_links = reverse_actor_links.entry(referenced_actor).or_default();
+
+                    if !reverse_links.contains(&actor_id) {
+                        reverse_links.push(actor_id);
+                    }
+
                     // This links various components together
                     // For boost components: boost_actor -> car_actor
                     if boost_actors.contains_key(&actor_id) {
-                        let car_id = active_actor.actor.0;
+                        let car_id = referenced_actor;
                         boost_actors.insert(actor_id, car_id);
                     }
-                    // For cars: car_actor -> PRI_actor (PlayerReplicationInfo link)
-                    if car_actors.contains_key(&actor_id) {
-                        let pri_id = active_actor.actor.0;
-                        car_to_pri.insert(actor_id, pri_id);
+
+                    // KEY INSIGHT: A car actor can directly reference its PRI via ActiveActor!
+                    // If THIS actor is a car and the referenced actor is a PRI, link them directly
+                    if car_actors.contains_key(&actor_id)
+                        && player_infos
+                            .get(&referenced_actor)
+                            .is_some_and(|p| !p.name.is_empty())
+                    {
+                        car_to_actor_id.insert(actor_id, referenced_actor);
+                    }
+
+                    // If a car is being referenced by this component, check if this component also references a PRI
+                    if car_actors.contains_key(&referenced_actor) {
+                        // Check all actors that this component references to find a PRI
+                        if let Some(component_refs) = actor_links.get(&actor_id) {
+                            for &component_ref in component_refs {
+                                if component_ref != referenced_actor
+                                    && player_infos
+                                        .get(&component_ref)
+                                        .is_some_and(|p| !p.name.is_empty())
+                                {
+                                    car_to_actor_id.insert(referenced_actor, component_ref);
+                                    break;
+                                }
+                            }
+                        }
+                        // Also try recursive search
+                        let mut visited = std::collections::HashSet::new();
+                        if let Some(pri_id) = find_pri_for_car(
+                            referenced_actor,
+                            &actor_links,
+                            &reverse_actor_links,
+                            &player_infos,
+                            &mut visited,
+                        ) {
+                            car_to_actor_id.insert(referenced_actor, pri_id);
+                        }
+                    }
+
+                    // If this component references a PRI, check if any cars reference this component
+                    if player_infos
+                        .get(&referenced_actor)
+                        .is_some_and(|p| !p.name.is_empty())
+                    {
+                        // This component references a PRI - check if any cars reference this component
+                        if let Some(car_referencers) = reverse_actor_links.get(&actor_id) {
+                            for &car_id in car_referencers {
+                                if car_actors.contains_key(&car_id) {
+                                    car_to_actor_id.insert(car_id, referenced_actor);
+                                }
+                            }
+                        }
+                        // Also check if this component references any cars, and link those cars to this PRI
+                        if let Some(component_refs) = actor_links.get(&actor_id) {
+                            for &component_ref in component_refs {
+                                if car_actors.contains_key(&component_ref) {
+                                    car_to_actor_id.insert(component_ref, referenced_actor);
+                                }
+                            }
+                        }
+                    }
+
+                    // Also update any cars that might now link to a PRI through this new link
+                    for &car_id in car_actors.keys() {
+                        if !car_to_actor_id.contains_key(&car_id) {
+                            update_car_to_pri_mapping(
+                                car_id,
+                                &actor_links,
+                                &reverse_actor_links,
+                                &mut car_to_actor_id,
+                                &player_infos,
+                            );
+                        }
                     }
                 }
                 Attribute::Int(seconds) => {
@@ -361,36 +442,39 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             .iter()
             .map(|(&car_id, car)| {
                 // Try to find player info for this car
-                let pri_id = car_to_pri.get(&car_id);
+                let pri_id = car_to_actor_id.get(&car_id);
                 let player_info = pri_id.and_then(|id| player_infos.get(id));
 
                 let boost = boost_amounts.get(&car_id).copied().unwrap_or(car.boost);
 
                 // Determine team - try player info first, otherwise use car position heuristic
-                let team = player_info
-                    .and_then(|p| {
-                        if p.team >= 0 {
-                            Some(p.team as u8)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        // Heuristic: cars on positive Y side at start are team 1
-                        u8::from(car.position.y > 0.0)
-                    });
+                let team = player_info.and_then(|p| p.team).unwrap_or_else(|| {
+                    // Heuristic: cars on positive Y side at start are team 1
+                    Team::from(u8::from(car.position.y > 0.0))
+                });
+
+                let mut actor_state = car.clone();
+                actor_state.boost = boost;
+
+                // Get or create Arc<String> for player name, reusing across frames
+                let name = if let Some(info) = player_info.filter(|p| !p.name.is_empty()) {
+                    name_cache
+                        .entry(info.name.clone())
+                        .or_insert_with(|| Arc::new(info.name.clone()))
+                        .clone()
+                } else {
+                    let default_name = format!("Player_{car_id}");
+                    name_cache
+                        .entry(default_name.clone())
+                        .or_insert_with(|| Arc::new(default_name))
+                        .clone()
+                };
 
                 PlayerState {
                     actor_id: car_id,
-                    name: player_info
-                        .filter(|p| !p.name.is_empty())
-                        .map_or_else(|| format!("Player_{car_id}"), |p| p.name.clone()),
+                    name,
                     team,
-                    position: car.position,
-                    velocity: car.velocity,
-                    rotation: car.rotation,
-                    boost,
-                    is_demolished: car.is_demolished,
+                    actor_state,
                 }
             })
             .collect();
@@ -415,6 +499,42 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     // Add initial kickoff if we have frames
     if !frames.is_empty() && (kickoff_frames.is_empty() || kickoff_frames.first() != Some(&0)) {
         kickoff_frames.insert(0, 0);
+    }
+
+    // Final pass: try to link any remaining cars to PRIs
+    // Check all components that reference each car to see if they also reference a PRI
+    for &car_id in car_actors.keys() {
+        if car_to_actor_id.contains_key(&car_id) {
+            continue;
+        }
+        // Find components that reference this car
+        if let Some(components) = reverse_actor_links.get(&car_id) {
+            for &component_id in components {
+                // Check if this component references a PRI
+                let Some(component_refs) = actor_links.get(&component_id) else {
+                    continue;
+                };
+
+                for &component_ref in component_refs {
+                    if component_ref != car_id
+                        && player_infos
+                            .get(&component_ref)
+                            .is_some_and(|p| !p.name.is_empty())
+                    {
+                        car_to_actor_id.insert(car_id, component_ref);
+                        break;
+                    }
+                }
+            }
+        }
+        // Also try recursive search
+        update_car_to_pri_mapping(
+            car_id,
+            &actor_links,
+            &reverse_actor_links,
+            &mut car_to_actor_id,
+            &player_infos,
+        );
     }
 
     Ok(ParsedReplay {
@@ -449,7 +569,7 @@ fn extract_goals(replay: &Replay) -> Vec<GoalEvent> {
                 goals.push(GoalEvent {
                     frame,
                     player_name,
-                    player_team,
+                    player_team: Team::from(player_team),
                 });
             }
         }
@@ -462,60 +582,11 @@ fn find_object_id(objects: &[String], name: &str) -> Option<usize> {
     objects.iter().position(|o| o == name)
 }
 
-/// Segments a replay into chunks between kickoffs and goals.
-///
-/// Each segment represents a continuous period of play that can be
-/// used for training the ML model.
-pub fn segment_by_goals(replay: &ParsedReplay) -> Vec<GameSegment> {
-    let mut segments = Vec::new();
-
-    if replay.kickoff_frames.is_empty() {
-        return segments;
-    }
-
-    // Create segments between each kickoff and the next goal/kickoff
-    for (i, &kickoff_frame) in replay.kickoff_frames.iter().enumerate() {
-        // Find the next goal or kickoff
-        let next_kickoff = replay
-            .kickoff_frames
-            .get(i + 1)
-            .copied()
-            .unwrap_or(replay.frames.len());
-
-        // Check if there's a goal in this segment
-        let goal_in_segment = replay
-            .goals
-            .iter()
-            .find(|g| g.frame > kickoff_frame && g.frame < next_kickoff);
-
-        let (end_frame, ended_with_goal, scoring_team) = goal_in_segment
-            .map_or((next_kickoff, false, None), |goal| {
-                (goal.frame, true, Some(goal.player_team))
-            });
-
-        segments.push(GameSegment {
-            start_frame: kickoff_frame,
-            end_frame,
-            ended_with_goal,
-            scoring_team,
-        });
-    }
-
-    segments
-}
-
 #[cfg(test)]
 mod tests {
-    use tracing::{info, warn};
+    use tracing::info;
 
     use super::*;
-
-    #[test]
-    fn test_segment_empty_replay() {
-        let replay = ParsedReplay::default();
-        let segments = segment_by_goals(&replay);
-        assert!(segments.is_empty());
-    }
 
     #[test]
     fn test_parse_real_replay() {
@@ -524,11 +595,8 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        let replay_path = Path::new("data/000f8951-ae9e-419a-8fed-0a22af68cabd.replay");
-        if !replay_path.exists() {
-            warn!("Test replay not found, skipping test");
-            return;
-        }
+        let replay_path = Path::new("../../test_data/2af51380-05b5-44ac-8b31-94b8b0f8da84.replay");
+        assert!(replay_path.exists(), "Test replay not found");
 
         let parsed = parse_replay(replay_path).expect("Failed to parse replay");
         info!(parsed_frames = parsed.frames.len(), "Parsed frames");
@@ -541,7 +609,7 @@ mod tests {
             info!(
                 frame = goal.frame,
                 player = %goal.player_name,
-                team = goal.player_team,
+                team = ?goal.player_team,
                 "Goal scored"
             );
         }
@@ -573,31 +641,53 @@ mod tests {
             for player in &frame.players {
                 info!(
                     name = %player.name,
-                    team = player.team,
-                    pos_x = player.position.x,
-                    pos_y = player.position.y,
-                    pos_z = player.position.z,
-                    velocity_x = player.velocity.x,
-                    velocity_y = player.velocity.y,
-                    velocity_z = player.velocity.z,
-                    boost = player.boost * 100.0,
+                    team = ?player.team,
+                    pos_x = player.actor_state.position.x,
+                    pos_y = player.actor_state.position.y,
+                    pos_z = player.actor_state.position.z,
+                    velocity_x = player.actor_state.velocity.x,
+                    velocity_y = player.actor_state.velocity.y,
+                    velocity_z = player.actor_state.velocity.z,
+                    boost = player.actor_state.boost * 100.0,
                     "Player state"
                 );
             }
         }
 
-        // Check segments
-        let segments = segment_by_goals(&parsed);
-        info!("=== SEGMENTS ===");
-        info!(total_segments = segments.len(), "Total segments");
-        for (i, seg) in segments.iter().enumerate().take(5) {
-            info!(
-                segment = i,
-                start_frame = seg.start_frame,
-                end_frame = seg.end_frame,
-                ended_with_goal = seg.ended_with_goal,
-                "Segment"
-            );
+        // Check player names are properly parsed in player_name field
+        info!("=== PLAYER NAMES ===");
+        let mut player_name_to_team: HashMap<String, Team> = HashMap::new();
+
+        // Expected players: Blue (team 0) and Orange (team 1)
+        let expected_blue_players = ["Dtwlve1", "Rip.the.Trip", "Ah perro!"];
+        let expected_orange_players = ["************", "Mooski17", "Olin"];
+
+        // Check frames to find player names in PlayerState.name
+        // Also verify each frame that player names match expected teams
+        for frame in &parsed.frames {
+            for player in &frame.players {
+                // Verify player name is in the expected list for their team
+                match player.team {
+                    Team::Blue => {
+                        assert!(
+                            expected_blue_players.contains(&player.name.as_str()),
+                            "Player '{}' is on Blue team but not in expected_blue_players. Time: {}. Remaining seconds: {}",
+                            player.name,
+                            frame.time,
+                            frame.seconds_remaining
+                        );
+                    }
+                    Team::Orange => {
+                        assert!(
+                            expected_orange_players.contains(&player.name.as_str()),
+                            "Player '{}' is on Orange team but not in expected_orange_players. Time: {}. Remaining seconds: {}",
+                            player.name,
+                            frame.time,
+                            frame.seconds_remaining
+                        );
+                    }
+                }
+            }
         }
     }
 }

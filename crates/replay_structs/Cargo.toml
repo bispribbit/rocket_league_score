@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+boxcars.workspace = true
 chrono.workspace = true
 object_store.workspace = true
 serde.workspace = true

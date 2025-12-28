@@ -26,6 +26,7 @@ pub async fn insert_replay_players(players: &[ReplayPlayer]) -> Result<(), sqlx:
         r#"
         INSERT INTO replay_players (replay_id, player_name, team, rank_division)
         SELECT * FROM unnest($1::uuid[], $2::text[], $3::smallint[], $4::rank_division[])
+        ON CONFLICT (replay_id, player_name) DO NOTHING
         "#,
         &replay_ids as &[Uuid],
         &player_names as &[String],

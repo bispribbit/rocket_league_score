@@ -8,14 +8,7 @@ use tracing::info;
 ///
 /// WGPU is a cross-platform GPU API that works on Windows, Linux, and macOS.
 /// It uses Vulkan on Linux/Windows and Metal on macOS.
-///
-/// # Errors
-///
-/// Returns an error if WGPU device initialization fails.
-pub fn init_wgpu_device() -> Result<WgpuDevice> {
-    info!("Initializing WGPU device...");
-    let device = WgpuDevice::default();
-    info!("WGPU device initialized successfully");
-    Ok(device)
+pub fn init_device() -> WgpuDevice {
+    info!("Initializing device...");
+    WgpuDevice::default()
 }
-

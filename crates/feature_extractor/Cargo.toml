@@ -9,5 +9,12 @@ workspace = true
 
 [dependencies]
 replay_parser.workspace = true
-anyhow.workspace = true
+replay_structs.workspace = true
 
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
+tracing-subscriber.workspace = true

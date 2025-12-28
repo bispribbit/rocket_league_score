@@ -9,7 +9,8 @@
 
 use std::collections::HashMap;
 
-use replay_parser::{GameFrame, PlayerState, Quaternion, Vector3};
+use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
+use tracing::info;
 
 /// Total number of features extracted per frame.
 ///
@@ -75,6 +76,7 @@ pub mod field {
 pub struct PlayerRating {
     pub player_name: String,
     pub mmr: i32,
+    pub team: i16,
 }
 
 /// Feature vector extracted from a single game frame.
@@ -152,8 +154,8 @@ pub fn extract_frame_features(frame: &GameFrame) -> FrameFeatures {
 /// Sorts players into blue (team 0) and orange (team 1) teams.
 /// Pads with default players if fewer than 3 per team.
 fn sort_players_by_team(players: &[PlayerState]) -> (Vec<&PlayerState>, Vec<&PlayerState>) {
-    let mut blue: Vec<&PlayerState> = players.iter().filter(|p| p.team == 0).collect();
-    let mut orange: Vec<&PlayerState> = players.iter().filter(|p| p.team == 1).collect();
+    let mut blue: Vec<&PlayerState> = players.iter().filter(|p| p.team == Team::Blue).collect();
+    let mut orange: Vec<&PlayerState> = players.iter().filter(|p| p.team == Team::Orange).collect();
 
     // Sort by actor_id for consistent ordering
     blue.sort_by_key(|p| p.actor_id);
@@ -225,7 +227,7 @@ fn extract_player_state_features(
 /// Writes a single player's state features to the feature vector.
 fn write_player_state(features: &mut [f32; FEATURE_COUNT], idx: usize, player: &PlayerState) {
     // If demolished, zero out all features except the demolished flag
-    if player.is_demolished {
+    if player.actor_state.is_demolished {
         // Position (zeroed)
         features[idx] = 0.0;
         features[idx + 1] = 0.0;
@@ -252,27 +254,27 @@ fn write_player_state(features: &mut [f32; FEATURE_COUNT], idx: usize, player: &
         features[idx + 12] = 1.0;
     } else {
         // Position
-        features[idx] = normalize_x(player.position.x);
-        features[idx + 1] = normalize_y(player.position.y);
-        features[idx + 2] = normalize_z(player.position.z);
+        features[idx] = normalize_x(player.actor_state.position.x);
+        features[idx + 1] = normalize_y(player.actor_state.position.y);
+        features[idx + 2] = normalize_z(player.actor_state.position.z);
 
         // Velocity
-        features[idx + 3] = normalize_car_velocity(player.velocity.x);
-        features[idx + 4] = normalize_car_velocity(player.velocity.y);
-        features[idx + 5] = normalize_car_velocity(player.velocity.z);
+        features[idx + 3] = normalize_car_velocity(player.actor_state.velocity.x);
+        features[idx + 4] = normalize_car_velocity(player.actor_state.velocity.y);
+        features[idx + 5] = normalize_car_velocity(player.actor_state.velocity.z);
 
         // Rotation (quaternion - already in [-1, 1] range)
-        features[idx + 6] = player.rotation.x;
-        features[idx + 7] = player.rotation.y;
-        features[idx + 8] = player.rotation.z;
-        features[idx + 9] = player.rotation.w;
+        features[idx + 6] = player.actor_state.rotation.x;
+        features[idx + 7] = player.actor_state.rotation.y;
+        features[idx + 8] = player.actor_state.rotation.z;
+        features[idx + 9] = player.actor_state.rotation.w;
 
         // Speed magnitude (normalized to supersonic = 1.0)
-        let speed = vector_magnitude(&player.velocity);
+        let speed = vector_magnitude(&player.actor_state.velocity);
         features[idx + 10] = (speed / field::MAX_CAR_SPEED).min(1.0);
 
         // Boost (already 0-1)
-        features[idx + 11] = player.boost;
+        features[idx + 11] = player.actor_state.boost;
 
         // Demolished flag
         features[idx + 12] = 0.0;
@@ -340,7 +342,7 @@ fn write_player_geometry(
     opponents: &[&PlayerState],
 ) {
     // If demolished, zero out all geometry features
-    if player.is_demolished {
+    if player.actor_state.is_demolished {
         for j in 0..indices::PLAYER_GEOM_FEATURES {
             features[idx + j] = 0.0;
         }
@@ -348,7 +350,7 @@ fn write_player_geometry(
     }
 
     // 0: Distance to ball (normalized by field diagonal)
-    let dist_to_ball = distance(&player.position, ball_pos);
+    let dist_to_ball = distance(&player.actor_state.position, ball_pos);
     features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
 
     // 1: Distance to own goal
@@ -362,12 +364,12 @@ fn write_player_geometry(
         y: own_goal_y,
         z: 0.0,
     };
-    let dist_to_own_goal = distance(&player.position, &own_goal);
+    let dist_to_own_goal = distance(&player.actor_state.position, &own_goal);
     features[idx + 1] = (dist_to_own_goal / field::DIAGONAL).min(1.0);
 
     // 2: Facing ball (dot product of forward vector with direction to ball)
-    let forward = quaternion_forward(&player.rotation);
-    let to_ball = direction(&player.position, ball_pos);
+    let forward = quaternion_forward(&player.actor_state.rotation);
+    let to_ball = direction(&player.actor_state.position, ball_pos);
     features[idx + 2] = dot(&forward, &to_ball);
 
     // 3: Goal line position [-1, 1]
@@ -378,16 +380,22 @@ fn write_player_geometry(
     } else {
         field::BLUE_GOAL_Y
     };
-    features[idx + 3] =
-        calculate_goal_line_position(&player.position, ball_pos, own_goal_y, opponent_goal_y);
+    features[idx + 3] = calculate_goal_line_position(
+        &player.actor_state.position,
+        ball_pos,
+        own_goal_y,
+        opponent_goal_y,
+    );
 
     // 4-5: Distance to each teammate (2 teammates in 3v3)
-    let teammate_distances = get_distances_to_others(&player.position, player.actor_id, teammates);
+    let teammate_distances =
+        get_distances_to_others(&player.actor_state.position, player.actor_id, teammates);
     features[idx + 4] = teammate_distances[0];
     features[idx + 5] = teammate_distances[1];
 
     // 6-8: Distance to each opponent (3 opponents in 3v3)
-    let opponent_distances = get_distances_to_others(&player.position, player.actor_id, opponents);
+    let opponent_distances =
+        get_distances_to_others(&player.actor_state.position, player.actor_id, opponents);
     features[idx + 6] = opponent_distances[0];
     features[idx + 7] = opponent_distances[1];
     features[idx + 8] = opponent_distances[2];
@@ -410,7 +418,7 @@ fn get_distances_to_others(
 
     // Compute distances
     for (i, other) in other_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
-        let dist = distance(position, &other.position);
+        let dist = distance(position, &other.actor_state.position);
         distances[i] = (dist / field::DIAGONAL).min(1.0);
     }
 
@@ -493,16 +501,25 @@ fn extract_team_context_features(
 /// Excludes demolished players from calculations.
 fn calculate_team_stats(players: &[&PlayerState]) -> (f32, f32, f32) {
     // Filter out demolished players
-    let active_players: Vec<_> = players.iter().filter(|p| !p.is_demolished).collect();
+    let active_players: Vec<_> = players
+        .iter()
+        .filter(|p| !p.actor_state.is_demolished)
+        .collect();
 
     if active_players.is_empty() {
         return (0.0, 0.0, 0.0);
     }
 
     let count = active_players.len() as f32;
-    let sum_x: f32 = active_players.iter().map(|p| p.position.x).sum();
-    let sum_y: f32 = active_players.iter().map(|p| p.position.y).sum();
-    let sum_boost: f32 = active_players.iter().map(|p| p.boost).sum();
+    let sum_x: f32 = active_players
+        .iter()
+        .map(|p| p.actor_state.position.x)
+        .sum();
+    let sum_y: f32 = active_players
+        .iter()
+        .map(|p| p.actor_state.position.y)
+        .sum();
+    let sum_boost: f32 = active_players.iter().map(|p| p.actor_state.boost).sum();
 
     (
         normalize_x(sum_x / count),
@@ -627,20 +644,42 @@ pub fn extract_segment_samples(
         .map(|player_rating| (player_rating.player_name.as_str(), player_rating.mmr))
         .collect();
 
+    // Group player ratings by team for fallback matching
+    let blue_ratings: Vec<&PlayerRating> = player_ratings.iter().filter(|r| r.team == 0).collect();
+    let orange_ratings: Vec<&PlayerRating> =
+        player_ratings.iter().filter(|r| r.team == 1).collect();
+
+    info!(rating_map = rating_map.len(), "Rating map");
+
     frames
         .iter()
         .map(|frame| {
             // Sort players to match feature order (blue team sorted by actor_id, then orange team sorted by actor_id)
             let (blue_players, orange_players) = sort_players_by_team(&frame.players);
 
+            info!(
+                blue_players = blue_players.len(),
+                orange_players = orange_players.len(),
+                "Sorted players"
+            );
+
             // Build target_mmr vector matching feature order
             let mut target_mmr = Vec::with_capacity(TOTAL_PLAYERS);
 
             // Blue team (first 3 slots)
-            for player in blue_players.iter().take(PLAYERS_PER_TEAM) {
+            for (idx, player) in blue_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
                 let mmr = rating_map
                     .get(player.name.as_str())
                     .copied()
+                    .or_else(|| {
+                        // Fallback: if name lookup fails (e.g., "Player_{id}" format),
+                        // try to match by team and position order
+                        if player.name.starts_with("Player_") && idx < blue_ratings.len() {
+                            Some(blue_ratings[idx].mmr)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(1000) as f32;
                 target_mmr.push(mmr);
             }
@@ -651,13 +690,23 @@ pub fn extract_segment_samples(
             ));
 
             // Orange team (next 3 slots)
-            for player in orange_players.iter().take(PLAYERS_PER_TEAM) {
+            for (idx, player) in orange_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
                 let mmr = rating_map
                     .get(player.name.as_str())
                     .copied()
+                    .or_else(|| {
+                        // Fallback: if name lookup fails (e.g., "Player_{id}" format),
+                        // try to match by team and position order
+                        if player.name.starts_with("Player_") && idx < orange_ratings.len() {
+                            Some(orange_ratings[idx].mmr)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(1000) as f32;
                 target_mmr.push(mmr);
             }
+
             // Pad orange team with default MMR if fewer than 3 players
             target_mmr.extend(core::iter::repeat_n(
                 1000.0,
@@ -674,7 +723,9 @@ pub fn extract_segment_samples(
 
 #[cfg(test)]
 mod tests {
-    use replay_parser::BallState;
+    use std::sync::Arc;
+
+    use replay_structs::{ActorState, BallState, RankDivision, Team};
 
     use super::*;
 
@@ -745,49 +796,53 @@ mod tests {
             players: vec![
                 PlayerState {
                     actor_id: 1,
-                    name: "Player1".to_string(),
-                    team: 0,
-                    position: Vector3 {
-                        x: -1000.0,
-                        y: -2000.0,
-                        z: 17.0,
+                    name: Arc::new("Player1".to_string()),
+                    team: Team::Blue,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: -1000.0,
+                            y: -2000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: 500.0,
+                            y: 200.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        boost: 0.5,
+                        is_demolished: false,
                     },
-                    velocity: Vector3 {
-                        x: 500.0,
-                        y: 200.0,
-                        z: 0.0,
-                    },
-                    rotation: Quaternion {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                        w: 1.0,
-                    },
-                    boost: 0.5,
-                    is_demolished: false,
                 },
                 PlayerState {
                     actor_id: 2,
-                    name: "Player2".to_string(),
-                    team: 1,
-                    position: Vector3 {
-                        x: 1000.0,
-                        y: 2000.0,
-                        z: 17.0,
+                    name: Arc::new("Player2".to_string()),
+                    team: Team::Orange,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: 1000.0,
+                            y: 2000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: -500.0,
+                            y: -200.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: core::f32::consts::FRAC_1_SQRT_2,
+                            w: core::f32::consts::FRAC_1_SQRT_2,
+                        },
+                        boost: 1.0,
+                        is_demolished: false,
                     },
-                    velocity: Vector3 {
-                        x: -500.0,
-                        y: -200.0,
-                        z: 0.0,
-                    },
-                    rotation: Quaternion {
-                        x: 0.0,
-                        y: 0.0,
-                        z: core::f32::consts::FRAC_1_SQRT_2,
-                        w: core::f32::consts::FRAC_1_SQRT_2,
-                    },
-                    boost: 1.0,
-                    is_demolished: false,
                 },
             ],
         };
@@ -854,5 +909,137 @@ mod tests {
             pos_center.abs() < 0.1,
             "Position at ball should be near zero, got {pos_center}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_extract_segment_samples() {
+        use std::path::Path;
+
+        use replay_parser::parse_replay;
+        use tracing::warn;
+
+        let _tracing = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        // Parse the replay
+        let replay_path = Path::new("../../test_data/2af51380-05b5-44ac-8b31-94b8b0f8da84.replay");
+        if !replay_path.exists() {
+            warn!("Test replay not found, skipping test");
+            return;
+        }
+
+        let parsed = parse_replay(replay_path).expect("Failed to parse replay");
+        assert!(!parsed.frames.is_empty(), "Expected frames in replay");
+
+        let player_ratings = vec![
+            PlayerRating {
+                player_name: "Dtwlve1".to_string(),
+                team: 0,
+                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
+            },
+            PlayerRating {
+                player_name: "Rip.the.Trip".to_string(),
+                team: 0,
+                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
+            },
+            PlayerRating {
+                player_name: "Ah perro!".to_string(),
+                team: 0,
+                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
+            },
+            PlayerRating {
+                player_name: "************".to_string(),
+                team: 1,
+                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
+            },
+            PlayerRating {
+                player_name: "Mooski17".to_string(),
+                team: 1,
+                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
+            },
+            PlayerRating {
+                player_name: "Olin".to_string(),
+                team: 1,
+                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
+            },
+        ];
+
+        // Create a map of player_name -> expected_mmr for verification
+        let expected_mmr_map: std::collections::HashMap<String, i32> = player_ratings
+            .iter()
+            .map(|pr| (pr.player_name.clone(), pr.mmr))
+            .collect();
+
+        // Test each segment
+        let samples = extract_segment_samples(&parsed.frames, &player_ratings);
+
+        // Verify that each sample has correct MMR values
+        for (frame_idx, sample) in samples.iter().enumerate() {
+            let frame = &parsed.frames[frame_idx];
+
+            // Get players sorted by team (blue first, then orange) to match feature_extractor's order
+            let (blue_players, orange_players) = {
+                let mut blue: Vec<_> = frame
+                    .players
+                    .iter()
+                    .filter(|p| p.team == Team::Blue)
+                    .collect();
+                let mut orange: Vec<_> = frame
+                    .players
+                    .iter()
+                    .filter(|p| p.team == Team::Orange)
+                    .collect();
+                blue.sort_by_key(|p| p.actor_id);
+                orange.sort_by_key(|p| p.actor_id);
+                (blue, orange)
+            };
+
+            // Verify blue team MMR values
+            for (idx, player) in blue_players.iter().take(3).enumerate() {
+                let expected_mmr = expected_mmr_map
+                    .get(player.name.as_str())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Player {} not found in database for frame {}",
+                            player.name, frame_idx
+                        )
+                    });
+
+                let actual_mmr = sample.target_mmr[idx] as i32;
+                assert_eq!(
+                    actual_mmr, expected_mmr,
+                    "Frame {}: Blue player {} (index {}) has incorrect MMR. Expected {}, got {}",
+                    frame_idx, player.name, idx, expected_mmr, actual_mmr
+                );
+                assert_ne!(
+                    actual_mmr, 1000,
+                    "Frame {}: Blue player {} (index {}) has default MMR 1000 instead of database value {}",
+                    frame_idx, player.name, idx, expected_mmr
+                );
+            }
+
+            // Verify orange team MMR values
+            for (idx, player) in orange_players.iter().take(3).enumerate() {
+                let expected_mmr = expected_mmr_map
+                    .get(player.name.as_str())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Player {} not found in database for frame {}",
+                            player.name, frame_idx
+                        )
+                    });
+
+                let actual_mmr = sample.target_mmr[3 + idx] as i32;
+                assert_eq!(
+                    actual_mmr, expected_mmr,
+                    "Frame {}: Orange player {} (index {}) has incorrect MMR. Expected {}, got {}",
+                    frame_idx, player.name, idx, expected_mmr, actual_mmr
+                );
+            }
+        }
     }
 }

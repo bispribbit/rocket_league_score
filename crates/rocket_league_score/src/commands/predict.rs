@@ -10,7 +10,7 @@ use ml_model::{ImpactModel, load_checkpoint, predict};
 use replay_parser::parse_replay;
 use tracing::{info, warn};
 
-use super::init_wgpu_device;
+use super::init_device;
 
 type Backend = Wgpu;
 
@@ -40,7 +40,7 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
     );
 
     // Load model weights
-    let device = init_wgpu_device()?;
+    let device = init_device();
     let model: ImpactModel<Backend> = load_checkpoint(&model_record.checkpoint_path, &device)?;
 
     // Parse the replay
