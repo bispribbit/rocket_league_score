@@ -1,8 +1,8 @@
-//! Small-scale end-to-end test of the ML pipeline.
+//! Small-scale end-to-end test of the LSTM sequence model pipeline.
 //!
 //! This command runs a quick sanity check:
 //! 1. Load a few replays with metadata
-//! 2. Extract features
+//! 2. Extract game sequences (one sample per replay)
 //! 3. Train for a few epochs
 //! 4. Verify loss decreases
 //! 5. Run inference and check output is reasonable
@@ -11,8 +11,11 @@ use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::AutodiffModule;
 use config::OBJECT_STORE;
-use feature_extractor::{PlayerRating, extract_segment_samples};
-use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, predict, train};
+use feature_extractor::{PlayerRating, extract_game_sequence};
+use ml_model::{
+    ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig, create_model, predict,
+    train,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
@@ -29,7 +32,8 @@ type TrainBackend = Autodiff<Wgpu>;
 ///
 /// Returns an error if the test fails.
 pub async fn run(num_replays: usize) -> Result<()> {
-    info!("=== ML Pipeline End-to-End Test ===");
+    info!("=== LSTM Sequence Model Pipeline Test ===");
+
     // Step 1: Load metadata
     info!("Step 1: Loading replays metadata...");
     let replays =
@@ -41,9 +45,9 @@ pub async fn run(num_replays: usize) -> Result<()> {
         anyhow::bail!("No valid replays found");
     }
 
-    // Step 2: Find matching replays and extract features
-    info!("Step 2: Finding replays and extracting features...");
-    let mut training_data = TrainingData::new();
+    // Step 2: Find matching replays and extract game sequences
+    info!("Step 2: Extracting game sequences (one per replay)...");
+    let mut training_data = SequenceTrainingData::new();
     let mut replays_processed = 0;
     let mut total_frames = 0;
 
@@ -104,16 +108,23 @@ pub async fn run(num_replays: usize) -> Result<()> {
             })
             .collect();
 
-        info!(replay = %replay.id, "Player ratings {player_ratings:?}. Players: {db_players:?}");
+        info!(replay = %replay.id, "Player ratings {player_ratings:?}");
 
-        let samples = extract_segment_samples(&parsed.frames, &player_ratings);
-        training_data.add_samples(samples);
-        total_frames += parsed.frames.len();
+        // Extract game sequence (one sample per replay)
+        let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+        let frame_count = game_sequence.frames.len();
 
+        training_data.add_sample(SequenceSample {
+            frames: game_sequence.frames,
+            target_mmr: game_sequence.target_mmr,
+        });
+
+        total_frames += frame_count;
         replays_processed += 1;
+
         info!(
             replay = %replay_path.to_string(),
-            frames = parsed.frames.len(),
+            frames = frame_count,
             "Processed replay"
         );
     }
@@ -132,29 +143,34 @@ pub async fn run(num_replays: usize) -> Result<()> {
         "Feature extraction complete"
     );
 
-    // Step 3: Create model
-    info!("Step 3: Creating model...");
+    // Step 3: Create LSTM sequence model
+    info!("Step 3: Creating LSTM sequence model...");
     let device = init_device();
     let model_config = ModelConfig::new();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 
     info!(
-        hidden1 = model_config.hidden_size_1,
-        hidden2 = model_config.hidden_size_2,
+        lstm_hidden_1 = model_config.lstm_hidden_1,
+        lstm_hidden_2 = model_config.lstm_hidden_2,
+        feedforward_hidden = model_config.feedforward_hidden,
+        dropout = model_config.dropout,
         "Model created"
     );
 
     // Step 4: Train for a few epochs
-    info!("Step 4: Training model (5 epochs)...");
+    info!("Step 4: Training model (10 epochs)...");
     let config = TrainingConfig::new(model_config)
-        .with_epochs(5)
-        .with_batch_size(32)
+        .with_epochs(10)
+        .with_batch_size(4) // Smaller batch for few samples
+        .with_sequence_length(200) // Sample 200 frames per game
         .with_learning_rate(1e-3); // Higher LR for quick test
 
     let output = train(&mut model, &training_data, &config)?;
 
+    let train_rmse = output.final_train_loss.sqrt();
     info!(
         final_loss = output.final_train_loss,
+        train_rmse,
         epochs = output.epochs_completed,
         "Training complete"
     );
@@ -165,33 +181,35 @@ pub async fn run(num_replays: usize) -> Result<()> {
     // Get the inner model for inference (strip Autodiff wrapper)
     let inference_model = model.valid();
 
-    // Sample a few predictions
-    let sample_indices = [0, training_data.len() / 2, training_data.len() - 1];
+    // Test on first sample
+    if let Some(sample) = training_data.samples.first() {
+        let predictions = predict(
+            &inference_model,
+            &sample.frames,
+            &device,
+            config.sequence_length,
+        );
 
-    for &idx in &sample_indices {
-        if let Some(sample) = training_data.samples.get(idx) {
-            let predicted = predict(&inference_model, &sample.features, &device);
+        info!("Predictions for all 6 players:");
+        for (player_idx, (predicted, target)) in
+            predictions.iter().zip(sample.target_mmr.iter()).enumerate()
+        {
+            let diff = (predicted - target).abs();
+            let team = if player_idx < feature_extractor::PLAYERS_PER_TEAM {
+                "blue"
+            } else {
+                "orange"
+            };
+            let slot = player_idx % feature_extractor::PLAYERS_PER_TEAM;
 
-            // Evaluate against each player's target MMR
-            for (player_idx, target_mmr) in sample.target_mmr.iter().enumerate() {
-                let diff = (predicted - target_mmr).abs();
-                let team = if player_idx < feature_extractor::PLAYERS_PER_TEAM {
-                    "blue"
-                } else {
-                    "orange"
-                };
-                let slot = player_idx % feature_extractor::PLAYERS_PER_TEAM;
-
-                info!(
-                    sample = idx,
-                    player_slot = slot,
-                    team = team,
-                    target_mmr = *target_mmr as i32,
-                    predicted_mmr = predicted as i32,
-                    diff = diff as i32,
-                    "Player prediction"
-                );
-            }
+            info!(
+                player_slot = slot,
+                team = team,
+                target_mmr = *target as i32,
+                predicted_mmr = *predicted as i32,
+                diff = diff as i32,
+                "Player prediction"
+            );
         }
     }
 
@@ -209,18 +227,43 @@ pub async fn run(num_replays: usize) -> Result<()> {
     }
 
     // Check 2: Predictions should be in reasonable MMR range (0-3000)
-    let test_features = feature_extractor::FrameFeatures::default();
-    let test_pred = predict(&inference_model, &test_features, &device);
+    let test_frames: Vec<feature_extractor::FrameFeatures> = (0..100)
+        .map(|_| feature_extractor::FrameFeatures::default())
+        .collect();
+    let test_preds = predict(&inference_model, &test_frames, &device, config.sequence_length);
 
-    if (0.0..=3000.0).contains(&test_pred) {
-        info!("PASS: Prediction in reasonable range ({})", test_pred);
+    let all_reasonable = test_preds.iter().all(|p| (0.0..=3000.0).contains(p));
+    if all_reasonable {
+        info!(
+            "PASS: All 6 predictions in reasonable range ({:?})",
+            test_preds.iter().map(|p| *p as i32).collect::<Vec<_>>()
+        );
     } else {
-        info!("FAIL: Prediction out of range ({})", test_pred);
+        info!(
+            "FAIL: Some predictions out of range ({:?})",
+            test_preds.iter().map(|p| *p as i32).collect::<Vec<_>>()
+        );
         all_passed = false;
     }
 
+    // Check 3: Predictions should not all be the same (model is learning something)
+    let variance: f32 = {
+        let mean = test_preds.iter().sum::<f32>() / test_preds.len() as f32;
+        test_preds.iter().map(|p| (p - mean).powi(2)).sum::<f32>() / test_preds.len() as f32
+    };
+
+    if variance > 1.0 {
+        info!("PASS: Predictions have variance ({:.2})", variance);
+    } else {
+        info!(
+            "INFO: Low prediction variance ({:.2}) - model may need more training",
+            variance
+        );
+        // Don't fail on this, just informational
+    }
+
     if all_passed {
-        info!("=== All sanity checks passed! Pipeline is working. ===");
+        info!("=== All sanity checks passed! LSTM pipeline is working. ===");
     } else {
         info!("=== Some checks failed. Review the output above. ===");
     }

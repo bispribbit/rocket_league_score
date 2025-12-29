@@ -1,14 +1,20 @@
-//! Train command - trains the ML model on ingested replays.
+//! Train command - trains the LSTM sequence model on ingested replays.
+//!
+//! This command loads replays from the database, extracts game sequences,
+//! and trains the sequence model to predict player MMR from temporal patterns.
 
 use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
 use config::OBJECT_STORE;
-use feature_extractor::{PlayerRating, extract_segment_samples};
-use ml_model::{ModelConfig, TrainingConfig, TrainingData, create_model, save_checkpoint, train};
+use feature_extractor::{PlayerRating, extract_game_sequence};
+use ml_model::{
+    ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig, create_model,
+    save_checkpoint, train,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::init_device;
 
@@ -26,7 +32,7 @@ pub async fn run(
     batch_size: usize,
     learning_rate: f64,
 ) -> Result<()> {
-    info!(model_name, "Starting training");
+    info!(model_name, "Starting LSTM sequence model training");
 
     let model_config = ModelConfig::new();
     let config = TrainingConfig::new(model_config.clone())
@@ -35,21 +41,33 @@ pub async fn run(
         .with_batch_size(batch_size);
 
     // Load training data from database
-    info!("Loading training data...");
+    info!("Loading training data (one sample per replay)...");
     let training_data = load_training_data().await?;
 
     if training_data.is_empty() {
         anyhow::bail!("No training data found. Please ingest replays first.");
     }
 
-    info!(samples = training_data.len(), "Loaded training samples");
+    info!(
+        samples = training_data.len(),
+        sequence_length = config.sequence_length,
+        "Loaded game sequence samples"
+    );
 
     // Create model with Autodiff backend for training
     let device = init_device();
     let mut model = create_model::<TrainBackend>(&device, &model_config);
 
+    info!(
+        lstm_hidden_1 = model_config.lstm_hidden_1,
+        lstm_hidden_2 = model_config.lstm_hidden_2,
+        feedforward_hidden = model_config.feedforward_hidden,
+        dropout = model_config.dropout,
+        "Model architecture"
+    );
+
     // Train model
-    info!(epochs, "Training model");
+    info!(epochs, batch_size, learning_rate, "Training model");
     let output = train(&mut model, &training_data, &config)?;
 
     // Save model checkpoint
@@ -57,15 +75,37 @@ pub async fn run(
     let checkpoint_path = format!("models/{model_name}_{next_version}");
 
     save_checkpoint(&model, &checkpoint_path, &config)?;
-    info!(final_loss = output.final_train_loss, "Training completed");
+
+    let train_rmse = output.final_train_loss.sqrt();
+    let valid_rmse = output.final_valid_loss.map(|l| l.sqrt());
+    info!(
+        final_train_loss = output.final_train_loss,
+        train_rmse,
+        final_valid_loss = output.final_valid_loss,
+        valid_rmse,
+        epochs_completed = output.epochs_completed,
+        "Training completed"
+    );
 
     // Create model record in database
     let training_config_json = serde_json::json!({
+        "model_type": "lstm_sequence",
         "learning_rate": learning_rate,
         "epochs": epochs,
         "batch_size": batch_size,
-        "hidden_size_1": model_config.hidden_size_1,
-        "hidden_size_2": model_config.hidden_size_2,
+        "sequence_length": config.sequence_length,
+        "lstm_hidden_1": model_config.lstm_hidden_1,
+        "lstm_hidden_2": model_config.lstm_hidden_2,
+        "feedforward_hidden": model_config.feedforward_hidden,
+        "dropout": model_config.dropout,
+    });
+
+    let training_metrics_json = serde_json::json!({
+        "final_train_loss": output.final_train_loss,
+        "final_train_rmse": train_rmse,
+        "final_valid_loss": output.final_valid_loss,
+        "final_valid_rmse": valid_rmse,
+        "epochs_completed": output.epochs_completed,
     });
 
     database::insert_model(
@@ -73,7 +113,7 @@ pub async fn run(
         next_version,
         &checkpoint_path,
         Some(training_config_json),
-        None, // TODO: Add training metrics
+        Some(training_metrics_json),
     )
     .await?;
 
@@ -81,19 +121,20 @@ pub async fn run(
         model_name,
         version = next_version,
         checkpoint_path,
-        "Training complete"
+        "Model saved"
     );
 
     Ok(())
 }
 
 /// Loads training data from the database.
-async fn load_training_data() -> Result<TrainingData> {
-    let mut data = TrainingData::new();
+///
+/// Each replay becomes one training sample - the model learns to predict
+/// player MMR from the entire sequence of gameplay.
+async fn load_training_data() -> Result<SequenceTrainingData> {
+    let mut data = SequenceTrainingData::new();
 
-    // Get all 3v3 replays (our primary training data)
-    // Note: Since we unified to ballchasing replays, we get all downloaded replays
-    // The metadata should contain game mode information if needed
+    // Get all ranked replays
     let mut all_replays = Vec::new();
     for rank in replay_structs::Rank::all_ranked() {
         let rank_replays =
@@ -101,14 +142,19 @@ async fn load_training_data() -> Result<TrainingData> {
                 .await?;
         all_replays.extend(rank_replays);
     }
-    let replays = all_replays;
 
-    for replay in replays {
+    info!(total_replays = all_replays.len(), "Found replays to process");
+
+    let mut skipped_no_players = 0;
+    let mut skipped_parse_error = 0;
+    let mut skipped_read_error = 0;
+
+    for replay in all_replays {
         // Get player ratings for this replay
         let db_players = database::list_replay_players_by_replay(replay.id).await?;
 
         if db_players.is_empty() {
-            // Skip replays without player ratings
+            skipped_no_players += 1;
             continue;
         }
 
@@ -132,24 +178,51 @@ async fn load_training_data() -> Result<TrainingData> {
             Ok(get_result) => match get_result.bytes().await {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    error!(replay = %object_path.to_string(), error = %e, "Failed to read bytes from object_store, skipping");
+                    error!(replay = %object_path.to_string(), error = %e, "Failed to read bytes");
+                    skipped_read_error += 1;
                     continue;
                 }
             },
             Err(e) => {
-                error!(replay = %object_path.to_string(), error = %e, "Failed to read from object_store, skipping");
+                error!(replay = %object_path.to_string(), error = %e, "Failed to get from object_store");
+                skipped_read_error += 1;
                 continue;
             }
         };
 
         // Parse the replay from bytes
-        let Ok(parsed) = parse_replay_from_bytes(&replay_data) else {
-            continue;
+        let parsed = match parse_replay_from_bytes(&replay_data) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(replay = %object_path.to_string(), error = %e, "Failed to parse replay");
+                skipped_parse_error += 1;
+                continue;
+            }
         };
 
-        // Segment by goals and extract features
-        let samples = extract_segment_samples(&parsed.frames, &player_ratings);
-        data.add_samples(samples);
+        if parsed.frames.is_empty() {
+            warn!(replay = %object_path.to_string(), "Replay has no frames");
+            skipped_parse_error += 1;
+            continue;
+        }
+
+        // Extract game sequence (one sample per replay)
+        let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+
+        // Convert to SequenceSample for ml_model
+        data.add_sample(SequenceSample {
+            frames: game_sequence.frames,
+            target_mmr: game_sequence.target_mmr,
+        });
+    }
+
+    if skipped_no_players > 0 || skipped_parse_error > 0 || skipped_read_error > 0 {
+        info!(
+            skipped_no_players,
+            skipped_parse_error,
+            skipped_read_error,
+            "Skipped some replays"
+        );
     }
 
     Ok(data)

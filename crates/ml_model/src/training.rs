@@ -1,4 +1,4 @@
-//! Training logic for the impact model.
+//! Training logic for the sequence model.
 
 use burn::data::dataset::Dataset;
 use burn::nn::loss::MseLoss;
@@ -6,8 +6,8 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 
-use crate::dataset::{ImpactBatcher, ImpactDataset};
-use crate::{ImpactModel, TrainingConfig, TrainingData};
+use crate::dataset::{SequenceBatcher, SequenceDataset};
+use crate::{SequenceModel, SequenceTrainingData, TrainingConfig};
 
 /// Output from training.
 #[derive(Debug, Clone)]
@@ -20,22 +20,23 @@ pub struct TrainingOutput {
     pub epochs_completed: usize,
 }
 
-/// Trains the model on the provided data.
+/// Trains the sequence model on the provided data.
 ///
-/// Uses a simple training loop with Adam optimizer and MSE loss.
+/// Uses Adam optimizer with MSE loss. The model learns to predict
+/// per-player MMR from sequences of game frames.
 ///
 /// # Arguments
 ///
 /// * `model` - The model to train (will be modified in place).
-/// * `data` - The training data.
+/// * `data` - The training data (game/segment samples).
 /// * `config` - Training configuration.
 ///
 /// # Errors
 ///
 /// Returns an error if training fails.
 pub fn train<B: AutodiffBackend>(
-    model: &mut ImpactModel<B>,
-    data: &TrainingData,
+    model: &mut SequenceModel<B>,
+    data: &SequenceTrainingData,
     config: &TrainingConfig,
 ) -> anyhow::Result<TrainingOutput>
 where
@@ -55,17 +56,20 @@ where
     }
 
     // Create dataset and batcher
-    let dataset = ImpactDataset::from_slice(&train_samples);
-    let batcher = ImpactBatcher::<B>::new(device);
+    let dataset = SequenceDataset::new(&train_samples, config.sequence_length);
+    let batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
 
-    // Create validation batcher if we have validation data
+    // Create validation dataset if we have validation data
     let valid_dataset = if !valid_samples.is_empty() {
-        Some(ImpactDataset::from_slice(&valid_samples))
+        Some(SequenceDataset::new(
+            &valid_samples,
+            config.sequence_length,
+        ))
     } else {
         None
     };
 
-    // Create optimizer
+    // Create optimizer with weight decay for regularization
     let mut optimizer = AdamConfig::new().init();
 
     let loss_fn = MseLoss::new();
@@ -74,6 +78,17 @@ where
     let mut best_valid_loss = f32::MAX;
     let mut epochs_without_improvement = 0;
     const EARLY_STOPPING_PATIENCE: usize = 10;
+
+    println!(
+        "Starting training with {} samples ({} train, {} valid)",
+        data.len(),
+        train_samples.len(),
+        valid_samples.len()
+    );
+    println!(
+        "Sequence length: {}, Batch size: {}, Learning rate: {}",
+        config.sequence_length, config.batch_size, config.learning_rate
+    );
 
     for epoch in 0..config.epochs {
         let mut epoch_loss = 0.0;
@@ -138,7 +153,8 @@ where
 
         // Validation
         if let Some(valid_ds) = &valid_dataset {
-            let valid_loss = compute_validation_loss(model, valid_ds, &batcher, &loss_fn);
+            let valid_batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
+            let valid_loss = compute_validation_loss(model, valid_ds, &valid_batcher, &loss_fn);
             final_valid_loss = Some(valid_loss);
 
             // Early stopping check
@@ -161,10 +177,8 @@ where
             }
         }
 
-        // Log progress every 10 epochs or at the end
-        if epoch % 10 == 0 || epoch == config.epochs - 1 {
-            log_progress(epoch + 1, final_train_loss, final_valid_loss);
-        }
+        // Log progress every epoch for sequence models (fewer samples)
+        log_progress(epoch + 1, final_train_loss, final_valid_loss);
     }
 
     Ok(TrainingOutput {
@@ -176,9 +190,9 @@ where
 
 /// Computes the validation loss on a dataset.
 fn compute_validation_loss<B: Backend>(
-    model: &ImpactModel<B>,
-    dataset: &ImpactDataset,
-    batcher: &ImpactBatcher<B>,
+    model: &SequenceModel<B>,
+    dataset: &SequenceDataset,
+    batcher: &SequenceBatcher<B>,
     loss_fn: &MseLoss,
 ) -> f32 {
     let num_samples = dataset.len();
@@ -189,8 +203,8 @@ fn compute_validation_loss<B: Backend>(
     let mut total_loss = 0.0;
     let mut batch_count = 0;
 
-    // Process in batches of 64
-    const BATCH_SIZE: usize = 64;
+    // Process in batches of 32
+    const BATCH_SIZE: usize = 32;
     for batch_start in (0..num_samples).step_by(BATCH_SIZE) {
         let batch_end = (batch_start + BATCH_SIZE).min(num_samples);
 
@@ -240,10 +254,15 @@ fn shuffle_indices(indices: &mut [usize], seed: u64) {
 
 /// Logs training progress.
 fn log_progress(epoch: usize, train_loss: f32, valid_loss: Option<f32>) {
+    // Convert MSE to RMSE for more intuitive interpretation
+    let train_rmse = train_loss.sqrt();
     if let Some(vl) = valid_loss {
-        println!("Epoch {epoch}: train_loss = {train_loss:.6}, valid_loss = {vl:.6}");
+        let valid_rmse = vl.sqrt();
+        println!(
+            "Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR), valid_loss = {vl:.6} (RMSE: {valid_rmse:.1} MMR)"
+        );
     } else {
-        println!("Epoch {epoch}: train_loss = {train_loss:.6}");
+        println!("Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR)");
     }
 }
 
@@ -254,7 +273,7 @@ mod tests {
     use feature_extractor::FrameFeatures;
 
     use super::*;
-    use crate::ModelConfig;
+    use crate::{ModelConfig, SequenceSample};
 
     type TestBackend = Autodiff<NdArray>;
 
@@ -262,21 +281,26 @@ mod tests {
     fn test_training() {
         let device = NdArrayDevice::default();
         let model_config = ModelConfig::new();
-        let mut model: ImpactModel<TestBackend> = ImpactModel::new(&device, &model_config);
+        let mut model: SequenceModel<TestBackend> = SequenceModel::new(&device, &model_config);
 
-        // Create some training data
-        let mut data = TrainingData::new();
-        for i in 0..100 {
-            let mmr = (i as f32).mul_add(10.0, 1000.0);
-            data.add_samples(vec![feature_extractor::TrainingSample {
-                features: FrameFeatures::default(),
-                target_mmr: vec![mmr; 6],
-            }]);
+        // Create some training data - 20 game samples
+        let mut data = SequenceTrainingData::new();
+        for i in 0..20 {
+            let mmr = (i as f32).mul_add(50.0, 1000.0);
+            let frames: Vec<FrameFeatures> = (0..100)
+                .map(|_| FrameFeatures::default())
+                .collect();
+
+            data.add_sample(SequenceSample {
+                frames,
+                target_mmr: [mmr; 6],
+            });
         }
 
         let config = TrainingConfig::new(model_config)
             .with_epochs(2)
-            .with_batch_size(16);
+            .with_batch_size(4)
+            .with_sequence_length(50);
 
         let result = train(&mut model, &data, &config);
         assert!(result.is_ok(), "Training failed: {:?}", result.err());

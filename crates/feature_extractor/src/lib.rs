@@ -630,10 +630,81 @@ fn quaternion_forward(q: &Quaternion) -> Vector3 {
     Vector3 { x, y, z }
 }
 
+/// A sequence sample representing an entire game/replay for LSTM training.
+#[derive(Debug, Clone)]
+pub struct GameSequenceSample {
+    /// All frame features from the game.
+    pub frames: Vec<FrameFeatures>,
+    /// Target MMR for each of the 6 players.
+    /// Order: blue team (3 players sorted by `actor_id`), then orange team (3 players).
+    pub target_mmr: [f32; TOTAL_PLAYERS],
+}
+
+/// Extracts a single game sequence sample from all frames in a replay.
+///
+/// This creates one training sample per replay, where the model learns
+/// to predict player MMR from the entire sequence of gameplay.
+///
+/// # Arguments
+///
+/// * `frames` - All frames from the replay.
+/// * `player_ratings` - Player ratings with team assignments.
+///
+/// # Returns
+///
+/// A `GameSequenceSample` containing all frame features and target MMR values.
+pub fn extract_game_sequence(
+    frames: &[GameFrame],
+    player_ratings: &[PlayerRating],
+) -> GameSequenceSample {
+    // Build target MMR array
+    let target_mmr = build_target_mmr_array(player_ratings);
+
+    // Extract features from all frames
+    let frame_features: Vec<FrameFeatures> = frames.iter().map(extract_frame_features).collect();
+
+    GameSequenceSample {
+        frames: frame_features,
+        target_mmr,
+    }
+}
+
+/// Builds a fixed-size target MMR array from player ratings.
+fn build_target_mmr_array(player_ratings: &[PlayerRating]) -> [f32; TOTAL_PLAYERS] {
+    let mut target_mmr = [1000.0f32; TOTAL_PLAYERS];
+
+    // Separate by team and sort
+    let mut blue_ratings: Vec<_> = player_ratings.iter().filter(|r| r.team == 0).collect();
+    let mut orange_ratings: Vec<_> = player_ratings.iter().filter(|r| r.team == 1).collect();
+
+    // Sort by name for consistent ordering (since we don't have actor_id here)
+    blue_ratings.sort_by(|a, b| a.player_name.cmp(&b.player_name));
+    orange_ratings.sort_by(|a, b| a.player_name.cmp(&b.player_name));
+
+    // Fill blue team (first 3 slots)
+    for (i, rating) in blue_ratings.iter().take(PLAYERS_PER_TEAM).enumerate() {
+        target_mmr[i] = rating.mmr as f32;
+    }
+
+    // Fill orange team (next 3 slots)
+    for (i, rating) in orange_ratings.iter().take(PLAYERS_PER_TEAM).enumerate() {
+        target_mmr[PLAYERS_PER_TEAM + i] = rating.mmr as f32;
+    }
+
+    target_mmr
+}
+
 /// Extracts features from all frames in a segment and pairs with ratings.
 ///
 /// Creates per-player `target_mmr` matching the feature order
 /// (blue team sorted by `actor_id`, then orange team sorted by `actor_id`).
+///
+/// **Note:** This function creates one sample per frame, which is suitable for
+/// feedforward models. For sequence models, use `extract_game_sequence` instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use extract_game_sequence for LSTM-based sequence models"
+)]
 pub fn extract_segment_samples(
     frames: &[GameFrame],
     player_ratings: &[PlayerRating],

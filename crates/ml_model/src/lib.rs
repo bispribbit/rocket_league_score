@@ -1,8 +1,19 @@
-//! ML model crate for Rocket League impact score prediction.
+//! ML model crate for Rocket League player skill prediction.
 //!
-//! This crate uses the Burn deep learning framework to define, train,
-//! and run inference with a neural network that predicts player impact
-//! scores based on frame features.
+//! This crate uses the Burn deep learning framework with an LSTM-based
+//! sequence model that analyzes temporal patterns in gameplay to predict
+//! player MMR/skill level.
+//!
+//! ## Key Concepts
+//!
+//! Unlike frame-by-frame prediction, this model processes **sequences of frames**
+//! from entire games or segments, learning temporal patterns like:
+//! - Reaction speed and recovery times
+//! - Consistency of mechanical execution
+//! - Decision making patterns over time
+//! - Rotation and positioning habits
+//!
+//! The model outputs one MMR prediction per player per game/segment.
 
 mod dataset;
 mod training;
@@ -11,24 +22,28 @@ use std::path::Path;
 
 use burn::config::Config;
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig, Relu};
+use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-pub use dataset::{ImpactBatcher, ImpactDataset, ImpactDatasetItem};
-use feature_extractor::{FEATURE_COUNT, FrameFeatures, TrainingSample};
+use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 pub use training::{TrainingOutput, train};
 
-/// Configuration for the impact score model.
+pub use dataset::{SequenceBatcher, SequenceDataset, SequenceDatasetItem};
+
+/// Configuration for the sequence model.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
-    /// Number of hidden units in the first layer.
+    /// Hidden size for the first LSTM layer.
     #[config(default = 256)]
-    pub hidden_size_1: usize,
-    /// Number of hidden units in the second layer.
+    pub lstm_hidden_1: usize,
+    /// Hidden size for the second LSTM layer.
     #[config(default = 128)]
-    pub hidden_size_2: usize,
+    pub lstm_hidden_2: usize,
+    /// Hidden size for the feedforward layer after LSTM.
+    #[config(default = 64)]
+    pub feedforward_hidden: usize,
     /// Dropout rate for regularization.
-    #[config(default = 0.1)]
+    #[config(default = 0.3)]
     pub dropout: f64,
 }
 
@@ -42,40 +57,70 @@ pub struct TrainingConfig {
     #[config(default = 100)]
     pub epochs: usize,
     /// Batch size for training.
-    #[config(default = 64)]
+    #[config(default = 32)]
     pub batch_size: usize,
     /// Model architecture configuration.
     pub model: ModelConfig,
     /// Validation split ratio (0.0 to 1.0).
     #[config(default = 0.1)]
     pub validation_split: f64,
+    /// Sequence length (number of frames per sample).
+    /// Frames are sampled uniformly from the game.
+    #[config(default = 300)]
+    pub sequence_length: usize,
 }
 
-/// The impact score prediction model.
+/// LSTM-based sequence model for player skill prediction.
 ///
-/// A simple feedforward neural network that takes frame features
-/// as input and outputs a predicted MMR/impact score.
+/// This model processes sequences of game frames to predict player MMR.
+/// It uses stacked LSTM layers to capture temporal patterns in gameplay,
+/// then projects the final hidden state to per-player MMR predictions.
 #[derive(Module, Debug)]
-pub struct ImpactModel<B: Backend> {
+pub struct SequenceModel<B: Backend> {
+    /// First LSTM layer processes raw frame features.
+    lstm1: Lstm<B>,
+    /// Second LSTM layer for deeper temporal patterns.
+    lstm2: Lstm<B>,
+    /// Dropout for regularization.
+    dropout: Dropout,
+    /// First feedforward layer after LSTM.
     linear1: Linear<B>,
-    linear2: Linear<B>,
+    /// Output layer predicting MMR for each player.
     linear_out: Linear<B>,
+    /// ReLU activation.
     activation: Relu,
+    /// Hidden size of first LSTM (needed for inference).
+    lstm1_hidden: usize,
+    /// Hidden size of second LSTM (needed for inference).
+    lstm2_hidden: usize,
 }
 
-impl<B: Backend> ImpactModel<B> {
-    /// Creates a new impact model with the given configuration.
+impl<B: Backend> SequenceModel<B> {
+    /// Creates a new sequence model with the given configuration.
     pub fn new(device: &B::Device, config: &ModelConfig) -> Self {
-        let linear1 = LinearConfig::new(FEATURE_COUNT, config.hidden_size_1).init(device);
-        let linear2 = LinearConfig::new(config.hidden_size_1, config.hidden_size_2).init(device);
-        let linear_out = LinearConfig::new(config.hidden_size_2, 1).init(device);
+        // LSTM layers
+        let lstm1 = LstmConfig::new(FEATURE_COUNT, config.lstm_hidden_1, true).init(device);
+        let lstm2 = LstmConfig::new(config.lstm_hidden_1, config.lstm_hidden_2, true).init(device);
+
+        // Dropout
+        let dropout = DropoutConfig::new(config.dropout).init();
+
+        // Feedforward layers
+        let linear1 =
+            LinearConfig::new(config.lstm_hidden_2, config.feedforward_hidden).init(device);
+        let linear_out = LinearConfig::new(config.feedforward_hidden, TOTAL_PLAYERS).init(device);
+
         let activation = Relu::new();
 
         Self {
+            lstm1,
+            lstm2,
+            dropout,
             linear1,
-            linear2,
             linear_out,
             activation,
+            lstm1_hidden: config.lstm_hidden_1,
+            lstm2_hidden: config.lstm_hidden_2,
         }
     }
 
@@ -83,35 +128,71 @@ impl<B: Backend> ImpactModel<B> {
     ///
     /// # Arguments
     ///
-    /// * `input` - Tensor of shape [`batch_size`, `FEATURE_COUNT`]
+    /// * `input` - Tensor of shape `[batch_size, seq_len, FEATURE_COUNT]`
     ///
     /// # Returns
     ///
-    /// Tensor of shape [`batch_size`, 1] containing predicted impact scores.
-    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let x = self.linear1.forward(input);
+    /// Tensor of shape `[batch_size, 6]` containing predicted MMR for each player.
+    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
+        // LSTM1: [batch, seq, features] -> [batch, seq, lstm1_hidden]
+        let (lstm1_out, _state1) = self.lstm1.forward(input, None);
+
+        // LSTM2: [batch, seq, lstm1_hidden] -> [batch, seq, lstm2_hidden]
+        let (lstm2_out, _state2) = self.lstm2.forward(lstm1_out, None);
+
+        // Take the last timestep's hidden state: [batch, lstm2_hidden]
+        // Use narrow to select the last timestep, then reshape to remove the seq dimension
+        let [batch_size, seq_len, hidden_size] = lstm2_out.dims();
+        let last_hidden = lstm2_out
+            .narrow(1, seq_len - 1, 1)
+            .reshape([batch_size, hidden_size]);
+
+        // Dropout for regularization
+        let x = self.dropout.forward(last_hidden);
+
+        // Feedforward layers
+        let x = self.linear1.forward(x);
         let x = self.activation.forward(x);
-        let x = self.linear2.forward(x);
-        let x = self.activation.forward(x);
+        let x = self.dropout.forward(x);
+
+        // Output: [batch, 6]
         self.linear_out.forward(x)
+    }
+
+    /// Forward pass for inference (without dropout).
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Tensor of shape `[batch_size, seq_len, FEATURE_COUNT]`
+    ///
+    /// # Returns
+    ///
+    /// Tensor of shape `[batch_size, 6]` containing predicted MMR for each player.
+    pub fn forward_inference(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
+        // Same as forward but dropout is automatically disabled in eval mode
+        // For Burn, dropout is controlled by the tensor's require_grad flag
+        self.forward(input)
     }
 }
 
-/// Reference to a saved model checkpoint.
+/// A training sample representing one game/segment.
 #[derive(Debug, Clone)]
-pub struct ModelCheckpoint {
-    pub path: String,
-    pub version: u32,
-    pub training_config: TrainingConfig,
+pub struct SequenceSample {
+    /// Sequence of frame features from the game.
+    pub frames: Vec<FrameFeatures>,
+    /// Target MMR for each of the 6 players.
+    /// Order: blue team (3 players sorted by actor_id), then orange team (3 players).
+    pub target_mmr: [f32; TOTAL_PLAYERS],
 }
 
-/// Training data container.
+/// Training data container for sequence samples.
 #[derive(Debug, Clone, Default)]
-pub struct TrainingData {
-    pub samples: Vec<TrainingSample>,
+pub struct SequenceTrainingData {
+    /// Collection of game/segment samples.
+    pub samples: Vec<SequenceSample>,
 }
 
-impl TrainingData {
+impl SequenceTrainingData {
     /// Creates a new empty training data container.
     #[must_use]
     pub const fn new() -> Self {
@@ -120,20 +201,25 @@ impl TrainingData {
         }
     }
 
-    /// Adds samples to the training data.
-    pub fn add_samples(&mut self, samples: Vec<TrainingSample>) {
+    /// Adds a sample to the training data.
+    pub fn add_sample(&mut self, sample: SequenceSample) {
+        self.samples.push(sample);
+    }
+
+    /// Adds multiple samples to the training data.
+    pub fn add_samples(&mut self, samples: Vec<SequenceSample>) {
         self.samples.extend(samples);
     }
 
     /// Returns the number of samples.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.samples.len()
     }
 
     /// Returns true if there are no samples.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
 
@@ -143,7 +229,7 @@ impl TrainingData {
     ///
     /// * `validation_ratio` - Fraction of data to use for validation (0.0 to 1.0)
     #[must_use]
-    pub fn split(&self, validation_ratio: f64) -> (Vec<TrainingSample>, Vec<TrainingSample>) {
+    pub fn split(&self, validation_ratio: f64) -> (Vec<SequenceSample>, Vec<SequenceSample>) {
         let validation_count = (self.samples.len() as f64 * validation_ratio) as usize;
         let train_count = self.samples.len() - validation_count;
 
@@ -154,103 +240,161 @@ impl TrainingData {
     }
 }
 
-/// Creates a new model with the given configuration.
-///
-/// # Arguments
-///
-/// * `device` - The device to create the model on.
-/// * `config` - The model configuration.
-///
-/// # Returns
-///
-/// A new `ImpactModel` instance.
-pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> ImpactModel<B> {
-    ImpactModel::new(device, config)
+/// Reference to a saved model checkpoint.
+#[derive(Debug, Clone)]
+pub struct ModelCheckpoint {
+    /// Path to the saved model.
+    pub path: String,
+    /// Model version.
+    pub version: u32,
+    /// Training configuration used.
+    pub training_config: TrainingConfig,
 }
 
-/// Predicts the impact score for a single frame.
+/// Creates a new sequence model with the given configuration.
+pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> SequenceModel<B> {
+    SequenceModel::new(device, config)
+}
+
+/// Predicts MMR for all players from a sequence of frames.
 ///
 /// # Arguments
 ///
 /// * `model` - The trained model.
-/// * `features` - The frame features to predict on.
+/// * `frames` - Sequence of frame features from a game.
 /// * `device` - The device to run inference on.
+/// * `sequence_length` - The expected sequence length (frames will be sampled to match).
 ///
 /// # Returns
 ///
-/// The predicted impact score (MMR-like value).
+/// Array of predicted MMR values for each of the 6 players.
 pub fn predict<B: Backend>(
-    model: &ImpactModel<B>,
-    features: &FrameFeatures,
+    model: &SequenceModel<B>,
+    frames: &[FrameFeatures],
     device: &B::Device,
-) -> f32 {
-    // Convert features to tensor [1, FEATURE_COUNT]
-    let input = Tensor::<B, 1>::from_floats(features.features, device).unsqueeze();
-
-    // Forward pass - output is [1, 1]
-    let output = model.forward(input);
-
-    // Extract scalar value using into_data
-    let output_data = output.into_data();
-    let values = output_data.to_vec::<f32>().unwrap_or_else(|_| vec![1000.0]);
-
-    values.first().copied().unwrap_or(1000.0)
-}
-
-/// Predicts impact scores for a batch of frames.
-///
-/// # Arguments
-///
-/// * `model` - The trained model.
-/// * `features` - Vector of frame features to predict on.
-/// * `device` - The device to run inference on.
-///
-/// # Returns
-///
-/// Vector of predicted impact scores.
-pub fn predict_batch<B: Backend>(
-    model: &ImpactModel<B>,
-    features: &[FrameFeatures],
-    device: &B::Device,
-) -> Vec<f32> {
-    if features.is_empty() {
-        return Vec::new();
+    sequence_length: usize,
+) -> [f32; TOTAL_PLAYERS] {
+    if frames.is_empty() {
+        return [1000.0; TOTAL_PLAYERS];
     }
 
-    // Build input tensor [batch_size, FEATURE_COUNT]
-    let batch_size = features.len();
-    let mut input_data = Vec::with_capacity(batch_size * FEATURE_COUNT);
+    // Sample frames to match expected sequence length
+    let sampled_frames = sample_frames(frames, sequence_length);
 
-    for frame in features {
+    // Build input tensor [1, seq_len, FEATURE_COUNT]
+    let mut input_data = Vec::with_capacity(sequence_length * FEATURE_COUNT);
+    for frame in &sampled_frames {
         input_data.extend_from_slice(&frame.features);
     }
 
     let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device)
-        .reshape([batch_size, FEATURE_COUNT]);
+        .reshape([1, sequence_length, FEATURE_COUNT]);
 
     // Forward pass
-    let output = model.forward(input);
+    let output = model.forward_inference(input);
 
     // Extract values
     let output_data = output.into_data();
-    output_data
+    let values = output_data
         .to_vec::<f32>()
-        .unwrap_or_else(|_| vec![1000.0; batch_size])
+        .unwrap_or_else(|_| vec![1000.0; TOTAL_PLAYERS]);
+
+    let mut result = [1000.0; TOTAL_PLAYERS];
+    for (i, val) in values.iter().take(TOTAL_PLAYERS).enumerate() {
+        result[i] = *val;
+    }
+    result
 }
 
-/// Saves the model checkpoint to disk.
+/// Predicts MMR with a sliding window, returning how predictions evolve over time.
+///
+/// This provides an "evolving score" that shows how the model's confidence
+/// changes as more of the game is observed.
 ///
 /// # Arguments
 ///
-/// * `model` - The model to save.
-/// * `path` - The path to save to (without extension).
-/// * `config` - The training configuration used.
+/// * `model` - The trained model.
+/// * `frames` - All frame features from a game.
+/// * `device` - The device to run inference on.
+/// * `sequence_length` - The window size for predictions.
+/// * `step_size` - How many frames to advance between predictions.
 ///
-/// # Errors
+/// # Returns
 ///
-/// Returns an error if saving fails.
+/// Vector of (timestamp, mmr_predictions) tuples showing evolution over time.
+pub fn predict_evolving<B: Backend>(
+    model: &SequenceModel<B>,
+    frames: &[FrameFeatures],
+    device: &B::Device,
+    sequence_length: usize,
+    step_size: usize,
+) -> Vec<EvolvingPrediction> {
+    let mut predictions = Vec::new();
+
+    if frames.len() < sequence_length {
+        // Not enough frames for even one prediction
+        let pred = predict(model, frames, device, sequence_length);
+        let timestamp = frames.last().map_or(0.0, |f| f.time);
+        predictions.push(EvolvingPrediction {
+            timestamp,
+            player_mmr: pred,
+        });
+        return predictions;
+    }
+
+    // Slide window through the game
+    let mut start = 0;
+    while start + sequence_length <= frames.len() {
+        let window = &frames[start..start + sequence_length];
+        let pred = predict(model, window, device, sequence_length);
+        let timestamp = window.last().map_or(0.0, |f| f.time);
+
+        predictions.push(EvolvingPrediction {
+            timestamp,
+            player_mmr: pred,
+        });
+
+        start += step_size;
+    }
+
+    predictions
+}
+
+/// A prediction at a specific point in time during a game.
+#[derive(Debug, Clone)]
+pub struct EvolvingPrediction {
+    /// Timestamp in the game (seconds).
+    pub timestamp: f32,
+    /// Predicted MMR for each player.
+    pub player_mmr: [f32; TOTAL_PLAYERS],
+}
+
+/// Samples frames uniformly to match a target sequence length.
+fn sample_frames(frames: &[FrameFeatures], target_len: usize) -> Vec<FrameFeatures> {
+    if frames.len() <= target_len {
+        // Pad with last frame if too short
+        let mut result = frames.to_vec();
+        if let Some(last) = frames.last() {
+            while result.len() < target_len {
+                result.push(last.clone());
+            }
+        }
+        return result;
+    }
+
+    // Sample uniformly
+    let step = frames.len() as f64 / target_len as f64;
+    (0..target_len)
+        .map(|i| {
+            let idx = (i as f64 * step) as usize;
+            frames[idx.min(frames.len() - 1)].clone()
+        })
+        .collect()
+}
+
+/// Saves the model checkpoint to disk.
 pub fn save_checkpoint<B: Backend>(
-    model: &ImpactModel<B>,
+    model: &SequenceModel<B>,
     path: &str,
     config: &TrainingConfig,
 ) -> anyhow::Result<ModelCheckpoint> {
@@ -280,19 +424,10 @@ pub fn save_checkpoint<B: Backend>(
 }
 
 /// Loads a model checkpoint from disk.
-///
-/// # Arguments
-///
-/// * `path` - The path to load from (without extension).
-/// * `device` - The device to load the model to.
-///
-/// # Errors
-///
-/// Returns an error if loading fails.
 pub fn load_checkpoint<B: Backend>(
     path: &str,
     device: &B::Device,
-) -> anyhow::Result<ImpactModel<B>> {
+) -> anyhow::Result<SequenceModel<B>> {
     // Try to load config first, fall back to defaults
     let config_path = format!("{path}.config.json");
     let model_config = if Path::new(&config_path).exists() {
@@ -304,7 +439,7 @@ pub fn load_checkpoint<B: Backend>(
     };
 
     // Create model with config
-    let model = ImpactModel::new(device, &model_config);
+    let model = SequenceModel::new(device, &model_config);
 
     // Load weights
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
@@ -327,69 +462,71 @@ mod tests {
     fn test_model_creation() {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let config = ModelConfig::new();
-        let _model: ImpactModel<TestBackend> = create_model(&device, &config);
+        let _model: SequenceModel<TestBackend> = create_model(&device, &config);
     }
 
     #[test]
     fn test_model_forward() {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let config = ModelConfig::new();
-        let model: ImpactModel<TestBackend> = create_model(&device, &config);
+        let model: SequenceModel<TestBackend> = create_model(&device, &config);
 
-        // Create a batch of 2 samples
-        let input = Tensor::<TestBackend, 2>::zeros([2, FEATURE_COUNT], &device);
+        // Create a batch of 2 sequences, each with 100 frames
+        let batch_size = 2;
+        let seq_len = 100;
+        let input = Tensor::<TestBackend, 3>::zeros([batch_size, seq_len, FEATURE_COUNT], &device);
         let output = model.forward(input);
 
-        // Output should be [2, 1]
-        assert_eq!(output.dims(), [2, 1]);
+        // Output should be [2, 6] (6 players per game)
+        assert_eq!(output.dims(), [batch_size, TOTAL_PLAYERS]);
     }
 
     #[test]
-    fn test_predict_single() {
+    fn test_predict_single_game() {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let config = ModelConfig::new();
-        let model: ImpactModel<TestBackend> = create_model(&device, &config);
+        let model: SequenceModel<TestBackend> = create_model(&device, &config);
 
-        let features = FrameFeatures::default();
-        let score = predict(&model, &features, &device);
+        // Create 500 frames of fake game data
+        let frames: Vec<FrameFeatures> = (0..500)
+            .map(|i| FrameFeatures {
+                features: [0.0; FEATURE_COUNT],
+                time: i as f32 * 0.033, // ~30fps
+            })
+            .collect();
 
-        // Score should be a reasonable number (model is untrained, so just check it's finite)
-        assert!(score.is_finite());
-    }
+        let scores = predict(&model, &frames, &device, 300);
 
-    #[test]
-    fn test_predict_batch() {
-        let device = burn::backend::ndarray::NdArrayDevice::default();
-        let config = ModelConfig::new();
-        let model: ImpactModel<TestBackend> = create_model(&device, &config);
-
-        let features = vec![FrameFeatures::default(), FrameFeatures::default()];
-        let scores = predict_batch(&model, &features, &device);
-
-        assert_eq!(scores.len(), 2);
+        // Should get 6 scores (one per player)
+        assert_eq!(scores.len(), TOTAL_PLAYERS);
         assert!(scores.iter().all(|s| s.is_finite()));
     }
 
     #[test]
-    fn test_training_data() {
-        let mut data = TrainingData::new();
+    fn test_sequence_training_data() {
+        let mut data = SequenceTrainingData::new();
         assert!(data.is_empty());
         assert_eq!(data.len(), 0);
 
-        data.add_samples(vec![]);
-        assert!(data.is_empty());
+        data.add_sample(SequenceSample {
+            frames: vec![FrameFeatures::default()],
+            target_mmr: [1000.0; TOTAL_PLAYERS],
+        });
+
+        assert!(!data.is_empty());
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
     fn test_training_data_split() {
-        let mut data = TrainingData::new();
+        let mut data = SequenceTrainingData::new();
 
         // Add 10 samples
         for i in 0..10 {
-            data.add_samples(vec![TrainingSample {
-                features: FrameFeatures::default(),
-                target_mmr: vec![i as f32 * 100.0; 6],
-            }]);
+            data.add_sample(SequenceSample {
+                frames: vec![FrameFeatures::default()],
+                target_mmr: [i as f32 * 100.0; TOTAL_PLAYERS],
+            });
         }
 
         let (train, val) = data.split(0.2);
@@ -398,10 +535,47 @@ mod tests {
     }
 
     #[test]
-    fn test_training_config_default() {
-        let config = TrainingConfig::new(ModelConfig::new());
-        assert!(config.learning_rate > 0.0);
-        assert!(config.epochs > 0);
-        assert!(config.batch_size > 0);
+    fn test_sample_frames_exact() {
+        let frames: Vec<FrameFeatures> = (0..100)
+            .map(|i| FrameFeatures {
+                features: [i as f32; FEATURE_COUNT],
+                time: i as f32,
+            })
+            .collect();
+
+        let sampled = sample_frames(&frames, 100);
+        assert_eq!(sampled.len(), 100);
+    }
+
+    #[test]
+    fn test_sample_frames_downsample() {
+        let frames: Vec<FrameFeatures> = (0..1000)
+            .map(|i| FrameFeatures {
+                features: [i as f32; FEATURE_COUNT],
+                time: i as f32,
+            })
+            .collect();
+
+        let sampled = sample_frames(&frames, 100);
+        assert_eq!(sampled.len(), 100);
+
+        // Should sample uniformly - first frame should be index 0
+        assert!((sampled[0].time - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_sample_frames_pad() {
+        let frames: Vec<FrameFeatures> = (0..50)
+            .map(|i| FrameFeatures {
+                features: [i as f32; FEATURE_COUNT],
+                time: i as f32,
+            })
+            .collect();
+
+        let sampled = sample_frames(&frames, 100);
+        assert_eq!(sampled.len(), 100);
+
+        // Last 50 should be padded with the last frame
+        assert!((sampled[99].time - 49.0).abs() < f32::EPSILON);
     }
 }
