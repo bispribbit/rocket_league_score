@@ -657,12 +657,6 @@ pub fn extract_segment_samples(
             // Sort players to match feature order (blue team sorted by actor_id, then orange team sorted by actor_id)
             let (blue_players, orange_players) = sort_players_by_team(&frame.players);
 
-            info!(
-                blue_players = blue_players.len(),
-                orange_players = orange_players.len(),
-                "Sorted players"
-            );
-
             // Build target_mmr vector matching feature order
             let mut target_mmr = Vec::with_capacity(TOTAL_PLAYERS);
 
