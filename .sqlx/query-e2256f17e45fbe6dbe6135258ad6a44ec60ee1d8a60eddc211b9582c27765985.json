@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE replays\n        SET dataset_split = $2, updated_at = NOW()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "dataset_split",
+            "kind": {
+              "Enum": [
+                "training",
+                "evaluation"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2256f17e45fbe6dbe6135258ad6a44ec60ee1d8a60eddc211b9582c27765985"
+}

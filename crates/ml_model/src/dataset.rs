@@ -105,8 +105,11 @@ impl<B: Backend> SequenceBatcher<B> {
             input_data.extend_from_slice(&item.features);
         }
 
-        let inputs = Tensor::<B, 1>::from_floats(input_data.as_slice(), &self.device)
-            .reshape([batch_size, self.sequence_length, FEATURE_COUNT]);
+        let inputs = Tensor::<B, 1>::from_floats(input_data.as_slice(), &self.device).reshape([
+            batch_size,
+            self.sequence_length,
+            FEATURE_COUNT,
+        ]);
 
         // Build target tensor [batch_size, TOTAL_PLAYERS]
         let mut target_data = Vec::with_capacity(batch_size * TOTAL_PLAYERS);
@@ -162,15 +165,11 @@ mod tests {
     fn test_sequence_dataset_creation() {
         let samples = vec![
             SequenceSample {
-                frames: (0..100)
-                    .map(|_| FrameFeatures::default())
-                    .collect(),
+                frames: (0..100).map(|_| FrameFeatures::default()).collect(),
                 target_mmr: [1000.0; TOTAL_PLAYERS],
             },
             SequenceSample {
-                frames: (0..200)
-                    .map(|_| FrameFeatures::default())
-                    .collect(),
+                frames: (0..200).map(|_| FrameFeatures::default()).collect(),
                 target_mmr: [1500.0; TOTAL_PLAYERS],
             },
         ];

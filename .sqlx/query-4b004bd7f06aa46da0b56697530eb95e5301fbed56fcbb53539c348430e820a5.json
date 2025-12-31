@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE replays\n        SET dataset_split = 'training', updated_at = NOW()\n        WHERE id IN (\n            SELECT id FROM replays\n            WHERE dataset_split IS NULL AND download_status = 'downloaded'\n            ORDER BY RANDOM()\n            LIMIT $1\n        )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4b004bd7f06aa46da0b56697530eb95e5301fbed56fcbb53539c348430e820a5"
+}

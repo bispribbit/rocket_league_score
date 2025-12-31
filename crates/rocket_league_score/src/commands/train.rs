@@ -143,7 +143,10 @@ async fn load_training_data() -> Result<SequenceTrainingData> {
         all_replays.extend(rank_replays);
     }
 
-    info!(total_replays = all_replays.len(), "Found replays to process");
+    info!(
+        total_replays = all_replays.len(),
+        "Found replays to process"
+    );
 
     let mut skipped_no_players = 0;
     let mut skipped_parse_error = 0;
@@ -219,9 +222,7 @@ async fn load_training_data() -> Result<SequenceTrainingData> {
     if skipped_no_players > 0 || skipped_parse_error > 0 || skipped_read_error > 0 {
         info!(
             skipped_no_players,
-            skipped_parse_error,
-            skipped_read_error,
-            "Skipped some replays"
+            skipped_parse_error, skipped_read_error, "Skipped some replays"
         );
     }
 

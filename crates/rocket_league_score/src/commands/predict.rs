@@ -74,22 +74,12 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
     info!("Blue Team:");
     for (i, mmr) in final_predictions.iter().take(3).enumerate() {
         let skill_level = interpret_mmr(*mmr);
-        info!(
-            "  Player {} - MMR: {:.0} ({})",
-            i + 1,
-            mmr,
-            skill_level
-        );
+        info!("  Player {} - MMR: {:.0} ({})", i + 1, mmr, skill_level);
     }
     info!("Orange Team:");
     for (i, mmr) in final_predictions.iter().skip(3).enumerate() {
         let skill_level = interpret_mmr(*mmr);
-        info!(
-            "  Player {} - MMR: {:.0} ({})",
-            i + 1,
-            mmr,
-            skill_level
-        );
+        info!("  Player {} - MMR: {:.0} ({})", i + 1, mmr, skill_level);
     }
 
     // Show how predictions evolved over the game
@@ -115,8 +105,16 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
     let orange_avg_final = final_predictions.iter().skip(3).sum::<f32>() / 3.0;
 
     info!("\n=== Game Summary ===");
-    info!("Blue Team Average MMR: {:.0} ({})", blue_avg_final, interpret_mmr(blue_avg_final));
-    info!("Orange Team Average MMR: {:.0} ({})", orange_avg_final, interpret_mmr(orange_avg_final));
+    info!(
+        "Blue Team Average MMR: {:.0} ({})",
+        blue_avg_final,
+        interpret_mmr(blue_avg_final)
+    );
+    info!(
+        "Orange Team Average MMR: {:.0} ({})",
+        orange_avg_final,
+        interpret_mmr(orange_avg_final)
+    );
 
     Ok(())
 }

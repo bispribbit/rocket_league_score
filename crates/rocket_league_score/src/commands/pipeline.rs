@@ -13,8 +13,7 @@ use burn::module::AutodiffModule;
 use config::OBJECT_STORE;
 use feature_extractor::{PlayerRating, extract_game_sequence};
 use ml_model::{
-    ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig, create_model, predict,
-    train,
+    ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig, create_model, predict, train,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
@@ -230,7 +229,12 @@ pub async fn run(num_replays: usize) -> Result<()> {
     let test_frames: Vec<feature_extractor::FrameFeatures> = (0..100)
         .map(|_| feature_extractor::FrameFeatures::default())
         .collect();
-    let test_preds = predict(&inference_model, &test_frames, &device, config.sequence_length);
+    let test_preds = predict(
+        &inference_model,
+        &test_frames,
+        &device,
+        config.sequence_length,
+    );
 
     let all_reasonable = test_preds.iter().all(|p| (0.0..=3000.0).contains(p));
     if all_reasonable {

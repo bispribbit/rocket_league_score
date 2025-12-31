@@ -148,10 +148,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         anyhow::bail!("No valid training samples extracted from replays.");
     }
 
-    info!(
-        samples = training_data.len(),
-        "Loaded training samples"
-    );
+    info!(samples = training_data.len(), "Loaded training samples");
 
     // Step 3: Create or load model
     info!("Step 3: Initializing model...");
@@ -282,9 +279,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
             let eval_rmse = eval_loss.sqrt();
             info!(
                 eval_samples = eval_data.len(),
-                eval_loss,
-                eval_rmse,
-                "Evaluation completed"
+                eval_loss, eval_rmse, "Evaluation completed"
             );
         } else {
             warn!("No valid evaluation samples extracted");
@@ -437,9 +432,7 @@ fn find_latest_checkpoint(prefix: &str) -> Result<Option<String>> {
 /// Extracts the epoch number from a checkpoint filename.
 fn extract_epoch_from_checkpoint(path: &str) -> Option<usize> {
     // Pattern: checkpoint_epoch{N} or checkpoint_epoch{N}.mpk
-    let filename = std::path::Path::new(path)
-        .file_name()?
-        .to_str()?;
+    let filename = std::path::Path::new(path).file_name()?.to_str()?;
 
     if let Some(rest) = filename.strip_prefix("checkpoint_epoch") {
         let epoch_str = rest.trim_end_matches(".mpk");
@@ -456,9 +449,9 @@ fn evaluate_model<B: burn::prelude::Backend>(
     config: &TrainingConfig,
     device: &B::Device,
 ) -> Result<f32> {
+    use burn::data::dataset::Dataset;
     use burn::nn::loss::MseLoss;
     use ml_model::{SequenceBatcher, SequenceDataset};
-    use burn::data::dataset::Dataset;
 
     let dataset = SequenceDataset::new(&data.samples, config.sequence_length);
     let batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
@@ -510,10 +503,7 @@ mod tests {
 
     #[test]
     fn test_extract_epoch_from_checkpoint() {
-        assert_eq!(
-            extract_epoch_from_checkpoint("checkpoint_epoch5"),
-            Some(5)
-        );
+        assert_eq!(extract_epoch_from_checkpoint("checkpoint_epoch5"), Some(5));
         assert_eq!(
             extract_epoch_from_checkpoint("checkpoint_epoch10.mpk"),
             Some(10)
@@ -522,14 +512,8 @@ mod tests {
             extract_epoch_from_checkpoint("/path/to/checkpoint_epoch25.mpk"),
             Some(25)
         );
-        assert_eq!(
-            extract_epoch_from_checkpoint("checkpoint_best"),
-            None
-        );
-        assert_eq!(
-            extract_epoch_from_checkpoint("checkpoint_final"),
-            None
-        );
+        assert_eq!(extract_epoch_from_checkpoint("checkpoint_best"), None);
+        assert_eq!(extract_epoch_from_checkpoint("checkpoint_final"), None);
     }
 
     #[test]
@@ -542,4 +526,3 @@ mod tests {
         assert!(!config.resume);
     }
 }
-

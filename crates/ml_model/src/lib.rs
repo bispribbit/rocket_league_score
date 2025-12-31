@@ -26,7 +26,9 @@ use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, R
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
-pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints};
+pub use training::{
+    CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints,
+};
 
 pub use dataset::{SequenceBatcher, SequenceDataset, SequenceDatasetItem};
 
@@ -287,8 +289,11 @@ pub fn predict<B: Backend>(
         input_data.extend_from_slice(&frame.features);
     }
 
-    let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device)
-        .reshape([1, sequence_length, FEATURE_COUNT]);
+    let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
+        1,
+        sequence_length,
+        FEATURE_COUNT,
+    ]);
 
     // Forward pass
     let output = model.forward_inference(input);

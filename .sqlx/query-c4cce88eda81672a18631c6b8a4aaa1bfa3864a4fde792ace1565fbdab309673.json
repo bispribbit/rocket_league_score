@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata, download_status as \"download_status: DownloadStatus\", file_path, error_message, created_at, updated_at\n        FROM replays\n        WHERE file_path = $1\n        ",
+  "query": "\n                SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata,\n                       download_status as \"download_status: DownloadStatus\", file_path, error_message,\n                       dataset_split as \"dataset_split: DatasetSplit\", created_at, updated_at\n                FROM replays\n                WHERE download_status = 'not_downloaded'\n                ORDER BY created_at\n                LIMIT $1\n                ",
   "describe": {
     "columns": [
       {
@@ -111,18 +111,33 @@
       },
       {
         "ordinal": 7,
+        "name": "dataset_split: DatasetSplit",
+        "type_info": {
+          "Custom": {
+            "name": "dataset_split",
+            "kind": {
+              "Enum": [
+                "training",
+                "evaluation"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -133,9 +148,10 @@
       false,
       false,
       true,
+      true,
       false,
       false
     ]
   },
-  "hash": "f34adc85e1d64ab6ce5555098ad621f7a0198fe71caca96e7b564201804f52fc"
+  "hash": "c4cce88eda81672a18631c6b8a4aaa1bfa3864a4fde792ace1565fbdab309673"
 }

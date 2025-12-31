@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE replays\n        SET dataset_split = 'evaluation', updated_at = NOW()\n        WHERE dataset_split IS NULL AND download_status = 'downloaded'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "6848c09d0d88c2e6e88630028280d38556cf8fc89691a8aef88648b40f1f0ebc"
+}

@@ -1,5 +1,6 @@
 // Shared vscode settings goes here.
 {
+    "terminal.integrated.scrollback": 100000,
     "editor.formatOnSave": true,
     "files.eol": "\n",
     "rust-analyzer.cargo.features": "all",
