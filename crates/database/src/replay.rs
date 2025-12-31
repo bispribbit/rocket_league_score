@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use replay_structs::{DownloadStatus, GameMode, Rank, Replay};
+use replay_structs::{DatasetSplit, DownloadStatus, GameMode, Rank, Replay};
 use uuid::Uuid;
 
 use crate::get_pool;
@@ -89,7 +89,9 @@ pub async fn find_replay_by_path(file_path: &Path) -> Result<Option<Replay>, sql
     sqlx::query_as!(
         Replay,
         r#"
-        SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+        SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata, 
+               download_status as "download_status: DownloadStatus", file_path, error_message,
+               dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
         FROM replays
         WHERE file_path = $1
         "#,
@@ -114,7 +116,9 @@ pub async fn list_replays_by_rank(
             sqlx::query_as!(
                 Replay,
                 r#"
-                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+                       download_status as "download_status: DownloadStatus", file_path, error_message,
+                       dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
                 FROM replays
                 WHERE rank = $1 AND download_status = $2
                 ORDER BY created_at
@@ -129,7 +133,9 @@ pub async fn list_replays_by_rank(
             sqlx::query_as!(
                 Replay,
                 r#"
-                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+                       download_status as "download_status: DownloadStatus", file_path, error_message,
+                       dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
                 FROM replays
                 WHERE rank = $1
                 ORDER BY created_at
@@ -157,7 +163,9 @@ pub async fn list_pending_downloads(
             sqlx::query_as!(
                 Replay,
                 r#"
-                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+                       download_status as "download_status: DownloadStatus", file_path, error_message,
+                       dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
                 FROM replays
                 WHERE rank = $1 AND download_status = 'not_downloaded'
                 ORDER BY created_at
@@ -173,7 +181,9 @@ pub async fn list_pending_downloads(
             sqlx::query_as!(
                 Replay,
                 r#"
-                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata, download_status as "download_status: DownloadStatus", file_path, error_message, created_at, updated_at
+                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+                       download_status as "download_status: DownloadStatus", file_path, error_message,
+                       dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
                 FROM replays
                 WHERE download_status = 'not_downloaded'
                 ORDER BY created_at
@@ -329,4 +339,173 @@ pub async fn count_replays_by_rank_and_status(
     .await?;
 
     Ok(result.count)
+}
+
+// ============================================================================
+// Dataset Split Functions
+// ============================================================================
+
+/// Assigns dataset splits to unassigned downloaded replays.
+///
+/// Uses random assignment to achieve the target training ratio.
+/// Only assigns replays that have `dataset_split = NULL` and `download_status = 'downloaded'`.
+///
+/// # Arguments
+///
+/// * `train_ratio` - Target ratio for training set (e.g., 0.9 for 90% training).
+///
+/// # Returns
+///
+/// A tuple of (`training_count`, `evaluation_count`) for newly assigned replays.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn assign_dataset_splits(train_ratio: f64) -> Result<DatasetSplitCounts, sqlx::Error> {
+    let pool = get_pool();
+
+    // First, count how many unassigned downloaded replays we have
+    let unassigned = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as "count!"
+        FROM replays
+        WHERE dataset_split IS NULL AND download_status = 'downloaded'
+        "#
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let total_unassigned = unassigned.count;
+    if total_unassigned == 0 {
+        return Ok(DatasetSplitCounts {
+            training: 0,
+            evaluation: 0,
+        });
+    }
+
+    // Calculate how many should go to training
+    let training_count = (total_unassigned as f64 * train_ratio).round() as i64;
+
+    // Assign training set (random selection)
+    let training_result = sqlx::query!(
+        r#"
+        UPDATE replays
+        SET dataset_split = 'training', updated_at = NOW()
+        WHERE id IN (
+            SELECT id FROM replays
+            WHERE dataset_split IS NULL AND download_status = 'downloaded'
+            ORDER BY RANDOM()
+            LIMIT $1
+        )
+        "#,
+        training_count
+    )
+    .execute(pool)
+    .await?;
+
+    // Assign remaining to evaluation
+    let eval_result = sqlx::query!(
+        r#"
+        UPDATE replays
+        SET dataset_split = 'evaluation', updated_at = NOW()
+        WHERE dataset_split IS NULL AND download_status = 'downloaded'
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(DatasetSplitCounts {
+        training: training_result.rows_affected() as i64,
+        evaluation: eval_result.rows_affected() as i64,
+    })
+}
+
+/// Counts of replays in each dataset split.
+#[derive(Debug, Clone, Default)]
+pub struct DatasetSplitCounts {
+    /// Number of replays in training set.
+    pub training: i64,
+    /// Number of replays in evaluation set.
+    pub evaluation: i64,
+}
+
+/// Returns counts of replays by dataset split.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn count_replays_by_split() -> Result<DatasetSplitCounts, sqlx::Error> {
+    let pool = get_pool();
+
+    let training = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as "count!"
+        FROM replays
+        WHERE dataset_split = 'training' AND download_status = 'downloaded'
+        "#
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let evaluation = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as "count!"
+        FROM replays
+        WHERE dataset_split = 'evaluation' AND download_status = 'downloaded'
+        "#
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(DatasetSplitCounts {
+        training: training.count,
+        evaluation: evaluation.count,
+    })
+}
+
+/// Lists replays by dataset split.
+///
+/// Only returns downloaded replays.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn list_replays_by_split(split: DatasetSplit) -> Result<Vec<Replay>, sqlx::Error> {
+    let pool = get_pool();
+    sqlx::query_as!(
+        Replay,
+        r#"
+        SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+               download_status as "download_status: DownloadStatus", file_path, error_message,
+               dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
+        FROM replays
+        WHERE dataset_split = $1 AND download_status = 'downloaded'
+        ORDER BY created_at
+        "#,
+        split as DatasetSplit
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Updates the dataset split for a specific replay.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn update_replay_split(replay_id: Uuid, split: DatasetSplit) -> Result<(), sqlx::Error> {
+    let pool = get_pool();
+    sqlx::query!(
+        r#"
+        UPDATE replays
+        SET dataset_split = $2, updated_at = NOW()
+        WHERE id = $1
+        "#,
+        replay_id,
+        split as DatasetSplit
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }

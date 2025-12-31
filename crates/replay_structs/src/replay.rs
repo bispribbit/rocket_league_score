@@ -1,9 +1,8 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::GameMode;
-use crate::Rank;
 use crate::rank::RankDivision;
+use crate::{GameMode, Rank};
 
 /// Player data for a specific replay.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -24,6 +23,17 @@ pub enum DownloadStatus {
     InProgress,
     Downloaded,
     Failed,
+}
+
+/// Dataset split assignment for machine learning.
+/// Used to ensure training and evaluation sets remain separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(type_name = "dataset_split", rename_all = "snake_case")]
+pub enum DatasetSplit {
+    /// Replay is used for training the model.
+    Training,
+    /// Replay is held out for evaluation/testing.
+    Evaluation,
 }
 
 impl core::fmt::Display for DownloadStatus {
@@ -47,6 +57,8 @@ pub struct Replay {
     pub download_status: DownloadStatus,
     pub file_path: String,
     pub error_message: Option<String>,
+    /// Dataset split assignment (None = unassigned).
+    pub dataset_split: Option<DatasetSplit>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

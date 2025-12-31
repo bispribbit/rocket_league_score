@@ -77,7 +77,7 @@ pub async fn run(
     save_checkpoint(&model, &checkpoint_path, &config)?;
 
     let train_rmse = output.final_train_loss.sqrt();
-    let valid_rmse = output.final_valid_loss.map(|l| l.sqrt());
+    let valid_rmse = output.final_valid_loss.map(f32::sqrt);
     info!(
         final_train_loss = output.final_train_loss,
         train_rmse,

@@ -40,7 +40,7 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
         .training_config
         .as_ref()
         .and_then(|c| c.get("sequence_length"))
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map_or(DEFAULT_SEQUENCE_LENGTH, |v| v as usize);
 
     info!(

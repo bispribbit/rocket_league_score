@@ -26,7 +26,7 @@ use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, R
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
-pub use training::{TrainingOutput, train};
+pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints};
 
 pub use dataset::{SequenceBatcher, SequenceDataset, SequenceDatasetItem};
 
@@ -87,7 +87,7 @@ pub struct SequenceModel<B: Backend> {
     linear1: Linear<B>,
     /// Output layer predicting MMR for each player.
     linear_out: Linear<B>,
-    /// ReLU activation.
+    /// `ReLU` activation.
     activation: Relu,
     /// Hidden size of first LSTM (needed for inference).
     lstm1_hidden: usize,
@@ -181,7 +181,7 @@ pub struct SequenceSample {
     /// Sequence of frame features from the game.
     pub frames: Vec<FrameFeatures>,
     /// Target MMR for each of the 6 players.
-    /// Order: blue team (3 players sorted by actor_id), then orange team (3 players).
+    /// Order: blue team (3 players sorted by `actor_id`), then orange team (3 players).
     pub target_mmr: [f32; TOTAL_PLAYERS],
 }
 
@@ -213,13 +213,13 @@ impl SequenceTrainingData {
 
     /// Returns the number of samples.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.samples.len()
     }
 
     /// Returns true if there are no samples.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
 
@@ -321,7 +321,7 @@ pub fn predict<B: Backend>(
 ///
 /// # Returns
 ///
-/// Vector of (timestamp, mmr_predictions) tuples showing evolution over time.
+/// Vector of (timestamp, `mmr_predictions`) tuples showing evolution over time.
 pub fn predict_evolving<B: Backend>(
     model: &SequenceModel<B>,
     frames: &[FrameFeatures],

@@ -5,7 +5,6 @@ use core::str::FromStr;
 use core::time::Duration;
 
 use anyhow::{Context, Result};
-use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use config::CONFIG;
@@ -14,16 +13,22 @@ use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use replay_structs::{GameMode, Rank, Replay, ReplaySummary};
 use reqwest::Client;
+use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::models::ReplayListResponse;
 
+/// Error returned when we hit API rate limits (429).
+#[derive(Debug, Clone, Error)]
+#[error("Rate limited by ballchasing API (429)")]
+pub struct RateLimitedError;
+
 /// Rate limit: 2 requests per second
 const RATE_LIMIT_PER_SECOND: u32 = 1;
 
-/// Rate limit: 500 requests per hour
-const RATE_LIMIT_PER_HOUR: u32 = 500;
+/// Rate limit: 1000 requests per hour
+const RATE_LIMIT_PER_HOUR: u32 = 1000;
 
 /// Base URL for the ballchasing API
 const API_BASE_URL: &str = "https://ballchasing.com/api";
@@ -114,7 +119,7 @@ impl BallchasingClient {
         let count = count.min(200); // API max is 200
 
         let mut url = format!(
-            "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=replay-date&sort-dir=desc"
+            "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=upload-date&sort-dir=desc"
         );
 
         if let Some(before_date) = before {
@@ -150,7 +155,7 @@ impl BallchasingClient {
         Ok(data)
     }
 
-    /// Downloads a replay file by ID with retry logic for rate limiting.
+    /// Downloads a replay file by ID.
     ///
     /// # Arguments
     ///
@@ -162,65 +167,56 @@ impl BallchasingClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the download fails after retries.
+    /// Returns `RateLimitedError` if rate limited (429), allowing caller to pause.
+    /// Returns other errors if the download fails.
     pub async fn download_replay(&self, replay: &Replay) -> Result<Bytes> {
-        let client = &self.client;
-        let replay_id_for_closure = replay.id;
+        self.wait_for_rate_limit().await;
 
-        (|| async {
-            self.wait_for_rate_limit().await;
+        let replay_id = replay.id;
 
-            info!(
-                replay_id = %replay_id_for_closure,
-                "Downloading replay"
+        info!(
+            replay_id = %replay_id,
+            "Downloading replay"
+        );
+
+        let url = format!("{API_BASE_URL}/replays/{replay_id}/file");
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", &CONFIG.ballchasing_api_key)
+            .send()
+            .await
+            .context("Failed to send download request")?;
+
+        let status = response.status();
+
+        // Return RateLimitedError on 429 so caller can pause all downloads
+        if status == 429 {
+            warn!(
+                replay_id = %replay_id,
+                "Rate limited (429), need to pause downloads"
             );
+            return Err(RateLimitedError.into());
+        }
 
-            let url = format!("{API_BASE_URL}/replays/{replay_id_for_closure}/file");
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Download failed with status {status}: {body}");
+        }
 
-            let response = client
-                .get(&url)
-                .header("Authorization", &CONFIG.ballchasing_api_key)
-                .send()
-                .await
-                .context("Failed to send download request")?;
+        let bytes = response
+            .bytes()
+            .await
+            .context("Failed to read replay file bytes")?;
 
-            let status = response.status();
+        info!(
+            replay_id = %replay_id,
+            bytes = bytes.len(),
+            "Downloaded replay"
+        );
 
-            // Only retry on 429 Too Many Requests
-            if status == 429 {
-                let body = response.text().await.unwrap_or_default();
-                warn!(
-                    replay_id = %replay_id_for_closure,
-                    "Rate limited (429), will retry"
-                );
-                anyhow::bail!("Rate limited (429): {body}");
-            }
-
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("Download failed with status {status}: {body}");
-            }
-
-            let bytes = response
-                .bytes()
-                .await
-                .context("Failed to read replay file bytes")?;
-
-            info!(
-                replay_id = %replay_id_for_closure,
-                bytes = bytes.len(),
-                "Downloaded replay"
-            );
-
-            Ok(bytes)
-        })
-        .retry(
-            &ExponentialBuilder::default()
-                .with_max_times(3)
-                .with_min_delay(Duration::from_secs(1))
-                .with_max_delay(Duration::from_secs(8)),
-        )
-        .await
+        Ok(bytes)
     }
 
     /// Fetches replays for a specific rank, handling pagination.
@@ -259,7 +255,9 @@ impl BallchasingClient {
         );
 
         while all_replays.len() < target_count {
-            let batch_size = (target_count - all_replays.len()).min(200);
+            // Always request at least 50 replays to have a good chance of finding new ones,
+            // even if we only need 1 more. We'll stop adding once we have enough.
+            let batch_size = 200;
 
             let ballchasing_rank =
                 Rank::from_str(rank).with_context(|| format!("Invalid rank: {rank}"))?;
@@ -281,6 +279,11 @@ impl BallchasingClient {
 
             let mut new_count = 0;
             for replay in &response.list {
+                // Stop if we have enough replays
+                if all_replays.len() >= target_count {
+                    break;
+                }
+
                 if let Ok(id) = replay.id.parse::<Uuid>() {
                     // Skip if already in database or already seen in this fetch
                     if seen_ids.contains(&id) {
@@ -294,9 +297,19 @@ impl BallchasingClient {
 
             if new_count == 0 {
                 consecutive_duplicates += 1;
-                if consecutive_duplicates >= 3 {
-                    warn!("Too many consecutive duplicate batches for rank {rank}, stopping fetch");
-                    break;
+                if consecutive_duplicates >= 10 {
+                    warn!(
+                        "Too many consecutive duplicate batches for rank {rank}, going back one day"
+                    );
+                    consecutive_duplicates = 0;
+                    // Subtract one day from before_date to look for older replays
+                    before_date = Some(
+                        before_date
+                            .unwrap_or_else(Utc::now)
+                            .checked_sub_signed(chrono::Duration::weeks(1))
+                            .unwrap_or_else(Utc::now),
+                    );
+                    continue;
                 }
             } else {
                 consecutive_duplicates = 0;
@@ -334,9 +347,9 @@ impl BallchasingClient {
                     // Fallback: use yesterday to ensure we don't get stuck
                     warn!(
                         replay_id = %last.id,
-                        "Failed to parse created date, using current date minus 1 day"
+                        "Failed to parse created date, using current date minus 1 week"
                     );
-                    before_date = Some(Utc::now() - chrono::Duration::days(1));
+                    before_date = Some(Utc::now() - chrono::Duration::weeks(1));
                 }
             }
 

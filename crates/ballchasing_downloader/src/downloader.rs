@@ -2,6 +2,7 @@
 
 use core::fmt::Write as _;
 use core::str::FromStr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::api::client::BallchasingClient;
+use crate::api::client::{BallchasingClient, RateLimitedError};
 use crate::players::extract_players_from_metadata;
 
 /// Target number of replays per rank.
@@ -29,6 +30,10 @@ const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
 
 /// Maximum concurrent downloads.
 const MAX_CONCURRENT_DOWNLOADS: usize = 1;
+
+/// How long to pause when rate limited (429 error).
+/// With 1000 downloads/hour, we wait 10 minutes to let the rate limit reset.
+const RATE_LIMIT_PAUSE_SECONDS: u64 = 600;
 
 /// Runs the complete download process.
 ///
@@ -195,9 +200,21 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
     info!("Starting replay downloads");
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+    let rate_limited = Arc::new(AtomicBool::new(false));
     let mut last_progress_log = std::time::Instant::now();
 
     loop {
+        // Check if we're rate limited and need to wait
+        if rate_limited.load(Ordering::SeqCst) {
+            warn!(
+                "Rate limited, pausing downloads for {} seconds",
+                RATE_LIMIT_PAUSE_SECONDS
+            );
+            sleep(Duration::from_secs(RATE_LIMIT_PAUSE_SECONDS)).await;
+            rate_limited.store(false, Ordering::SeqCst);
+            info!("Resuming downloads after rate limit pause");
+        }
+
         // Get batch of pending downloads
         let pending = database::list_pending_downloads(None, 100).await?;
 
@@ -242,9 +259,27 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
         for replay in pending {
             let permit = Arc::clone(&semaphore).acquire_owned().await?;
             let client = Arc::clone(&client);
+            let rate_limited = Arc::clone(&rate_limited);
 
             let handle = tokio::spawn(async move {
+                // Check if we're rate limited BEFORE making the API call
+                // This prevents spamming the API when a previous task already hit 429
+                if rate_limited.load(Ordering::SeqCst) {
+                    drop(permit);
+                    // Return Ok so we don't mark as failed - it will be retried
+                    return Ok(());
+                }
+
                 let result = download_single(&client, &replay).await;
+
+                // Check if this was a rate limit error - set flag BEFORE dropping permit
+                // to prevent race condition where next task starts before flag is set
+                if let Err(e) = &result
+                    && e.downcast_ref::<RateLimitedError>().is_some()
+                {
+                    rate_limited.store(true, Ordering::SeqCst);
+                }
+
                 drop(permit);
                 result
             });
@@ -256,6 +291,14 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
         for handle in handles {
             if let Err(error) = handle.await? {
                 debug!("Download error: {error}");
+            }
+        }
+
+        // If rate limited, reset in-progress downloads so they can be retried
+        if rate_limited.load(Ordering::SeqCst) {
+            let reset_count = database::reset_in_progress_downloads().await?;
+            if reset_count > 0 {
+                info!("Reset {reset_count} in-progress downloads due to rate limiting");
             }
         }
     }
