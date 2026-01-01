@@ -9,8 +9,14 @@ use object_store::local::LocalFileSystem;
 pub static OBJECT_STORE: LazyLock<Arc<dyn ObjectStore>> = LazyLock::new(|| {
     dotenvy::dotenv().ok();
 
-    let base_path = std::env::var("REPLAY_BASE_PATH")
-        .map_or_else(|_| PathBuf::from("/workspace/ballchasing"), PathBuf::from);
+    #[cfg(target_os = "linux")]
+    let base_path_unwrap = PathBuf::from("/workspace/ballchasing");
+
+    #[cfg(target_os = "windows")]
+    let base_path_unwrap = PathBuf::from(r"C:\GitHub\rocket_league_score\ballchasing");
+
+    let base_path =
+        std::env::var("REPLAY_BASE_PATH").map_or_else(|_| base_path_unwrap, PathBuf::from);
 
     std::fs::create_dir_all(&base_path).expect("Failed to create object store directory");
 

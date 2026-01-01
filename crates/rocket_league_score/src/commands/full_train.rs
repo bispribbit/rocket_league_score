@@ -27,7 +27,7 @@ use ml_model::{
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
-use replay_structs::{DatasetSplit, DownloadStatus, Replay};
+use replay_structs::{DatasetSplit, Replay};
 use tracing::{error, info, warn};
 
 use super::init_device;
@@ -160,7 +160,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         .with_batch_size(config.batch_size);
 
     let checkpoint_dir = format!("models/{}", config.model_name);
-    let checkpoint_prefix = format!("{}/checkpoint", checkpoint_dir);
+    let checkpoint_prefix = format!("{checkpoint_dir}/checkpoint");
 
     let (mut model, start_state) = if config.resume {
         // Try to load from latest checkpoint
@@ -224,7 +224,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     // Step 5: Save final model to database
     info!("Step 5: Saving model to database...");
     let next_version = database::get_next_model_version(&config.model_name).await?;
-    let final_checkpoint_path = format!("{}/final_v{}", checkpoint_dir, next_version);
+    let final_checkpoint_path = format!("{checkpoint_dir}/final_v{next_version}");
 
     save_checkpoint(&model, &final_checkpoint_path, &training_config)?;
 
