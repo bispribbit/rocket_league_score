@@ -60,7 +60,7 @@ impl Default for FullTrainConfig {
             model_name: String::from("lstm_v1"),
             train_ratio: 0.9,
             epochs: 100,
-            batch_size: 32,
+            batch_size: 128,
             learning_rate: 0.001,
             resume: false,
             checkpoint_every_n_epochs: 5,
@@ -358,7 +358,12 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
         }
 
         // Extract game sequence (one sample per replay)
-        let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+        let game_sequence = extract_game_sequence(
+            &parsed.frames,
+            &player_ratings,
+            Some(&parsed.goal_frames),
+            Some(&parsed.goals),
+        );
 
         // Convert to SequenceSample for ml_model
         data.add_sample(SequenceSample {

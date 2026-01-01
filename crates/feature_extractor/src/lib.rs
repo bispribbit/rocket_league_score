@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
+use replay_structs::{GameFrame, GoalEvent, PlayerState, Quaternion, Team, Vector3};
 use tracing::info;
 
 /// Total number of features extracted per frame.
@@ -20,8 +20,9 @@ use tracing::info;
 /// - Player geometry: 9 × 6 = 54
 /// - Team context: 3 × 2 = 6
 /// - Game context: 2
-/// - Total: 147
-pub const FEATURE_COUNT: usize = 147;
+/// - Score/goal context: 5
+/// - Total: 152
+pub const FEATURE_COUNT: usize = 152;
 
 /// Number of players expected in a 3v3 match.
 pub const PLAYERS_PER_TEAM: usize = 3;
@@ -47,6 +48,11 @@ pub mod indices {
 
     // Game context (145-146)
     pub const GAME_CONTEXT_START: usize = 145;
+    pub const GAME_CONTEXT_COUNT: usize = 2;
+
+    // Score/goal context (147-151)
+    pub const SCORE_CONTEXT_START: usize = 147;
+    pub const SCORE_CONTEXT_COUNT: usize = 5;
 }
 
 /// Field dimensions for normalization (Rocket League standard field).
@@ -106,16 +112,28 @@ pub struct TrainingSample {
     pub target_mmr: Vec<f32>,
 }
 
+/// Score context for a frame (goals and score information).
+#[derive(Debug, Clone, Default)]
+pub struct ScoreContext {
+    /// Blue team score.
+    pub blue_score: i32,
+    /// Orange team score.
+    pub orange_score: i32,
+    /// Time since last goal (in seconds), or None if no goals yet.
+    pub time_since_last_goal: Option<f32>,
+}
+
 /// Extracts ML features from a single game frame.
 ///
 /// # Arguments
 ///
 /// * `frame` - The game frame to extract features from.
+/// * `score_context` - Optional score/goal context for this frame.
 ///
 /// # Returns
 ///
 /// A `FrameFeatures` struct containing the normalized feature vector.
-pub fn extract_frame_features(frame: &GameFrame) -> FrameFeatures {
+pub fn extract_frame_features(frame: &GameFrame, score_context: Option<&ScoreContext>) -> FrameFeatures {
     let mut features = FrameFeatures {
         features: [0.0; FEATURE_COUNT],
         time: frame.time,
@@ -124,17 +142,17 @@ pub fn extract_frame_features(frame: &GameFrame) -> FrameFeatures {
     // Sort players into teams
     let (blue_players, orange_players) = sort_players_by_team(&frame.players);
 
-    // 1. Extract ball features (indices 0-9)
+    // 1. Extract ball features (indices 0-6)
     extract_ball_features(
         &mut features.features,
         &frame.ball.position,
         &frame.ball.velocity,
     );
 
-    // 2. Extract player state features (indices 10-87)
+    // 2. Extract player state features (indices 7-84)
     extract_player_state_features(&mut features.features, &blue_players, &orange_players);
 
-    // 3. Extract player geometry features (indices 88-111)
+    // 3. Extract player geometry features (indices 85-138)
     extract_player_geometry_features(
         &mut features.features,
         &blue_players,
@@ -142,11 +160,14 @@ pub fn extract_frame_features(frame: &GameFrame) -> FrameFeatures {
         &frame.ball.position,
     );
 
-    // 4. Extract team context features (indices 112-117)
+    // 4. Extract team context features (indices 139-144)
     extract_team_context_features(&mut features.features, &blue_players, &orange_players);
 
-    // 5. Extract game context features (ball distance to goals)
+    // 5. Extract game context features (ball distance to goals) (indices 145-146)
     extract_game_context_features(&mut features.features, &frame.ball.position);
+
+    // 6. Extract score/goal context features (indices 147-151)
+    extract_score_context_features(&mut features.features, score_context);
 
     features
 }
@@ -548,6 +569,58 @@ fn extract_game_context_features(features: &mut [f32; FEATURE_COUNT], ball_pos: 
     features[idx + 1] = (distance(ball_pos, &orange_goal) / field::DIAGONAL).min(1.0);
 }
 
+/// Extracts score/goal context features (5 features).
+///
+/// Features:
+/// - Score differential (blue - orange), normalized to [-1, 1]
+/// - Blue team goals count, normalized to [0, 1]
+/// - Orange team goals count, normalized to [0, 1]
+/// - Time since last goal (normalized), or 1.0 if no goals
+/// - Goal scored recently flag (1.0 if goal in last 5 seconds, else 0.0)
+fn extract_score_context_features(
+    features: &mut [f32; FEATURE_COUNT],
+    score_context: Option<&ScoreContext>,
+) {
+    let idx = indices::SCORE_CONTEXT_START;
+
+    if let Some(ctx) = score_context {
+        // 0: Score differential (blue - orange), normalized to [-1, 1]
+        // Assuming max score difference of 10 for normalization
+        let max_score_diff = 10.0;
+        let score_diff = (ctx.blue_score - ctx.orange_score) as f32;
+        features[idx] = (score_diff / max_score_diff).clamp(-1.0, 1.0);
+
+        // 1: Blue team goals count, normalized to [0, 1] (assuming max 10 goals)
+        let max_goals = 10.0;
+        features[idx + 1] = ((ctx.blue_score as f32) / max_goals).min(1.0);
+
+        // 2: Orange team goals count, normalized to [0, 1]
+        features[idx + 2] = ((ctx.orange_score as f32) / max_goals).min(1.0);
+
+        // 3: Time since last goal (normalized), or 1.0 if no goals
+        // Normalize by max game time (300 seconds = 5 minutes)
+        let max_game_time = 300.0;
+        if let Some(time_since) = ctx.time_since_last_goal {
+            features[idx + 3] = (time_since / max_game_time).min(1.0);
+        } else {
+            features[idx + 3] = 1.0; // No goals yet
+        }
+
+        // 4: Goal scored recently flag (1.0 if goal in last 5 seconds, else 0.0)
+        let recent_goal_threshold = 5.0;
+        if let Some(time_since) = ctx.time_since_last_goal {
+            features[idx + 4] = if time_since <= recent_goal_threshold { 1.0 } else { 0.0 };
+        } else {
+            features[idx + 4] = 0.0; // No goals yet
+        }
+    } else {
+        // No score context available - zero out all score features
+        for i in 0..indices::SCORE_CONTEXT_COUNT {
+            features[idx + i] = 0.0;
+        }
+    }
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -649,6 +722,8 @@ pub struct GameSequenceSample {
 ///
 /// * `frames` - All frames from the replay.
 /// * `player_ratings` - Player ratings with team assignments.
+/// * `goal_frames` - Frame indices where goals were scored (optional).
+/// * `goals` - Goal events with team information (optional).
 ///
 /// # Returns
 ///
@@ -656,12 +731,61 @@ pub struct GameSequenceSample {
 pub fn extract_game_sequence(
     frames: &[GameFrame],
     player_ratings: &[PlayerRating],
+    _goal_frames: Option<&[usize]>, // Kept for API consistency, but we use goals instead
+    goals: Option<&[GoalEvent]>,
 ) -> GameSequenceSample {
     // Build target MMR array
     let target_mmr = build_target_mmr_array(player_ratings);
 
-    // Extract features from all frames
-    let frame_features: Vec<FrameFeatures> = frames.iter().map(extract_frame_features).collect();
+    // Build a map of frame index -> goal event for quick lookup
+    let goal_map: std::collections::HashMap<usize, &GoalEvent> = goals
+        .map(|g| {
+            g.iter()
+                .map(|goal| (goal.frame, goal))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    // Track score state as we iterate through frames
+    let mut blue_score = 0;
+    let mut orange_score = 0;
+    let mut last_goal_frame: Option<usize> = None;
+
+    // Extract features from all frames with score tracking
+    let frame_features: Vec<FrameFeatures> = frames
+        .iter()
+        .enumerate()
+        .map(|(frame_idx, frame)| {
+            // Check if a goal was scored at this frame
+            if let Some(goal) = goal_map.get(&frame_idx) {
+                match goal.player_team {
+                    Team::Blue => blue_score += 1,
+                    Team::Orange => orange_score += 1,
+                }
+                last_goal_frame = Some(frame_idx);
+            }
+
+            // Calculate time since last goal
+            let time_since_last_goal = if let Some(last_frame) = last_goal_frame {
+                if frame_idx >= last_frame {
+                    Some(frame.time - frames[last_frame].time)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Create score context
+            let score_context = ScoreContext {
+                blue_score,
+                orange_score,
+                time_since_last_goal,
+            };
+
+            extract_frame_features(frame, Some(&score_context))
+        })
+        .collect();
 
     GameSequenceSample {
         frames: frame_features,
@@ -779,7 +903,7 @@ pub fn extract_segment_samples(
             ));
 
             TrainingSample {
-                features: extract_frame_features(frame),
+                features: extract_frame_features(frame, None), // No score context for deprecated function
                 target_mmr,
             }
         })
@@ -801,7 +925,8 @@ mod tests {
             + (indices::PLAYER_STATE_FEATURES * TOTAL_PLAYERS)
             + (indices::PLAYER_GEOM_FEATURES * TOTAL_PLAYERS)
             + (indices::TEAM_CONTEXT_FEATURES * 2)
-            + 2; // game context (ball_dist_to_blue, ball_dist_to_orange)
+            + indices::GAME_CONTEXT_COUNT
+            + indices::SCORE_CONTEXT_COUNT;
 
         assert_eq!(expected, FEATURE_COUNT);
     }
@@ -809,7 +934,7 @@ mod tests {
     #[test]
     fn test_extract_empty_frame() {
         let frame = GameFrame::default();
-        let features = extract_frame_features(&frame);
+        let features = extract_frame_features(&frame, None);
         assert_eq!(features.features.len(), FEATURE_COUNT);
     }
 
@@ -912,7 +1037,7 @@ mod tests {
             ],
         };
 
-        let features = extract_frame_features(&frame);
+        let features = extract_frame_features(&frame, None);
 
         // Check ball features
         assert!((features.features[0] - 0.0).abs() < 0.001); // ball_pos_x

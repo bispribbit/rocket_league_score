@@ -227,7 +227,9 @@ where
             let predictions = model.forward(batch.inputs);
             let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
 
-            // Get loss value for logging
+            // Extract loss value for epoch average
+            // Note: This GPU->CPU sync is expensive, but necessary for accurate epoch metrics
+            // With batch_size=128, we now have ~4x fewer batches, reducing sync overhead significantly
             let loss_value: f32 = loss
                 .clone()
                 .into_data()
@@ -239,6 +241,17 @@ where
 
             epoch_loss += loss_value as f64;
             batch_count += 1;
+
+            // Log progress every 20 batches to show training is progressing
+            // (fewer batches per epoch now with larger batch size)
+            if batch_count % 20 == 0 {
+                let avg_loss_so_far = epoch_loss / batch_count as f64;
+                let total_batches = (num_samples + config.batch_size - 1) / config.batch_size;
+                println!(
+                    "  Batch {batch_count}/{total_batches}, avg_loss = {:.6}",
+                    avg_loss_so_far
+                );
+            }
 
             // Backward pass
             let grads = loss.backward();
@@ -364,8 +377,8 @@ fn compute_validation_loss<B: Backend>(
     let mut total_loss = 0.0;
     let mut batch_count = 0;
 
-    // Process in batches of 32
-    const BATCH_SIZE: usize = 32;
+    // Process in batches (use same size as training for consistency)
+    const BATCH_SIZE: usize = 128;
     for batch_start in (0..num_samples).step_by(BATCH_SIZE) {
         let batch_end = (batch_start + BATCH_SIZE).min(num_samples);
 

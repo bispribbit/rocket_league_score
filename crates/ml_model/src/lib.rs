@@ -25,12 +25,11 @@ use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+pub use dataset::{SequenceBatcher, SequenceDataset, SequenceDatasetItem};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 pub use training::{
     CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints,
 };
-
-pub use dataset::{SequenceBatcher, SequenceDataset, SequenceDatasetItem};
 
 /// Configuration for the sequence model.
 #[derive(Config, Debug)]
@@ -59,7 +58,7 @@ pub struct TrainingConfig {
     #[config(default = 100)]
     pub epochs: usize,
     /// Batch size for training.
-    #[config(default = 32)]
+    #[config(default = 128)]
     pub batch_size: usize,
     /// Model architecture configuration.
     pub model: ModelConfig,

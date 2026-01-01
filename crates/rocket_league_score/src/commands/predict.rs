@@ -64,8 +64,12 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
 
     info!(frames = parsed.frames.len(), "Analyzing gameplay sequence");
 
-    // Extract features from all frames
-    let frame_features: Vec<_> = parsed.frames.iter().map(extract_frame_features).collect();
+    // Extract features from all frames (no score context available in predict mode)
+    let frame_features: Vec<_> = parsed
+        .frames
+        .iter()
+        .map(|frame| extract_frame_features(frame, None))
+        .collect();
 
     // Get final prediction for the entire game
     let final_predictions = predict(&model, &frame_features, &device, sequence_length);

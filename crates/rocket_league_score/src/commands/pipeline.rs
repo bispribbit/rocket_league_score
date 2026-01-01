@@ -110,7 +110,12 @@ pub async fn run(num_replays: usize) -> Result<()> {
         info!(replay = %replay.id, "Player ratings {player_ratings:?}");
 
         // Extract game sequence (one sample per replay)
-        let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+        let game_sequence = extract_game_sequence(
+            &parsed.frames,
+            &player_ratings,
+            Some(&parsed.goal_frames),
+            Some(&parsed.goals),
+        );
         let frame_count = game_sequence.frames.len();
 
         training_data.add_sample(SequenceSample {
