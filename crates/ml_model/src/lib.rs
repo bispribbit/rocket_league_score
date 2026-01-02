@@ -16,7 +16,6 @@
 //! The model outputs one MMR prediction per player per game/segment.
 
 mod dataset;
-mod lazy_dataset;
 mod training;
 
 use std::path::Path;
@@ -28,10 +27,8 @@ use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 pub use dataset::{SegmentDataset, SequenceBatcher, SequenceDatasetItem};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
-pub use lazy_dataset::{GameLoader, GameMetadata, LazySegmentDataset};
 pub use training::{
     CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints,
-    train_with_dataset,
 };
 
 /// Configuration for the sequence model.

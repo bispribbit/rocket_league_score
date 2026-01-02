@@ -8,7 +8,7 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 
-use crate::dataset::{SegmentDataset, SequenceBatcher, SequenceDatasetItem};
+use crate::dataset::{SegmentDataset, SequenceBatcher};
 use crate::{SequenceModel, SequenceTrainingData, TrainingConfig, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
@@ -246,7 +246,6 @@ where
 
             // Extract loss value for epoch average
             // Note: This GPU->CPU sync is expensive, but necessary for accurate epoch metrics
-            // With batch_size=128, we now have ~4x fewer batches, reducing sync overhead significantly
             let loss_value: f32 = loss
                 .clone()
                 .into_data()
@@ -390,303 +389,6 @@ where
     })
 }
 
-/// Trains a model using any dataset that provides `SequenceDatasetItem`.
-///
-/// This is the generic version that works with lazy-loading datasets.
-/// Use this when you want to control dataset creation (e.g., for lazy loading).
-///
-/// # Arguments
-///
-/// * `model` - The model to train (will be modified in place).
-/// * `train_dataset` - Training dataset (must implement `Dataset<SequenceDatasetItem>`).
-/// * `valid_dataset` - Optional validation dataset.
-/// * `config` - Training configuration.
-/// * `checkpoint_config` - Optional checkpoint configuration for saving during training.
-/// * `start_state` - Optional starting state for resumption.
-///
-/// # Errors
-///
-/// Returns an error if training fails.
-#[expect(clippy::too_many_arguments)]
-pub fn train_with_dataset<B, D>(
-    model: &mut SequenceModel<B>,
-    train_dataset: D,
-    valid_dataset: Option<D>,
-    config: &TrainingConfig,
-    checkpoint_config: Option<CheckpointConfig>,
-    start_state: Option<TrainingState>,
-    train_game_count: usize,
-    valid_game_count: usize,
-) -> anyhow::Result<TrainingOutput>
-where
-    B: AutodiffBackend,
-    B::FloatElem: From<f32>,
-    D: Dataset<SequenceDatasetItem>,
-{
-    if train_dataset.len() == 0 {
-        return Err(anyhow::anyhow!("No training data provided"));
-    }
-
-    let device = model.linear1.weight.device();
-    let batcher = SequenceBatcher::<B>::new(device, config.sequence_length);
-
-    // Create optimizer with weight decay for regularization
-    let mut optimizer = AdamConfig::new().init();
-
-    let loss_fn = MseLoss::new();
-    let mut checkpoint_paths = Vec::new();
-
-    // Initialize training state (from provided state or fresh)
-    let mut state = start_state.unwrap_or_else(|| TrainingState::new(0));
-    let start_epoch = state.current_epoch;
-
-    const EARLY_STOPPING_PATIENCE: usize = 10;
-
-    let valid_segments = valid_dataset.as_ref().map_or(0, Dataset::len);
-    println!(
-        "Starting training with {} games ({} train, {} valid)",
-        train_game_count + valid_game_count,
-        train_game_count,
-        valid_game_count
-    );
-    println!(
-        "Total segments: {} train, {} valid (segment_length={})",
-        train_dataset.len(),
-        valid_segments,
-        config.sequence_length
-    );
-    println!(
-        "Batch size: {}, Learning rate: {}",
-        config.batch_size, config.learning_rate
-    );
-    if start_epoch > 0 {
-        println!("Resuming from epoch {}", start_epoch + 1);
-    }
-    if let Some(ckpt_cfg) = &checkpoint_config {
-        println!(
-            "Checkpoints will be saved every {} epochs to {}",
-            ckpt_cfg.save_every_n_epochs, ckpt_cfg.path_prefix
-        );
-    }
-
-    let num_samples = train_dataset.len();
-
-    for epoch in start_epoch..config.epochs {
-        let epoch_start = Instant::now();
-        state.current_epoch = epoch;
-
-        // Shuffle indices for this epoch
-        let mut indices: Vec<usize> = (0..num_samples).collect();
-        shuffle_indices(&mut indices, epoch as u64);
-
-        let mut epoch_loss = 0.0;
-        let mut batch_count = 0;
-        let mut batch_processing_time = std::time::Duration::ZERO;
-        let mut data_loading_time = std::time::Duration::ZERO;
-
-        // Process batches
-        for batch_start in (0..num_samples).step_by(config.batch_size) {
-            let batch_start_time = Instant::now();
-            let batch_end = (batch_start + config.batch_size).min(num_samples);
-            let Some(batch_indices) = indices.get(batch_start..batch_end) else {
-                continue;
-            };
-
-            // Collect items for this batch
-            let data_load_start = Instant::now();
-            let items: Vec<_> = batch_indices
-                .iter()
-                .filter_map(|&idx| train_dataset.get(idx))
-                .collect();
-            data_loading_time += data_load_start.elapsed();
-
-            if items.is_empty() {
-                continue;
-            }
-
-            // Create batch
-            let batch = batcher.batch(items);
-
-            // Forward pass
-            let predictions = model.forward(batch.inputs.clone());
-            let loss = loss_fn.forward(
-                predictions,
-                batch.targets.clone(),
-                burn::nn::loss::Reduction::Mean,
-            );
-
-            // Backward pass
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, model);
-
-            // Extract loss value for epoch average
-            let loss_value: f32 = loss
-                .clone()
-                .into_data()
-                .to_vec()
-                .unwrap_or_else(|_| vec![0.0])
-                .first()
-                .copied()
-                .unwrap_or(0.0);
-
-            epoch_loss += loss_value as f64;
-            batch_count += 1;
-
-            // Log progress every 20 batches
-            if batch_count % 20 == 0 {
-                let avg_loss_so_far = epoch_loss / batch_count as f64;
-                let total_batches = num_samples.div_ceil(config.batch_size);
-                println!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
-            }
-
-            // Update model
-            *model = optimizer.step(config.learning_rate, model.clone(), grads);
-            batch_processing_time += batch_start_time.elapsed();
-        }
-
-        let epoch_duration = epoch_start.elapsed();
-
-        // Calculate epoch metrics
-        let avg_train_loss = if batch_count > 0 {
-            (epoch_loss / batch_count as f64) as f32
-        } else {
-            0.0
-        };
-
-        state.current_train_loss = avg_train_loss;
-
-        // Compute validation loss if we have a validation dataset
-        let valid_start = Instant::now();
-        let valid_loss = valid_dataset
-            .as_ref()
-            .map(|valid_ds| compute_validation_loss_generic(model, valid_ds, &batcher, &loss_fn));
-        let validation_time = valid_start.elapsed();
-        state.current_valid_loss = valid_loss;
-
-        // Convert to RMSE for display
-        let train_rmse = avg_train_loss.sqrt();
-        let valid_rmse_str = valid_loss
-            .map(|v| format!(" (RMSE: {:.1} MMR)", v.sqrt()))
-            .unwrap_or_default();
-
-        println!(
-            "Epoch {}: train_loss = {:.6} (RMSE: {:.1} MMR), valid_loss = {}{}",
-            epoch + 1,
-            avg_train_loss,
-            train_rmse,
-            valid_loss.map_or_else(|| "N/A".to_string(), |v| format!("{v:.6}")),
-            valid_rmse_str
-        );
-
-        // Log timing information
-        println!(
-            "  Timing: epoch={:.2}s, data_loading={:.2}s, batch_processing={:.2}s, validation={:.2}s",
-            epoch_duration.as_secs_f64(),
-            data_loading_time.as_secs_f64(),
-            batch_processing_time.as_secs_f64(),
-            validation_time.as_secs_f64()
-        );
-
-        // Check for improvement
-        let improved = valid_loss.is_none_or(|vl| vl < state.best_valid_loss);
-        if improved {
-            if let Some(vl) = valid_loss {
-                state.best_valid_loss = vl;
-            }
-            state.epochs_without_improvement = 0;
-
-            // Save "best" checkpoint
-            if let Some(ckpt_cfg) = &checkpoint_config
-                && ckpt_cfg.save_on_improvement
-            {
-                let path = format!("{}_best", ckpt_cfg.path_prefix);
-                if let Ok(ckpt) = save_checkpoint(model, &path, config) {
-                    println!("Saved checkpoint: {}", ckpt.path);
-                    checkpoint_paths.push(ckpt.path);
-                }
-            }
-        } else {
-            state.epochs_without_improvement += 1;
-
-            // Early stopping
-            if state.epochs_without_improvement >= EARLY_STOPPING_PATIENCE {
-                println!(
-                    "Early stopping after {EARLY_STOPPING_PATIENCE} epochs without improvement",
-                );
-                break;
-            }
-        }
-
-        // Save periodic checkpoint
-        if let Some(ckpt_cfg) = &checkpoint_config
-            && (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0
-        {
-            let path = format!("{}_epoch_{}", ckpt_cfg.path_prefix, epoch + 1);
-            if let Ok(ckpt) = save_checkpoint(model, &path, config) {
-                println!("Saved checkpoint: {}", ckpt.path);
-                checkpoint_paths.push(ckpt.path);
-            }
-        }
-    }
-
-    Ok(TrainingOutput {
-        final_train_loss: state.current_train_loss,
-        final_valid_loss: state.current_valid_loss,
-        epochs_completed: state.current_epoch + 1,
-        checkpoint_paths,
-    })
-}
-
-/// Computes the validation loss on any dataset.
-fn compute_validation_loss_generic<B: Backend, D: Dataset<SequenceDatasetItem>>(
-    model: &SequenceModel<B>,
-    dataset: &D,
-    batcher: &SequenceBatcher<B>,
-    loss_fn: &MseLoss,
-) -> f32 {
-    let num_segments = dataset.len();
-    if num_segments == 0 {
-        return 0.0;
-    }
-
-    let mut total_loss = 0.0;
-    let mut batch_count = 0;
-
-    const BATCH_SIZE: usize = 2048;
-    for batch_start in (0..num_segments).step_by(BATCH_SIZE) {
-        let batch_end = (batch_start + BATCH_SIZE).min(num_segments);
-
-        let items: Vec<_> = (batch_start..batch_end)
-            .filter_map(|i| dataset.get(i))
-            .collect();
-
-        if items.is_empty() {
-            continue;
-        }
-
-        let batch = batcher.batch(items);
-        let predictions = model.forward(batch.inputs);
-        let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
-
-        let loss_value: f32 = loss
-            .into_data()
-            .to_vec()
-            .unwrap_or_else(|_| vec![0.0])
-            .first()
-            .copied()
-            .unwrap_or(0.0);
-
-        total_loss += loss_value as f64;
-        batch_count += 1;
-    }
-
-    if batch_count > 0 {
-        (total_loss / batch_count as f64) as f32
-    } else {
-        0.0
-    }
-}
-
 /// Computes the validation loss on a segment dataset.
 fn compute_validation_loss<B: Backend>(
     model: &SequenceModel<B>,
@@ -702,8 +404,8 @@ fn compute_validation_loss<B: Backend>(
     let mut total_loss = 0.0;
     let mut batch_count = 0;
 
-    // Process in batches (use same size as training for consistency)
-    const BATCH_SIZE: usize = 2048;
+    // Use smaller batch size for validation to reduce memory pressure
+    const BATCH_SIZE: usize = 512;
     for batch_start in (0..num_segments).step_by(BATCH_SIZE) {
         let batch_end = (batch_start + BATCH_SIZE).min(num_segments);
 
@@ -719,13 +421,17 @@ fn compute_validation_loss<B: Backend>(
         let predictions = model.forward(batch.inputs);
         let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
 
-        let loss_value: f32 = loss
-            .into_data()
-            .to_vec()
-            .unwrap_or_else(|_| vec![0.0])
-            .first()
-            .copied()
-            .unwrap_or(0.0);
+        // Extract loss value and explicitly drop loss tensor to free GPU memory immediately
+        let loss_value: f32 = {
+            let loss_data = loss.clone().into_data();
+            drop(loss);
+            loss_data
+                .to_vec()
+                .unwrap_or_else(|_| vec![0.0])
+                .first()
+                .copied()
+                .unwrap_or(0.0)
+        };
 
         total_loss += loss_value as f64;
         batch_count += 1;

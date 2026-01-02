@@ -16,23 +16,18 @@
 //! full_train::run("lstm_v1", 0.9, 100, 32, 0.001, true).await?;
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
-use burn::data::dataset::Dataset;
 use config::OBJECT_STORE;
-use feature_extractor::{FrameFeatures, PlayerRating, TOTAL_PLAYERS, extract_game_sequence};
+use feature_extractor::{PlayerRating, extract_game_sequence};
 use ml_model::{
-    CheckpointConfig, GameLoader, GameMetadata, LazySegmentDataset, ModelConfig, SequenceSample,
-    SequenceTrainingData, TrainingConfig, TrainingState, create_model, load_checkpoint,
-    save_checkpoint, train_with_dataset,
+    CheckpointConfig, ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig,
+    TrainingState, create_model, load_checkpoint, save_checkpoint, train_with_checkpoints,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
-use parking_lot::RwLock;
 use replay_parser::parse_replay_from_bytes;
 use replay_structs::{DatasetSplit, Replay};
 use tracing::{error, info, warn};
@@ -177,9 +172,9 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let step1_duration = step1_start.elapsed();
     info!(duration_ms = step1_duration.as_millis(), "Step 1 complete");
 
-    // Step 2: Collect metadata (lightweight - no frame data yet)
+    // Step 2: Load all training data into memory
     let step2_start = Instant::now();
-    info!("Step 2: Collecting game metadata...");
+    info!("Step 2: Loading all training data into memory...");
 
     // Load replays based on configuration
     let training_replays = if let Some(max_replays) = config.max_replays {
@@ -193,62 +188,32 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         anyhow::bail!("No valid replays found. Please ingest and download replays first.");
     }
 
-    info!(replay_count = training_replays.len(), "Loaded replays");
+    info!(
+        replay_count = training_replays.len(),
+        "Loading replays into memory..."
+    );
 
-    let (train_metadata, train_player_map) =
-        collect_game_metadata(&training_replays, config.train_ratio).await?;
+    // Load all data into memory (this is the only time we read from disk)
+    let training_data = load_training_data_from_replays(&training_replays).await?;
     let step2_duration = step2_start.elapsed();
 
-    if train_metadata.is_empty() {
+    if training_data.is_empty() {
         anyhow::bail!("No valid training games found.");
     }
 
-    // Split metadata into train/valid (last 10% for validation)
-    let valid_count = (train_metadata.len() as f64 * 0.1) as usize;
-    let train_count = train_metadata.len() - valid_count;
-
-    let (train_games, valid_games) = train_metadata.split_at(train_count);
-    let train_games = train_games.to_vec();
-    let valid_games = valid_games.to_vec();
-
     info!(
-        train_games = train_games.len(),
-        valid_games = valid_games.len(),
+        games_loaded = training_data.len(),
         duration_ms = step2_duration.as_millis(),
-        "Split metadata into train/valid"
+        duration_sec = step2_duration.as_secs_f64(),
+        "All training data loaded into memory"
     );
 
-    // Step 3: Create lazy datasets with game loader
+    // Step 3: Create or load model
     let step3_start = Instant::now();
-    info!("Step 3: Creating lazy datasets...");
-    let loader = Arc::new(ReplayLoader::new(train_player_map));
-
-    let segment_length = 90; // 3 seconds at 30fps
-    let train_dataset =
-        LazySegmentDataset::new(train_games.clone(), loader.clone(), segment_length);
-    let valid_dataset = if valid_games.is_empty() {
-        None
-    } else {
-        Some(LazySegmentDataset::new(
-            valid_games.clone(),
-            loader,
-            segment_length,
-        ))
-    };
-
-    let step3_duration = step3_start.elapsed();
-    info!(
-        train_segments = train_dataset.len(),
-        valid_segments = valid_dataset.as_ref().map_or(0, LazySegmentDataset::len),
-        duration_ms = step3_duration.as_millis(),
-        "Created lazy datasets"
-    );
-
-    // Step 4: Create or load model
-    let step4_start = Instant::now();
-    info!("Step 4: Initializing model...");
+    info!("Step 3: Initializing model...");
     let device = init_device();
     let model_config = ModelConfig::new();
+    let segment_length = 90; // 3 seconds at 30fps
     let training_config = TrainingConfig::new(model_config.clone())
         .with_learning_rate(config.learning_rate)
         .with_epochs(config.epochs)
@@ -279,40 +244,38 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         info!("Creating new model");
         (create_model::<TrainBackend>(&device, &model_config), None)
     };
-    let step4_duration = step4_start.elapsed();
+    let step3_duration = step3_start.elapsed();
 
     info!(
         lstm_hidden_1 = model_config.lstm_hidden_1,
         lstm_hidden_2 = model_config.lstm_hidden_2,
         feedforward_hidden = model_config.feedforward_hidden,
         dropout = model_config.dropout,
-        duration_ms = step4_duration.as_millis(),
+        duration_ms = step3_duration.as_millis(),
         "Model architecture"
     );
 
-    // Step 5: Train with lazy datasets
-    let step5_start = Instant::now();
-    info!("Step 5: Starting training with lazy loading...");
+    // Step 4: Train model (data is already in memory, no lazy loading)
+    let step4_start = Instant::now();
+    info!("Step 4: Starting training...");
+
     let checkpoint_config = CheckpointConfig {
         path_prefix: checkpoint_prefix.clone(),
         save_every_n_epochs: config.checkpoint_every_n_epochs,
         save_on_improvement: true,
     };
 
-    let output = train_with_dataset(
+    let output = train_with_checkpoints(
         &mut model,
-        train_dataset,
-        valid_dataset,
+        &training_data,
         &training_config,
         Some(checkpoint_config),
         start_state,
-        train_games.len(),
-        valid_games.len(),
     )?;
 
     let train_rmse = output.final_train_loss.sqrt();
     let valid_rmse = output.final_valid_loss.map(f32::sqrt);
-    let step5_duration = step5_start.elapsed();
+    let step4_duration = step4_start.elapsed();
 
     info!(
         final_train_loss = output.final_train_loss,
@@ -321,19 +284,19 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         valid_rmse,
         epochs_completed = output.epochs_completed,
         checkpoints_saved = output.checkpoint_paths.len(),
-        duration_ms = step5_duration.as_millis(),
-        duration_sec = step5_duration.as_secs_f64(),
+        duration_ms = step4_duration.as_millis(),
+        duration_sec = step4_duration.as_secs_f64(),
         avg_epoch_ms = if output.epochs_completed > 0 {
-            step5_duration.as_millis() / output.epochs_completed as u128
+            step4_duration.as_millis() / output.epochs_completed as u128
         } else {
             0
         },
         "Training completed"
     );
 
-    // Step 6: Save final model to database
-    let step6_start = Instant::now();
-    info!("Step 6: Saving model to database...");
+    // Step 5: Save final model to database
+    let step5_start = Instant::now();
+    info!("Step 5: Saving model to database...");
     let next_version = database::get_next_model_version(&config.model_name).await?;
     let final_checkpoint_path = format!("{checkpoint_dir}/final_v{next_version}");
 
@@ -350,8 +313,8 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "feedforward_hidden": model_config.feedforward_hidden,
         "dropout": model_config.dropout,
         "train_ratio": config.train_ratio,
-        "training_games": train_games.len(),
-        "validation_games": valid_games.len(),
+        "training_games": training_data.len(),
+        "validation_games": 0, // Validation is handled internally by train_with_checkpoints
         "evaluation_games": current_counts.evaluation,
     });
 
@@ -373,21 +336,21 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     )
     .await?;
 
-    let step6_duration = step6_start.elapsed();
+    let step5_duration = step5_start.elapsed();
     info!(
         model_name = %config.model_name,
         version = next_version,
         checkpoint_path = %final_checkpoint_path,
-        duration_ms = step6_duration.as_millis(),
+        duration_ms = step5_duration.as_millis(),
         "Model saved to database"
     );
 
-    // Step 7: Run evaluation on held-out test set (skip when using max_replays)
-    let step7_start = Instant::now();
+    // Step 6: Run evaluation on held-out test set (skip when using max_replays)
+    let step6_start = Instant::now();
     if config.max_replays.is_some() {
-        info!("Step 7: Skipping evaluation (using sampled replays mode)...");
+        info!("Step 6: Skipping evaluation (using sampled replays mode)...");
     } else {
-        info!("Step 7: Running evaluation on test set...");
+        info!("Step 6: Running evaluation on test set...");
         let eval_replays = database::list_replays_by_split(DatasetSplit::Evaluation).await?;
 
         if !eval_replays.is_empty() {
@@ -395,12 +358,12 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
             if !eval_data.is_empty() {
                 let eval_loss = evaluate_model(&model, &eval_data, &training_config, &device);
                 let eval_rmse = eval_loss.sqrt();
-                let step7_duration = step7_start.elapsed();
+                let step6_duration = step6_start.elapsed();
                 info!(
                     eval_samples = eval_data.len(),
                     eval_loss,
                     eval_rmse,
-                    duration_ms = step7_duration.as_millis(),
+                    duration_ms = step6_duration.as_millis(),
                     "Evaluation completed"
                 );
             } else {
@@ -410,7 +373,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
             warn!("No evaluation replays available");
         }
     }
-    let step7_duration = step7_start.elapsed();
+    let step6_duration = step6_start.elapsed();
 
     let total_duration = pipeline_start.elapsed();
     info!(
@@ -420,12 +383,11 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     );
     info!(
         step1_splits_ms = step1_duration.as_millis(),
-        step2_metadata_ms = step2_duration.as_millis(),
-        step3_datasets_ms = step3_duration.as_millis(),
-        step4_model_init_ms = step4_duration.as_millis(),
-        step5_training_ms = step5_duration.as_millis(),
-        step6_save_model_ms = step6_duration.as_millis(),
-        step7_evaluation_ms = step7_duration.as_millis(),
+        step2_data_loading_ms = step2_duration.as_millis(),
+        step3_model_init_ms = step3_duration.as_millis(),
+        step4_training_ms = step4_duration.as_millis(),
+        step5_save_model_ms = step5_duration.as_millis(),
+        step6_evaluation_ms = step6_duration.as_millis(),
         "=== Detailed timing breakdown ==="
     );
 
@@ -554,196 +516,6 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
     }
 
     Ok(data)
-}
-
-/// Stored info about a game for lazy loading.
-#[derive(Debug, Clone)]
-struct GameInfo {
-    file_path: String,
-    player_ratings: Vec<PlayerRating>,
-}
-
-/// Loader that loads replay data on-demand from object store.
-struct ReplayLoader {
-    /// Map from `game_id` to game info for loading.
-    game_info: HashMap<String, GameInfo>,
-    /// Cache of recently loaded games (LRU-style, limited size).
-    cache: RwLock<HashMap<String, Vec<FrameFeatures>>>,
-}
-
-impl ReplayLoader {
-    fn new(game_info: HashMap<String, GameInfo>) -> Self {
-        Self {
-            game_info,
-            cache: RwLock::new(HashMap::new()),
-        }
-    }
-}
-
-impl GameLoader for ReplayLoader {
-    fn load_game(&self, game_id: &str) -> Option<Vec<FrameFeatures>> {
-        // Check cache first
-        {
-            let cache = self.cache.read();
-            if let Some(frames) = cache.get(game_id) {
-                return Some(frames.clone());
-            }
-        }
-
-        // Load from object store
-        let info = self.game_info.get(game_id)?;
-
-        // Use block_in_place to move blocking work to a thread pool
-        // This allows us to call block_on from within an async runtime
-        let file_path = info.file_path.clone();
-        let player_ratings = info.player_ratings.clone();
-
-        let frames = tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::try_current().ok()?;
-            handle.block_on(async {
-                let object_path = ObjectStorePath::from(file_path);
-                let get_result = OBJECT_STORE.get(&object_path).await.ok()?;
-                let bytes = get_result.bytes().await.ok()?;
-                let parsed = parse_replay_from_bytes(&bytes).ok()?;
-
-                if parsed.frames.is_empty() {
-                    return None;
-                }
-
-                let game_sequence = extract_game_sequence(
-                    &parsed.frames,
-                    &player_ratings,
-                    Some(&parsed.goal_frames),
-                    Some(&parsed.goals),
-                );
-
-                Some(game_sequence.frames)
-            })
-        })?;
-
-        // Store in cache (simple cache, no eviction for now)
-        // In production, you'd want LRU eviction to limit cache size
-        {
-            let mut cache = self.cache.write();
-            // Limit cache to ~100 games to avoid memory issues
-            if cache.len() >= 100 {
-                // Simple eviction: clear half the cache
-                let keys_to_remove: Vec<_> = cache.keys().take(50).cloned().collect();
-                for key in keys_to_remove {
-                    cache.remove(&key);
-                }
-            }
-            cache.insert(game_id.to_string(), frames.clone());
-        }
-
-        Some(frames)
-    }
-}
-
-/// Collects lightweight metadata for all games without loading frame data.
-///
-/// Returns `(game_metadata, player_map)` where `player_map` is used by the loader.
-async fn collect_game_metadata(
-    replays: &[Replay],
-    _train_ratio: f64,
-) -> Result<(Vec<GameMetadata>, HashMap<String, GameInfo>)> {
-    let mut metadata = Vec::with_capacity(replays.len());
-    let mut player_map = HashMap::with_capacity(replays.len());
-
-    let mut skipped_no_players = 0;
-
-    for replay in replays {
-        let game_id = replay.id.to_string();
-
-        // Get player ratings for this replay
-        let db_players = database::list_replay_players_by_replay(replay.id).await?;
-
-        if db_players.is_empty() {
-            skipped_no_players += 1;
-            continue;
-        }
-
-        // Convert to feature extractor format
-        let player_ratings: Vec<PlayerRating> = db_players
-            .iter()
-            .map(|p| PlayerRating {
-                player_name: p.player_name.clone(),
-                team: p.team,
-                mmr: p.rank_division.mmr_middle(),
-            })
-            .collect();
-
-        // Build target MMR array
-        let target_mmr = build_target_mmr_from_ratings(&player_ratings);
-
-        // Estimate frame count (5 min game at 30fps = 9000 frames)
-        let estimated_frame_count = 9000;
-
-        metadata.push(GameMetadata {
-            game_id: game_id.clone(),
-            target_mmr,
-            estimated_frame_count,
-        });
-
-        player_map.insert(
-            game_id,
-            GameInfo {
-                file_path: replay.file_path.clone(),
-                player_ratings,
-            },
-        );
-    }
-
-    if skipped_no_players > 0 {
-        info!(skipped_no_players, "Skipped games with no player data");
-    }
-
-    info!(
-        total_games = metadata.len(),
-        "Collected game metadata (no frame data loaded yet)"
-    );
-
-    Ok((metadata, player_map))
-}
-
-/// Builds target MMR array from player ratings.
-fn build_target_mmr_from_ratings(player_ratings: &[PlayerRating]) -> [f32; TOTAL_PLAYERS] {
-    let mut target_mmr = [1000.0f32; TOTAL_PLAYERS];
-
-    // Team values: 0 = Blue, 1 = Orange (matches replay_structs::Team enum)
-    const TEAM_BLUE: i16 = 0;
-    const TEAM_ORANGE: i16 = 1;
-
-    // Sort players by team, then by name for consistency
-    let mut blue_players: Vec<_> = player_ratings
-        .iter()
-        .filter(|p| p.team == TEAM_BLUE)
-        .collect();
-    let mut orange_players: Vec<_> = player_ratings
-        .iter()
-        .filter(|p| p.team == TEAM_ORANGE)
-        .collect();
-
-    blue_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
-    orange_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
-
-    // Fill slots: first 3 for blue, next 3 for orange
-    for (i, player) in blue_players.iter().take(3).enumerate() {
-        let Some(target_mmr_player) = target_mmr.get_mut(i) else {
-            error!("Blue team has 3 players");
-            continue;
-        };
-        *target_mmr_player = player.mmr as f32;
-    }
-    for (i, player) in orange_players.iter().take(3).enumerate() {
-        let Some(target_mmr_player) = target_mmr.get_mut(3 + i) else {
-            error!("Orange team has 3 players");
-            continue;
-        };
-        *target_mmr_player = player.mmr as f32;
-    }
-
-    target_mmr
 }
 
 /// Finds the latest checkpoint file for a given prefix.
