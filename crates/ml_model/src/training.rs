@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use burn::data::dataset::Dataset;
+use burn::module::AutodiffModule;
 use burn::nn::loss::MseLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
@@ -157,7 +158,7 @@ where
     // Create segment datasets - each game is split into multiple consecutive-frame segments
     // This generates segments on-the-fly to avoid massive memory usage
     let dataset = SegmentDataset::new(train_samples, config.sequence_length);
-    let batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
+    let batcher = SequenceBatcher::<B>::new(device, config.sequence_length);
 
     // Create validation dataset if we have validation data
     let valid_dataset = if !valid_samples.is_empty() {
@@ -284,13 +285,24 @@ where
         };
         state.current_epoch = epoch;
 
-        // Validation
+        info!(
+            "Epoch {epoch} completed in {:.2}s, avg_loss = {:.6}",
+            epoch_duration.as_secs_f64(),
+            state.current_train_loss
+        );
+
+        // Validation - use inner (non-autodiff) backend for faster inference
         let mut improved = false;
         let mut validation_time = std::time::Duration::ZERO;
         if let Some(valid_ds) = &valid_dataset {
             let valid_start = Instant::now();
-            let valid_batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
-            let valid_loss = compute_validation_loss(model, valid_ds, &valid_batcher, &loss_fn);
+            // Convert to inner backend to avoid gradient tracking overhead
+            let inner_model = model.clone().valid();
+            let inner_device = inner_model.linear1.weight.device();
+            let valid_batcher =
+                SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length);
+            let valid_loss =
+                compute_validation_loss(&inner_model, valid_ds, &valid_batcher, config.batch_size);
             validation_time = valid_start.elapsed();
             state.current_valid_loss = Some(valid_loss);
 
@@ -390,12 +402,14 @@ where
     })
 }
 
-/// Computes the validation loss on a segment dataset.
+/// Computes the validation loss on a segment dataset using the inner (non-autodiff) backend.
+///
+/// This is faster than using the autodiff backend since no computation graph is built.
 fn compute_validation_loss<B: Backend>(
     model: &SequenceModel<B>,
     dataset: &SegmentDataset,
     batcher: &SequenceBatcher<B>,
-    loss_fn: &MseLoss,
+    batch_size: usize,
 ) -> f32 {
     let num_segments = dataset.len();
     if num_segments == 0 {
@@ -403,12 +417,11 @@ fn compute_validation_loss<B: Backend>(
     }
 
     let mut total_loss = 0.0;
-    let mut batch_count = 0;
+    let mut total_samples = 0;
 
-    // Use smaller batch size for validation to reduce memory pressure
-    const BATCH_SIZE: usize = 512;
-    for batch_start in (0..num_segments).step_by(BATCH_SIZE) {
-        let batch_end = (batch_start + BATCH_SIZE).min(num_segments);
+    // Use same batch size as training for consistent GPU utilization
+    for batch_start in (0..num_segments).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(num_segments);
 
         let items: Vec<_> = (batch_start..batch_end)
             .filter_map(|i| dataset.get(i))
@@ -418,28 +431,30 @@ fn compute_validation_loss<B: Backend>(
             continue;
         }
 
+        let num_items = items.len();
         let batch = batcher.batch(items);
         let predictions = model.forward(batch.inputs);
-        let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
 
-        // Extract loss value and explicitly drop loss tensor to free GPU memory immediately
-        let loss_value: f32 = {
-            let loss_data = loss.clone().into_data();
-            drop(loss);
-            loss_data
-                .to_vec()
-                .unwrap_or_else(|_| vec![0.0])
-                .first()
-                .copied()
-                .unwrap_or(0.0)
-        };
+        // Compute MSE manually to avoid autodiff overhead
+        let diff = predictions - batch.targets;
+        let squared = diff.clone() * diff;
+        let mse = squared.mean();
 
-        total_loss += loss_value as f64;
-        batch_count += 1;
+        let loss_value: f32 = mse
+            .into_data()
+            .to_vec()
+            .unwrap_or_else(|_| vec![0.0])
+            .first()
+            .copied()
+            .unwrap_or(0.0);
+
+        // Weight by number of samples for accurate overall average
+        total_loss += loss_value as f64 * num_items as f64;
+        total_samples += num_items;
     }
 
-    if batch_count > 0 {
-        (total_loss / batch_count as f64) as f32
+    if total_samples > 0 {
+        (total_loss / total_samples as f64) as f32
     } else {
         0.0
     }
