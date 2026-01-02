@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use database::{get_pool, initialize_pool};
 use replay_structs::DownloadStatus;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -53,8 +54,8 @@ async fn main() -> Result<()> {
         Err(_) => base_path_unwrap,
     };
 
-    println!("=== Verify Downloaded Replays ===");
-    println!("Base path: {}\n", base_path.display());
+    info!("=== Verify Downloaded Replays ===");
+    info!("Base path: {}\n", base_path.display());
 
     // Select all replays where download_status = 'downloaded'
     let pool = get_pool();
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    println!(
+    info!(
         "Found {} replays with download_status = 'downloaded'\n",
         downloaded_replays.len()
     );
@@ -89,7 +90,7 @@ async fn main() -> Result<()> {
         let path = base_path.join(&replay.file_path);
 
         if !path.exists() {
-            println!("Missing: {} (ID: {})", replay.file_path, replay.id);
+            info!("Missing: {} (ID: {})", replay.file_path, replay.id);
 
             // Mark as 'not_downloaded'
             sqlx::query!(
@@ -110,10 +111,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("\n=== Summary ===");
-    println!("Total downloaded replays: {}", downloaded_replays.len());
-    println!("Existing on disk:         {existing_count}");
-    println!("Missing (marked as not_downloaded): {missing_count}");
+    info!("\n=== Summary ===");
+    info!("Total downloaded replays: {}", downloaded_replays.len());
+    info!("Existing on disk:         {existing_count}");
+    info!("Missing (marked as not_downloaded): {missing_count}");
 
     Ok(())
 }

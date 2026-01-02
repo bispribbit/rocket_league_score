@@ -83,7 +83,7 @@ let config = TrainingConfig::new(ModelConfig::new())
 
 // Train (model is modified in-place)
 let output = train(&mut model, &data, &config)?;
-println!("Final loss: {}", output.final_train_loss);
+info!("Final loss: {}", output.final_train_loss);
 ```
 
 ### Inference
@@ -95,7 +95,7 @@ use feature_extractor::extract_frame_features;
 // Single frame prediction
 let features = extract_frame_features(&frame);
 let score = predict(&model, &features, &device);
-println!("Predicted MMR: {}", score);
+info!("Predicted MMR: {}", score);
 
 // Batch prediction (more efficient for multiple frames)
 use ml_model::predict_batch;

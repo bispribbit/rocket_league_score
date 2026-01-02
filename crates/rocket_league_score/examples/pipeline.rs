@@ -25,6 +25,7 @@
 use anyhow::Result;
 use database::initialize_pool;
 use rocket_league_score::commands;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 fn get_env_or_default<T: core::str::FromStr>(name: &str, default: T) -> T {
@@ -52,21 +53,20 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok());
 
-    println!("=== Full Training Pipeline ===");
-    println!("Model name:    {model_name}");
-    println!(
+    info!("=== Full Training Pipeline ===");
+    info!("Model name:    {model_name}");
+    info!(
         "Train ratio:   {train_ratio:.1}%",
         train_ratio = train_ratio * 100.0
     );
-    println!("Epochs:        {epochs}");
-    println!("Batch size:    {batch_size}");
-    println!("Learning rate: {learning_rate}");
-    println!("Resume:        {resume}");
-    println!(
+    info!("Epochs:        {epochs}");
+    info!("Batch size:    {batch_size}");
+    info!("Learning rate: {learning_rate}");
+    info!("Resume:        {resume}");
+    info!(
         "Max replays:   {}",
         max_replays.map_or_else(|| "all".to_string(), |n| n.to_string())
     );
-    println!();
 
     // Initialize database
     let database_url =

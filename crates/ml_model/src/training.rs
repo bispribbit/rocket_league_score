@@ -7,6 +7,7 @@ use burn::nn::loss::MseLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
+use tracing::info;
 
 use crate::dataset::{SegmentDataset, SequenceBatcher};
 use crate::{SequenceModel, SequenceTrainingData, TrainingConfig, save_checkpoint};
@@ -178,27 +179,27 @@ where
     const EARLY_STOPPING_PATIENCE: usize = 10;
 
     let valid_segments = valid_dataset.as_ref().map_or(0, Dataset::len);
-    println!(
+    info!(
         "Starting training with {} games ({} train, {} valid)",
         data.len(),
         dataset.game_count(),
         valid_dataset.as_ref().map_or(0, SegmentDataset::game_count)
     );
-    println!(
+    info!(
         "Total segments: {} train, {} valid (segment_length={})",
         dataset.len(),
         valid_segments,
         config.sequence_length
     );
-    println!(
+    info!(
         "Batch size: {}, Learning rate: {}",
         config.batch_size, config.learning_rate
     );
     if start_epoch > 0 {
-        println!("Resuming from epoch {}", start_epoch + 1);
+        info!("Resuming from epoch {}", start_epoch + 1);
     }
     if let Some(ckpt_cfg) = &checkpoint_config {
-        println!(
+        info!(
             "Checkpoints will be saved every {} epochs to {}",
             ckpt_cfg.save_every_n_epochs, ckpt_cfg.path_prefix
         );
@@ -263,7 +264,7 @@ where
             if batch_count % 20 == 0 {
                 let avg_loss_so_far = epoch_loss / batch_count as f64;
                 let total_batches = num_samples.div_ceil(config.batch_size);
-                println!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
+                info!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
             }
 
             // Backward pass
@@ -306,7 +307,7 @@ where
                         state.current_train_loss,
                         state.current_valid_loss,
                     );
-                    println!(
+                    info!(
                         "Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs without improvement"
                     );
 
@@ -314,7 +315,7 @@ where
                     if let Some(ckpt_cfg) = &checkpoint_config {
                         let path = format!("{}_final", ckpt_cfg.path_prefix);
                         if let Ok(_ckpt) = save_checkpoint(model, &path, config) {
-                            println!("Saved final checkpoint: {path}");
+                            info!("Saved final checkpoint: {path}");
                             checkpoint_paths.push(path);
                         }
                     }
@@ -337,7 +338,7 @@ where
         );
 
         // Log timing information
-        println!(
+        info!(
             "  Timing: epoch={:.2}s, data_loading={:.2}s, batch_processing={:.2}s, validation={:.2}s",
             epoch_duration.as_secs_f64(),
             data_loading_time.as_secs_f64(),
@@ -361,11 +362,11 @@ where
 
                 match save_checkpoint(model, &path, config) {
                     Ok(_ckpt) => {
-                        println!("Saved checkpoint: {path}");
+                        info!("Saved checkpoint: {path}");
                         checkpoint_paths.push(path);
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to save checkpoint: {e}");
+                        info!("Warning: Failed to save checkpoint: {e}");
                     }
                 }
             }
@@ -376,7 +377,7 @@ where
     if let Some(ckpt_cfg) = &checkpoint_config {
         let path = format!("{}_final", ckpt_cfg.path_prefix);
         if let Ok(_ckpt) = save_checkpoint(model, &path, config) {
-            println!("Saved final checkpoint: {path}");
+            info!("Saved final checkpoint: {path}");
             checkpoint_paths.push(path);
         }
     }
@@ -463,11 +464,11 @@ fn log_progress(epoch: usize, train_loss: f32, valid_loss: Option<f32>) {
     let train_rmse = train_loss.sqrt();
     if let Some(vl) = valid_loss {
         let valid_rmse = vl.sqrt();
-        println!(
+        info!(
             "Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR), valid_loss = {vl:.6} (RMSE: {valid_rmse:.1} MMR)"
         );
     } else {
-        println!("Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR)");
+        info!("Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR)");
     }
 }
 

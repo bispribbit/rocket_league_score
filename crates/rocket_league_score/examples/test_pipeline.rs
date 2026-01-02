@@ -18,6 +18,7 @@
 use anyhow::Result;
 use database::initialize_pool;
 use rocket_league_score::commands;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -30,9 +31,8 @@ async fn main() -> Result<()> {
     // Configuration for quick testing
     let num_replays: usize = 1_000;
 
-    println!("=== Full Pipeline Test ===");
-    println!("Testing with {num_replays} replays");
-    println!();
+    info!("=== Full Pipeline Test ===");
+    info!("Testing with {num_replays} replays");
 
     // Initialize database
     let database_url =
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    println!("=== Pipeline test completed successfully ===");
+    info!("=== Pipeline test completed successfully ===");
 
     Ok(())
 }
