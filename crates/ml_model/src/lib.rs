@@ -16,6 +16,7 @@
 //! The model outputs one MMR prediction per player per game/segment.
 
 mod dataset;
+mod lazy_dataset;
 mod training;
 
 use std::path::Path;
@@ -25,26 +26,28 @@ use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-pub use dataset::{SequenceBatcher, SequenceDataset, SequenceDatasetItem};
+pub use dataset::{SegmentDataset, SequenceBatcher, SequenceDatasetItem};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
+pub use lazy_dataset::{GameLoader, GameMetadata, LazySegmentDataset};
 pub use training::{
     CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints,
+    train_with_dataset,
 };
 
 /// Configuration for the sequence model.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
     /// Hidden size for the first LSTM layer.
-    #[config(default = 256)]
+    #[config(default = 128)]
     pub lstm_hidden_1: usize,
     /// Hidden size for the second LSTM layer.
-    #[config(default = 128)]
+    #[config(default = 64)]
     pub lstm_hidden_2: usize,
     /// Hidden size for the feedforward layer after LSTM.
-    #[config(default = 64)]
+    #[config(default = 32)]
     pub feedforward_hidden: usize,
     /// Dropout rate for regularization.
-    #[config(default = 0.3)]
+    #[config(default = 0.5)]
     pub dropout: f64,
 }
 
@@ -58,16 +61,17 @@ pub struct TrainingConfig {
     #[config(default = 100)]
     pub epochs: usize,
     /// Batch size for training.
-    #[config(default = 128)]
+    #[config(default = 2048)]
     pub batch_size: usize,
     /// Model architecture configuration.
     pub model: ModelConfig,
     /// Validation split ratio (0.0 to 1.0).
     #[config(default = 0.1)]
     pub validation_split: f64,
-    /// Sequence length (number of frames per sample).
-    /// Frames are sampled uniformly from the game.
-    #[config(default = 300)]
+    /// Sequence length (number of frames per segment).
+    /// At 30fps, 90 frames = 3 seconds of gameplay.
+    /// Each game is split into non-overlapping segments of this length.
+    #[config(default = 90)]
     pub sequence_length: usize,
 }
 
@@ -259,55 +263,106 @@ pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> Seq
 
 /// Predicts MMR for all players from a sequence of frames.
 ///
+/// This function splits the game into non-overlapping segments, predicts MMR
+/// for each segment, and averages the predictions across all segments.
+///
 /// # Arguments
 ///
 /// * `model` - The trained model.
-/// * `frames` - Sequence of frame features from a game.
+/// * `frames` - All frame features from a game.
 /// * `device` - The device to run inference on.
-/// * `sequence_length` - The expected sequence length (frames will be sampled to match).
+/// * `segment_length` - Number of consecutive frames per segment.
 ///
 /// # Returns
 ///
-/// Array of predicted MMR values for each of the 6 players.
+/// Array of predicted MMR values for each of the 6 players (averaged across segments).
 pub fn predict<B: Backend>(
     model: &SequenceModel<B>,
     frames: &[FrameFeatures],
     device: &B::Device,
-    sequence_length: usize,
+    segment_length: usize,
 ) -> [f32; TOTAL_PLAYERS] {
     if frames.is_empty() {
         return [1000.0; TOTAL_PLAYERS];
     }
 
-    // Sample frames to match expected sequence length
-    let sampled_frames = sample_frames(frames, sequence_length);
+    // Calculate number of segments
+    let num_segments = if frames.len() >= segment_length {
+        frames.len() / segment_length
+    } else {
+        1
+    };
 
-    // Build input tensor [1, seq_len, FEATURE_COUNT]
-    let mut input_data = Vec::with_capacity(sequence_length * FEATURE_COUNT);
-    for frame in &sampled_frames {
-        input_data.extend_from_slice(&frame.features);
+    // Accumulate predictions across all segments
+    let mut sum_predictions = [0.0f32; TOTAL_PLAYERS];
+    let mut segment_count = 0;
+
+    for seg_idx in 0..num_segments {
+        let start = seg_idx * segment_length;
+        let segment_frames = get_segment_frames(frames, start, segment_length);
+
+        // Build input tensor [1, seg_len, FEATURE_COUNT]
+        let mut input_data = Vec::with_capacity(segment_length * FEATURE_COUNT);
+        for frame in &segment_frames {
+            input_data.extend_from_slice(&frame.features);
+        }
+
+        let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
+            1,
+            segment_length,
+            FEATURE_COUNT,
+        ]);
+
+        // Forward pass
+        let output = model.forward_inference(input);
+
+        // Extract values
+        let output_data = output.into_data();
+        if let Ok(values) = output_data.to_vec::<f32>() {
+            for (i, val) in values.iter().take(TOTAL_PLAYERS).enumerate() {
+                let Some(sum_prediction) = sum_predictions.get_mut(i) else {
+                    tracing::error!("Sum predictions has less than {TOTAL_PLAYERS} players");
+                    continue;
+                };
+                *sum_prediction += *val;
+            }
+            segment_count += 1;
+        }
     }
 
-    let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
-        1,
-        sequence_length,
-        FEATURE_COUNT,
-    ]);
-
-    // Forward pass
-    let output = model.forward_inference(input);
-
-    // Extract values
-    let output_data = output.into_data();
-    let values = output_data
-        .to_vec::<f32>()
-        .unwrap_or_else(|_| vec![1000.0; TOTAL_PLAYERS]);
-
-    let mut result = [1000.0; TOTAL_PLAYERS];
-    for (i, val) in values.iter().take(TOTAL_PLAYERS).enumerate() {
-        result[i] = *val;
+    // Average predictions
+    if segment_count > 0 {
+        for pred in &mut sum_predictions {
+            *pred /= segment_count as f32;
+        }
+        sum_predictions
+    } else {
+        [1000.0; TOTAL_PLAYERS]
     }
-    result
+}
+
+/// Gets a segment of consecutive frames, padding if necessary.
+fn get_segment_frames(
+    frames: &[FrameFeatures],
+    start: usize,
+    segment_length: usize,
+) -> Vec<FrameFeatures> {
+    let end = (start + segment_length).min(frames.len());
+    let Some(segment) = frames.get(start..end) else {
+        tracing::error!("No segment found for start: {start} and segment_length: {segment_length}");
+        return vec![];
+    };
+
+    let mut segment = segment.to_vec();
+
+    // Pad with last frame if needed
+    if let Some(last) = segment.last().cloned() {
+        while segment.len() < segment_length {
+            segment.push(last.clone());
+        }
+    }
+
+    segment
 }
 
 /// Predicts MMR with a sliding window, returning how predictions evolve over time.
@@ -349,7 +404,12 @@ pub fn predict_evolving<B: Backend>(
     // Slide window through the game
     let mut start = 0;
     while start + sequence_length <= frames.len() {
-        let window = &frames[start..start + sequence_length];
+        let Some(window) = frames.get(start..start + sequence_length) else {
+            tracing::error!(
+                "No window found for start: {start} and sequence_length: {sequence_length}"
+            );
+            break;
+        };
         let pred = predict(model, window, device, sequence_length);
         let timestamp = window.last().map_or(0.0, |f| f.time);
 
@@ -373,30 +433,11 @@ pub struct EvolvingPrediction {
     pub player_mmr: [f32; TOTAL_PLAYERS],
 }
 
-/// Samples frames uniformly to match a target sequence length.
-fn sample_frames(frames: &[FrameFeatures], target_len: usize) -> Vec<FrameFeatures> {
-    if frames.len() <= target_len {
-        // Pad with last frame if too short
-        let mut result = frames.to_vec();
-        if let Some(last) = frames.last() {
-            while result.len() < target_len {
-                result.push(last.clone());
-            }
-        }
-        return result;
-    }
-
-    // Sample uniformly
-    let step = frames.len() as f64 / target_len as f64;
-    (0..target_len)
-        .map(|i| {
-            let idx = (i as f64 * step) as usize;
-            frames[idx.min(frames.len() - 1)].clone()
-        })
-        .collect()
-}
-
 /// Saves the model checkpoint to disk.
+///
+/// # Errors
+///
+/// Returns an error if the checkpoint cannot be saved.
 pub fn save_checkpoint<B: Backend>(
     model: &SequenceModel<B>,
     path: &str,
@@ -428,6 +469,19 @@ pub fn save_checkpoint<B: Backend>(
 }
 
 /// Loads a model checkpoint from disk.
+///
+/// # Arguments
+///
+/// * `path` - The path to the checkpoint.
+/// * `device` - The device to load the model on.
+///
+/// # Returns
+///
+/// The loaded model.
+///
+/// # Errors
+///
+/// Returns an error if the checkpoint cannot be loaded.
 pub fn load_checkpoint<B: Backend>(
     path: &str,
     device: &B::Device,
@@ -539,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_frames_exact() {
+    fn test_get_segment_frames() {
         let frames: Vec<FrameFeatures> = (0..100)
             .map(|i| FrameFeatures {
                 features: [i as f32; FEATURE_COUNT],
@@ -547,28 +601,20 @@ mod tests {
             })
             .collect();
 
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
+        // Full segment
+        let segment = get_segment_frames(&frames, 0, 30);
+        assert_eq!(segment.len(), 30);
+        assert!((segment[0].time - 0.0).abs() < f32::EPSILON);
+        assert!((segment[29].time - 29.0).abs() < f32::EPSILON);
+
+        // Second segment
+        let segment = get_segment_frames(&frames, 30, 30);
+        assert_eq!(segment.len(), 30);
+        assert!((segment[0].time - 30.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn test_sample_frames_downsample() {
-        let frames: Vec<FrameFeatures> = (0..1000)
-            .map(|i| FrameFeatures {
-                features: [i as f32; FEATURE_COUNT],
-                time: i as f32,
-            })
-            .collect();
-
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
-
-        // Should sample uniformly - first frame should be index 0
-        assert!((sampled[0].time - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_sample_frames_pad() {
+    fn test_get_segment_frames_padding() {
         let frames: Vec<FrameFeatures> = (0..50)
             .map(|i| FrameFeatures {
                 features: [i as f32; FEATURE_COUNT],
@@ -576,10 +622,15 @@ mod tests {
             })
             .collect();
 
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
+        // Segment that needs padding
+        let segment = get_segment_frames(&frames, 30, 30);
+        assert_eq!(segment.len(), 30);
 
-        // Last 50 should be padded with the last frame
-        assert!((sampled[99].time - 49.0).abs() < f32::EPSILON);
+        // First 20 should be original frames (30-49)
+        assert!((segment[0].time - 30.0).abs() < f32::EPSILON);
+        assert!((segment[19].time - 49.0).abs() < f32::EPSILON);
+
+        // Last 10 should be padded with frame 49
+        assert!((segment[29].time - 49.0).abs() < f32::EPSILON);
     }
 }

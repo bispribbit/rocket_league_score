@@ -51,27 +51,18 @@ pub async fn run() -> Result<()> {
         info!("Reset {reset_count} in-progress downloads");
     }
 
+    let fetch_client = client.clone();
     let download_client = client.clone();
-    let _replay = download_all_replays(download_client)
-        .await
-        .inspect_err(|err| {
-            error!("Download error: {err}");
-        });
 
-    /*
-       let fetch_client = client.clone();
-       let download_client = client.clone();
+    let fetch_task = tokio::spawn(async move { fetch_all_metadata(fetch_client).await });
 
-       let fetch_task = tokio::spawn(async move { fetch_all_metadata(fetch_client).await });
+    let download_task = tokio::spawn(async move { download_all_replays(download_client).await });
 
-       let download_task = tokio::spawn(async move { download_all_replays(download_client).await });
+    // Wait for both tasks
+    let (fetch_result, download_result) = tokio::join!(fetch_task, download_task);
 
-       // Wait for both tasks
-       let (fetch_result, download_result) = tokio::join!(fetch_task, download_task);
-
-       fetch_result??;
-       download_result??;
-    */
+    fetch_result??;
+    download_result??;
 
     info!("Download process complete");
     print_stats().await?;

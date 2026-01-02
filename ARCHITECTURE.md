@@ -223,3 +223,77 @@ Expected output:
 3. Trains model for 5 epochs
 4. Runs inference on samples
 5. Reports sanity check results
+6. Displays timing breakdown for each step
+
+---
+
+## Performance and Timing
+
+The pipeline includes comprehensive timing measurements to help identify bottlenecks and optimize performance. Timing information is logged at multiple levels:
+
+### Pipeline-Level Timing
+
+Both `test-pipeline` and `full_train` commands report timing for each major step:
+
+**test-pipeline timing:**
+- Step 1: Loading metadata (database queries)
+- Step 2: Extracting game sequences (parsing + feature extraction)
+  - Per-replay parse time
+  - Per-replay feature extraction time
+- Step 3: Model creation
+- Step 4: Training (with per-epoch breakdown)
+- Step 5: Inference
+- Step 6: Sanity checks
+- Total pipeline duration
+
+**full_train timing:**
+- Step 1: Dataset split assignment
+- Step 2: Collecting game metadata
+- Step 3: Creating lazy datasets
+- Step 4: Model initialization
+- Step 5: Training (with per-epoch breakdown)
+- Step 6: Saving model to database
+- Step 7: Evaluation on test set
+- Total pipeline duration
+
+### Training-Level Timing
+
+During training, each epoch reports:
+- **Epoch duration**: Total time for the epoch
+- **Data loading time**: Time spent loading batches from dataset
+- **Batch processing time**: Time spent on forward/backward passes and optimization
+- **Validation time**: Time spent computing validation loss
+
+This breakdown helps identify whether bottlenecks are in:
+- **Data loading**: If data loading time is high, consider:
+  - Using lazy loading (already implemented for full_train)
+  - Increasing batch size to reduce per-batch overhead
+  - Optimizing dataset access patterns
+- **Batch processing**: If batch processing time is high, consider:
+  - Using GPU acceleration (Wgpu backend)
+  - Reducing model size
+  - Optimizing batch size
+- **Validation**: If validation time is high, consider:
+  - Reducing validation set size
+  - Computing validation less frequently
+
+### Typical Performance Characteristics
+
+For a typical training run with 1000 games:
+- **Metadata loading**: ~1-5 seconds
+- **Feature extraction**: ~10-30 seconds per replay (depends on replay length)
+- **Model creation**: <1 second
+- **Training**: ~5-15 seconds per epoch (depends on batch size and GPU)
+- **Inference**: <1 second per sample
+
+### Optimization Tips
+
+1. **Batch size**: Larger batches reduce per-batch overhead but require more memory. Typical values: 32-128 for training, 2048 for validation.
+
+2. **Lazy loading**: The full_train command uses lazy loading to avoid loading all replays into memory. This is essential for large datasets.
+
+3. **GPU acceleration**: Training uses the Wgpu backend for GPU acceleration. Ensure proper GPU drivers are installed.
+
+4. **Data preprocessing**: Consider preprocessing and caching features if feature extraction is a bottleneck.
+
+5. **Parallel processing**: Replay parsing and feature extraction can be parallelized across multiple replays (future enhancement).

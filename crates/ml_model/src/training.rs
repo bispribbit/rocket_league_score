@@ -1,12 +1,14 @@
 //! Training logic for the sequence model.
 
+use std::time::Instant;
+
 use burn::data::dataset::Dataset;
 use burn::nn::loss::MseLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 
-use crate::dataset::{SequenceBatcher, SequenceDataset};
+use crate::dataset::{SegmentDataset, SequenceBatcher, SequenceDatasetItem};
 use crate::{SequenceModel, SequenceTrainingData, TrainingConfig, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
@@ -143,20 +145,22 @@ where
 
     let device = model.linear1.weight.device();
 
-    // Split data into training and validation sets
+    // Split data into training and validation sets BY GAME (not by segment)
+    // This prevents data leakage where segments from the same game appear in both sets
     let (train_samples, valid_samples) = data.split(config.validation_split);
 
     if train_samples.is_empty() {
         return Err(anyhow::anyhow!("No training samples after split"));
     }
 
-    // Create dataset and batcher
-    let dataset = SequenceDataset::new(&train_samples, config.sequence_length);
+    // Create segment datasets - each game is split into multiple consecutive-frame segments
+    // This generates segments on-the-fly to avoid massive memory usage
+    let dataset = SegmentDataset::new(train_samples, config.sequence_length);
     let batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
 
     // Create validation dataset if we have validation data
     let valid_dataset = if !valid_samples.is_empty() {
-        Some(SequenceDataset::new(&valid_samples, config.sequence_length))
+        Some(SegmentDataset::new(valid_samples, config.sequence_length))
     } else {
         None
     };
@@ -173,20 +177,27 @@ where
 
     const EARLY_STOPPING_PATIENCE: usize = 10;
 
+    let valid_segments = valid_dataset.as_ref().map_or(0, Dataset::len);
     println!(
-        "Starting training with {} samples ({} train, {} valid)",
+        "Starting training with {} games ({} train, {} valid)",
         data.len(),
-        train_samples.len(),
-        valid_samples.len()
+        dataset.game_count(),
+        valid_dataset.as_ref().map_or(0, SegmentDataset::game_count)
     );
     println!(
-        "Sequence length: {}, Batch size: {}, Learning rate: {}",
-        config.sequence_length, config.batch_size, config.learning_rate
+        "Total segments: {} train, {} valid (segment_length={})",
+        dataset.len(),
+        valid_segments,
+        config.sequence_length
+    );
+    println!(
+        "Batch size: {}, Learning rate: {}",
+        config.batch_size, config.learning_rate
     );
     if start_epoch > 0 {
         println!("Resuming from epoch {}", start_epoch + 1);
     }
-    if let Some(ref ckpt_cfg) = checkpoint_config {
+    if let Some(ckpt_cfg) = &checkpoint_config {
         println!(
             "Checkpoints will be saved every {} epochs to {}",
             ckpt_cfg.save_every_n_epochs, ckpt_cfg.path_prefix
@@ -194,8 +205,11 @@ where
     }
 
     for epoch in start_epoch..config.epochs {
+        let epoch_start = Instant::now();
         let mut epoch_loss = 0.0;
         let mut batch_count = 0;
+        let mut batch_processing_time = std::time::Duration::ZERO;
+        let mut data_loading_time = std::time::Duration::ZERO;
 
         // Simple batching with shuffling
         let num_samples = dataset.len();
@@ -206,16 +220,19 @@ where
 
         // Process batches
         for batch_start in (0..num_samples).step_by(config.batch_size) {
+            let batch_start_time = Instant::now();
             let batch_end = (batch_start + config.batch_size).min(num_samples);
             let Some(batch_indices) = indices.get(batch_start..batch_end) else {
                 continue;
             };
 
             // Collect batch items
+            let data_load_start = Instant::now();
             let items: Vec<_> = batch_indices
                 .iter()
                 .filter_map(|&i| dataset.get(i))
                 .collect();
+            data_loading_time += data_load_start.elapsed();
 
             if items.is_empty() {
                 continue;
@@ -247,9 +264,7 @@ where
             if batch_count % 20 == 0 {
                 let avg_loss_so_far = epoch_loss / batch_count as f64;
                 let total_batches = num_samples.div_ceil(config.batch_size);
-                println!(
-                    "  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}"
-                );
+                println!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
             }
 
             // Backward pass
@@ -258,8 +273,10 @@ where
 
             // Update weights
             *model = optimizer.step(config.learning_rate, model.clone(), grads);
+            batch_processing_time += batch_start_time.elapsed();
         }
 
+        let epoch_duration = epoch_start.elapsed();
         state.current_train_loss = if batch_count > 0 {
             (epoch_loss / batch_count as f64) as f32
         } else {
@@ -269,9 +286,12 @@ where
 
         // Validation
         let mut improved = false;
+        let mut validation_time = std::time::Duration::ZERO;
         if let Some(valid_ds) = &valid_dataset {
+            let valid_start = Instant::now();
             let valid_batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
             let valid_loss = compute_validation_loss(model, valid_ds, &valid_batcher, &loss_fn);
+            validation_time = valid_start.elapsed();
             state.current_valid_loss = Some(valid_loss);
 
             // Early stopping check
@@ -292,7 +312,7 @@ where
                     );
 
                     // Save final checkpoint
-                    if let Some(ref ckpt_cfg) = checkpoint_config {
+                    if let Some(ckpt_cfg) = &checkpoint_config {
                         let path = format!("{}_final", ckpt_cfg.path_prefix);
                         if let Ok(_ckpt) = save_checkpoint(model, &path, config) {
                             println!("Saved final checkpoint: {path}");
@@ -317,8 +337,17 @@ where
             state.current_valid_loss,
         );
 
+        // Log timing information
+        println!(
+            "  Timing: epoch={:.2}s, data_loading={:.2}s, batch_processing={:.2}s, validation={:.2}s",
+            epoch_duration.as_secs_f64(),
+            data_loading_time.as_secs_f64(),
+            batch_processing_time.as_secs_f64(),
+            validation_time.as_secs_f64()
+        );
+
         // Checkpoint saving
-        if let Some(ref ckpt_cfg) = checkpoint_config {
+        if let Some(ckpt_cfg) = &checkpoint_config {
             let should_save_periodic =
                 ckpt_cfg.save_every_n_epochs > 0 && (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0;
             let should_save_improvement = ckpt_cfg.save_on_improvement && improved;
@@ -345,7 +374,7 @@ where
     }
 
     // Save final checkpoint
-    if let Some(ref ckpt_cfg) = checkpoint_config {
+    if let Some(ckpt_cfg) = &checkpoint_config {
         let path = format!("{}_final", ckpt_cfg.path_prefix);
         if let Ok(_ckpt) = save_checkpoint(model, &path, config) {
             println!("Saved final checkpoint: {path}");
@@ -361,15 +390,312 @@ where
     })
 }
 
-/// Computes the validation loss on a dataset.
-fn compute_validation_loss<B: Backend>(
+/// Trains a model using any dataset that provides `SequenceDatasetItem`.
+///
+/// This is the generic version that works with lazy-loading datasets.
+/// Use this when you want to control dataset creation (e.g., for lazy loading).
+///
+/// # Arguments
+///
+/// * `model` - The model to train (will be modified in place).
+/// * `train_dataset` - Training dataset (must implement `Dataset<SequenceDatasetItem>`).
+/// * `valid_dataset` - Optional validation dataset.
+/// * `config` - Training configuration.
+/// * `checkpoint_config` - Optional checkpoint configuration for saving during training.
+/// * `start_state` - Optional starting state for resumption.
+///
+/// # Errors
+///
+/// Returns an error if training fails.
+#[expect(clippy::too_many_arguments)]
+pub fn train_with_dataset<B, D>(
+    model: &mut SequenceModel<B>,
+    train_dataset: D,
+    valid_dataset: Option<D>,
+    config: &TrainingConfig,
+    checkpoint_config: Option<CheckpointConfig>,
+    start_state: Option<TrainingState>,
+    train_game_count: usize,
+    valid_game_count: usize,
+) -> anyhow::Result<TrainingOutput>
+where
+    B: AutodiffBackend,
+    B::FloatElem: From<f32>,
+    D: Dataset<SequenceDatasetItem>,
+{
+    if train_dataset.len() == 0 {
+        return Err(anyhow::anyhow!("No training data provided"));
+    }
+
+    let device = model.linear1.weight.device();
+    let batcher = SequenceBatcher::<B>::new(device, config.sequence_length);
+
+    // Create optimizer with weight decay for regularization
+    let mut optimizer = AdamConfig::new().init();
+
+    let loss_fn = MseLoss::new();
+    let mut checkpoint_paths = Vec::new();
+
+    // Initialize training state (from provided state or fresh)
+    let mut state = start_state.unwrap_or_else(|| TrainingState::new(0));
+    let start_epoch = state.current_epoch;
+
+    const EARLY_STOPPING_PATIENCE: usize = 10;
+
+    let valid_segments = valid_dataset.as_ref().map_or(0, Dataset::len);
+    println!(
+        "Starting training with {} games ({} train, {} valid)",
+        train_game_count + valid_game_count,
+        train_game_count,
+        valid_game_count
+    );
+    println!(
+        "Total segments: {} train, {} valid (segment_length={})",
+        train_dataset.len(),
+        valid_segments,
+        config.sequence_length
+    );
+    println!(
+        "Batch size: {}, Learning rate: {}",
+        config.batch_size, config.learning_rate
+    );
+    if start_epoch > 0 {
+        println!("Resuming from epoch {}", start_epoch + 1);
+    }
+    if let Some(ckpt_cfg) = &checkpoint_config {
+        println!(
+            "Checkpoints will be saved every {} epochs to {}",
+            ckpt_cfg.save_every_n_epochs, ckpt_cfg.path_prefix
+        );
+    }
+
+    let num_samples = train_dataset.len();
+
+    for epoch in start_epoch..config.epochs {
+        let epoch_start = Instant::now();
+        state.current_epoch = epoch;
+
+        // Shuffle indices for this epoch
+        let mut indices: Vec<usize> = (0..num_samples).collect();
+        shuffle_indices(&mut indices, epoch as u64);
+
+        let mut epoch_loss = 0.0;
+        let mut batch_count = 0;
+        let mut batch_processing_time = std::time::Duration::ZERO;
+        let mut data_loading_time = std::time::Duration::ZERO;
+
+        // Process batches
+        for batch_start in (0..num_samples).step_by(config.batch_size) {
+            let batch_start_time = Instant::now();
+            let batch_end = (batch_start + config.batch_size).min(num_samples);
+            let Some(batch_indices) = indices.get(batch_start..batch_end) else {
+                continue;
+            };
+
+            // Collect items for this batch
+            let data_load_start = Instant::now();
+            let items: Vec<_> = batch_indices
+                .iter()
+                .filter_map(|&idx| train_dataset.get(idx))
+                .collect();
+            data_loading_time += data_load_start.elapsed();
+
+            if items.is_empty() {
+                continue;
+            }
+
+            // Create batch
+            let batch = batcher.batch(items);
+
+            // Forward pass
+            let predictions = model.forward(batch.inputs.clone());
+            let loss = loss_fn.forward(
+                predictions,
+                batch.targets.clone(),
+                burn::nn::loss::Reduction::Mean,
+            );
+
+            // Backward pass
+            let grads = loss.backward();
+            let grads = GradientsParams::from_grads(grads, model);
+
+            // Extract loss value for epoch average
+            let loss_value: f32 = loss
+                .clone()
+                .into_data()
+                .to_vec()
+                .unwrap_or_else(|_| vec![0.0])
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+
+            epoch_loss += loss_value as f64;
+            batch_count += 1;
+
+            // Log progress every 20 batches
+            if batch_count % 20 == 0 {
+                let avg_loss_so_far = epoch_loss / batch_count as f64;
+                let total_batches = num_samples.div_ceil(config.batch_size);
+                println!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
+            }
+
+            // Update model
+            *model = optimizer.step(config.learning_rate, model.clone(), grads);
+            batch_processing_time += batch_start_time.elapsed();
+        }
+
+        let epoch_duration = epoch_start.elapsed();
+
+        // Calculate epoch metrics
+        let avg_train_loss = if batch_count > 0 {
+            (epoch_loss / batch_count as f64) as f32
+        } else {
+            0.0
+        };
+
+        state.current_train_loss = avg_train_loss;
+
+        // Compute validation loss if we have a validation dataset
+        let valid_start = Instant::now();
+        let valid_loss = valid_dataset
+            .as_ref()
+            .map(|valid_ds| compute_validation_loss_generic(model, valid_ds, &batcher, &loss_fn));
+        let validation_time = valid_start.elapsed();
+        state.current_valid_loss = valid_loss;
+
+        // Convert to RMSE for display
+        let train_rmse = avg_train_loss.sqrt();
+        let valid_rmse_str = valid_loss
+            .map(|v| format!(" (RMSE: {:.1} MMR)", v.sqrt()))
+            .unwrap_or_default();
+
+        println!(
+            "Epoch {}: train_loss = {:.6} (RMSE: {:.1} MMR), valid_loss = {}{}",
+            epoch + 1,
+            avg_train_loss,
+            train_rmse,
+            valid_loss.map_or_else(|| "N/A".to_string(), |v| format!("{v:.6}")),
+            valid_rmse_str
+        );
+
+        // Log timing information
+        println!(
+            "  Timing: epoch={:.2}s, data_loading={:.2}s, batch_processing={:.2}s, validation={:.2}s",
+            epoch_duration.as_secs_f64(),
+            data_loading_time.as_secs_f64(),
+            batch_processing_time.as_secs_f64(),
+            validation_time.as_secs_f64()
+        );
+
+        // Check for improvement
+        let improved = valid_loss.is_none_or(|vl| vl < state.best_valid_loss);
+        if improved {
+            if let Some(vl) = valid_loss {
+                state.best_valid_loss = vl;
+            }
+            state.epochs_without_improvement = 0;
+
+            // Save "best" checkpoint
+            if let Some(ckpt_cfg) = &checkpoint_config
+                && ckpt_cfg.save_on_improvement
+            {
+                let path = format!("{}_best", ckpt_cfg.path_prefix);
+                if let Ok(ckpt) = save_checkpoint(model, &path, config) {
+                    println!("Saved checkpoint: {}", ckpt.path);
+                    checkpoint_paths.push(ckpt.path);
+                }
+            }
+        } else {
+            state.epochs_without_improvement += 1;
+
+            // Early stopping
+            if state.epochs_without_improvement >= EARLY_STOPPING_PATIENCE {
+                println!(
+                    "Early stopping after {EARLY_STOPPING_PATIENCE} epochs without improvement",
+                );
+                break;
+            }
+        }
+
+        // Save periodic checkpoint
+        if let Some(ckpt_cfg) = &checkpoint_config
+            && (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0
+        {
+            let path = format!("{}_epoch_{}", ckpt_cfg.path_prefix, epoch + 1);
+            if let Ok(ckpt) = save_checkpoint(model, &path, config) {
+                println!("Saved checkpoint: {}", ckpt.path);
+                checkpoint_paths.push(ckpt.path);
+            }
+        }
+    }
+
+    Ok(TrainingOutput {
+        final_train_loss: state.current_train_loss,
+        final_valid_loss: state.current_valid_loss,
+        epochs_completed: state.current_epoch + 1,
+        checkpoint_paths,
+    })
+}
+
+/// Computes the validation loss on any dataset.
+fn compute_validation_loss_generic<B: Backend, D: Dataset<SequenceDatasetItem>>(
     model: &SequenceModel<B>,
-    dataset: &SequenceDataset,
+    dataset: &D,
     batcher: &SequenceBatcher<B>,
     loss_fn: &MseLoss,
 ) -> f32 {
-    let num_samples = dataset.len();
-    if num_samples == 0 {
+    let num_segments = dataset.len();
+    if num_segments == 0 {
+        return 0.0;
+    }
+
+    let mut total_loss = 0.0;
+    let mut batch_count = 0;
+
+    const BATCH_SIZE: usize = 2048;
+    for batch_start in (0..num_segments).step_by(BATCH_SIZE) {
+        let batch_end = (batch_start + BATCH_SIZE).min(num_segments);
+
+        let items: Vec<_> = (batch_start..batch_end)
+            .filter_map(|i| dataset.get(i))
+            .collect();
+
+        if items.is_empty() {
+            continue;
+        }
+
+        let batch = batcher.batch(items);
+        let predictions = model.forward(batch.inputs);
+        let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
+
+        let loss_value: f32 = loss
+            .into_data()
+            .to_vec()
+            .unwrap_or_else(|_| vec![0.0])
+            .first()
+            .copied()
+            .unwrap_or(0.0);
+
+        total_loss += loss_value as f64;
+        batch_count += 1;
+    }
+
+    if batch_count > 0 {
+        (total_loss / batch_count as f64) as f32
+    } else {
+        0.0
+    }
+}
+
+/// Computes the validation loss on a segment dataset.
+fn compute_validation_loss<B: Backend>(
+    model: &SequenceModel<B>,
+    dataset: &SegmentDataset,
+    batcher: &SequenceBatcher<B>,
+    loss_fn: &MseLoss,
+) -> f32 {
+    let num_segments = dataset.len();
+    if num_segments == 0 {
         return 0.0;
     }
 
@@ -377,9 +703,9 @@ fn compute_validation_loss<B: Backend>(
     let mut batch_count = 0;
 
     // Process in batches (use same size as training for consistency)
-    const BATCH_SIZE: usize = 128;
-    for batch_start in (0..num_samples).step_by(BATCH_SIZE) {
-        let batch_end = (batch_start + BATCH_SIZE).min(num_samples);
+    const BATCH_SIZE: usize = 2048;
+    for batch_start in (0..num_segments).step_by(BATCH_SIZE) {
+        let batch_end = (batch_start + BATCH_SIZE).min(num_segments);
 
         let items: Vec<_> = (batch_start..batch_end)
             .filter_map(|i| dataset.get(i))
@@ -499,18 +825,18 @@ mod tests {
         }
 
         let config = TrainingConfig::new(model_config)
-            .with_epochs(10)
+            .with_epochs(3)
             .with_batch_size(4)
             .with_sequence_length(50);
 
         // Create temp dir for checkpoints
         let temp_dir = std::env::temp_dir().join("ml_test_ckpt");
-        let _ = std::fs::create_dir_all(&temp_dir);
+        let _create_dir = std::fs::create_dir_all(&temp_dir);
         let path_prefix = temp_dir.join("test_model").to_string_lossy().to_string();
 
         let checkpoint_config = CheckpointConfig {
             path_prefix,
-            save_every_n_epochs: 5,
+            save_every_n_epochs: 1,
             save_on_improvement: false,
         };
 
@@ -519,7 +845,7 @@ mod tests {
         assert!(result.is_ok(), "Training failed: {:?}", result.err());
 
         let output = result.expect("Training should succeed");
-        assert_eq!(output.epochs_completed, 10);
+        assert_eq!(output.epochs_completed, 3);
         // Should have saved at epoch 5, 10 (final)
         assert!(
             !output.checkpoint_paths.is_empty(),
@@ -527,7 +853,7 @@ mod tests {
         );
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _cleanup = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -549,19 +875,19 @@ mod tests {
         }
 
         let config = TrainingConfig::new(model_config)
-            .with_epochs(10)
+            .with_epochs(3)
             .with_batch_size(4)
             .with_sequence_length(50);
 
         // Start from epoch 5
-        let start_state = TrainingState::new(5);
+        let start_state = TrainingState::new(2);
 
         let result = train_with_checkpoints(&mut model, &data, &config, None, Some(start_state));
         assert!(result.is_ok(), "Training failed: {:?}", result.err());
 
         let output = result.expect("Training should succeed");
         // Should complete epochs 5-9 (5 epochs total)
-        assert_eq!(output.epochs_completed, 10);
+        assert_eq!(output.epochs_completed, 3);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use burn::data::dataset::Dataset;
 use burn::prelude::*;
-use feature_extractor::{FEATURE_COUNT, TOTAL_PLAYERS};
+use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 
 use crate::SequenceSample;
 
@@ -17,57 +17,167 @@ pub struct SequenceDatasetItem {
     pub sequence_length: usize,
 }
 
-/// Dataset for sequence training samples.
-pub struct SequenceDataset {
-    items: Vec<SequenceDatasetItem>,
-    target_sequence_length: usize,
+/// Metadata for a game, tracking how many segments it contains.
+#[derive(Debug, Clone)]
+struct GameMetadata {
+    /// Index into the samples vector.
+    sample_index: usize,
+    /// Number of segments this game can produce.
+    segment_count: usize,
+    /// Starting segment index in the global index space.
+    start_segment_index: usize,
 }
 
-impl SequenceDataset {
-    /// Creates a dataset from sequence samples.
+/// Dataset that generates consecutive-frame segments on-the-fly.
+///
+/// Instead of pre-computing all segments (which would use ~65GB for 1.2M segments),
+/// this dataset stores references to full games and extracts segments when accessed.
+///
+/// Each segment contains `segment_length` consecutive frames from a game.
+/// A 5-minute game (~9000 frames) with segment_length=90 produces ~100 segments.
+pub struct SegmentDataset {
+    /// Reference to the original samples (full games).
+    samples: Vec<SequenceSample>,
+    /// Metadata for each game (segment counts and index ranges).
+    game_metadata: Vec<GameMetadata>,
+    /// Number of consecutive frames per segment.
+    segment_length: usize,
+    /// Total number of segments across all games.
+    total_segments: usize,
+}
+
+impl SegmentDataset {
+    /// Creates a segment dataset from game samples.
     ///
     /// # Arguments
     ///
-    /// * `samples` - The sequence samples to include.
-    /// * `target_sequence_length` - The target sequence length for uniform batching.
-    pub fn new(samples: &[SequenceSample], target_sequence_length: usize) -> Self {
-        let items = samples
-            .iter()
-            .map(|sample| {
-                let sampled_frames = sample_frames(&sample.frames, target_sequence_length);
-                let mut features = Vec::with_capacity(target_sequence_length * FEATURE_COUNT);
-                for frame in &sampled_frames {
-                    features.extend_from_slice(&frame.features);
-                }
+    /// * `samples` - Full game samples (each with all frames).
+    /// * `segment_length` - Number of consecutive frames per segment.
+    pub fn new(samples: Vec<SequenceSample>, segment_length: usize) -> Self {
+        let mut game_metadata = Vec::with_capacity(samples.len());
+        let mut total_segments = 0;
 
-                SequenceDatasetItem {
-                    features,
-                    target_mmr: sample.target_mmr,
-                    sequence_length: sample.frames.len().min(target_sequence_length),
-                }
-            })
-            .collect();
+        for (idx, sample) in samples.iter().enumerate() {
+            // Calculate how many non-overlapping segments this game can produce
+            let segment_count = if sample.frames.len() >= segment_length {
+                sample.frames.len() / segment_length
+            } else {
+                // Games shorter than segment_length still produce 1 segment (padded)
+                1
+            };
+
+            game_metadata.push(GameMetadata {
+                sample_index: idx,
+                segment_count,
+                start_segment_index: total_segments,
+            });
+
+            total_segments += segment_count;
+        }
 
         Self {
-            items,
-            target_sequence_length,
+            samples,
+            game_metadata,
+            segment_length,
+            total_segments,
         }
     }
 
-    /// Returns the target sequence length.
+    /// Returns the segment length.
     #[must_use]
-    pub const fn target_sequence_length(&self) -> usize {
-        self.target_sequence_length
+    pub const fn segment_length(&self) -> usize {
+        self.segment_length
+    }
+
+    /// Returns the number of games in the dataset.
+    #[must_use]
+    pub const fn game_count(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Maps a global segment index to (game_index, local_segment_index).
+    fn index_to_game_segment(&self, index: usize) -> Option<(usize, usize)> {
+        // Binary search for the game containing this segment index
+        let game_idx = self
+            .game_metadata
+            .binary_search_by(|meta| {
+                if index < meta.start_segment_index {
+                    std::cmp::Ordering::Greater
+                } else if index >= meta.start_segment_index + meta.segment_count {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
+
+        let meta = self.game_metadata.get(game_idx)?;
+        let local_segment_idx = index - meta.start_segment_index;
+
+        Some((meta.sample_index, local_segment_idx))
+    }
+
+    /// Extracts a segment from a game.
+    fn extract_segment(&self, sample: &SequenceSample, segment_idx: usize) -> SequenceDatasetItem {
+        let start_frame = segment_idx * self.segment_length;
+
+        // Extract consecutive frames
+        let frames: Vec<&FrameFeatures> =
+            if start_frame + self.segment_length <= sample.frames.len() {
+                // Full segment available
+                sample
+                    .frames
+                    .get(start_frame..start_frame + self.segment_length)
+                    .unwrap_or(&[])
+                    .iter()
+                    .collect()
+            } else {
+                // Need to pad (short game or last partial segment)
+                let available = sample
+                    .frames
+                    .get(start_frame.min(sample.frames.len())..)
+                    .unwrap_or(&[]);
+                let mut frames: Vec<&FrameFeatures> = available.iter().collect();
+
+                // Pad with last frame if needed
+                if let Some(last) = sample.frames.last() {
+                    while frames.len() < self.segment_length {
+                        frames.push(last);
+                    }
+                } else {
+                    // Empty game - should not happen, but handle gracefully
+                    return SequenceDatasetItem {
+                        features: vec![0.0; self.segment_length * FEATURE_COUNT],
+                        target_mmr: sample.target_mmr,
+                        sequence_length: 0,
+                    };
+                }
+                frames
+            };
+
+        // Flatten features
+        let mut features = Vec::with_capacity(self.segment_length * FEATURE_COUNT);
+        for frame in &frames {
+            features.extend_from_slice(&frame.features);
+        }
+
+        SequenceDatasetItem {
+            features,
+            target_mmr: sample.target_mmr,
+            sequence_length: frames.len().min(self.segment_length),
+        }
     }
 }
 
-impl Dataset<SequenceDatasetItem> for SequenceDataset {
+impl Dataset<SequenceDatasetItem> for SegmentDataset {
     fn get(&self, index: usize) -> Option<SequenceDatasetItem> {
-        self.items.get(index).cloned()
+        let (sample_idx, segment_idx) = self.index_to_game_segment(index)?;
+        let sample = self.samples.get(sample_idx)?;
+        Some(self.extract_segment(sample, segment_idx))
     }
 
     fn len(&self) -> usize {
-        self.items.len()
+        self.total_segments
     }
 }
 
@@ -124,88 +234,111 @@ impl<B: Backend> SequenceBatcher<B> {
     }
 }
 
-/// Samples frames uniformly to match a target sequence length.
-fn sample_frames(
-    frames: &[feature_extractor::FrameFeatures],
-    target_len: usize,
-) -> Vec<feature_extractor::FrameFeatures> {
-    if frames.is_empty() {
-        // Return default frames if empty
-        return vec![feature_extractor::FrameFeatures::default(); target_len];
-    }
-
-    if frames.len() <= target_len {
-        // Pad with last frame if too short
-        let mut result = frames.to_vec();
-        if let Some(last) = frames.last() {
-            while result.len() < target_len {
-                result.push(last.clone());
-            }
-        }
-        return result;
-    }
-
-    // Sample uniformly
-    let step = frames.len() as f64 / target_len as f64;
-    (0..target_len)
-        .map(|i| {
-            let idx = (i as f64 * step) as usize;
-            frames[idx.min(frames.len() - 1)].clone()
-        })
-        .collect()
-}
-
 #[cfg(test)]
+#[expect(clippy::float_cmp)]
 mod tests {
-    use feature_extractor::FrameFeatures;
-
     use super::*;
 
     #[test]
-    fn test_sequence_dataset_creation() {
+    fn test_segment_dataset_creation() {
+        // Create a game with 300 frames
+        let sample = SequenceSample {
+            frames: (0..300)
+                .map(|i| FrameFeatures {
+                    features: [i as f32; FEATURE_COUNT],
+                    time: i as f32 / 30.0,
+                })
+                .collect(),
+            target_mmr: [1500.0; TOTAL_PLAYERS],
+        };
+
+        let dataset = SegmentDataset::new(vec![sample], 90);
+
+        // 300 frames / 90 per segment = 3 segments
+        assert_eq!(dataset.len(), 3);
+        assert_eq!(dataset.game_count(), 1);
+    }
+
+    #[test]
+    fn test_segment_dataset_consecutive_frames() {
+        // Create a game with frames numbered by their index
+        let sample = SequenceSample {
+            frames: (0..270)
+                .map(|i| {
+                    let mut features = [0.0; FEATURE_COUNT];
+                    features[0] = i as f32; // Store frame index in first feature
+                    FrameFeatures {
+                        features,
+                        time: i as f32 / 30.0,
+                    }
+                })
+                .collect(),
+            target_mmr: [1500.0; TOTAL_PLAYERS],
+        };
+
+        let dataset = SegmentDataset::new(vec![sample], 90);
+
+        // Get segment 0 (frames 0-89)
+        let seg0 = dataset.get(0).expect("Should have segment 0");
+        assert_eq!(seg0.features[0], 0.0); // First frame of segment 0
+        assert_eq!(seg0.features[FEATURE_COUNT], 1.0); // Second frame (index 1)
+
+        // Get segment 1 (frames 90-179)
+        let seg1 = dataset.get(1).expect("Should have segment 1");
+        assert_eq!(seg1.features[0], 90.0); // First frame of segment 1
+
+        // Get segment 2 (frames 180-269)
+        let seg2 = dataset.get(2).expect("Should have segment 2");
+        assert_eq!(seg2.features[0], 180.0); // First frame of segment 2
+    }
+
+    #[test]
+    fn test_segment_dataset_multiple_games() {
         let samples = vec![
             SequenceSample {
-                frames: (0..100).map(|_| FrameFeatures::default()).collect(),
+                frames: (0..180).map(|_| FrameFeatures::default()).collect(), // 2 segments
                 target_mmr: [1000.0; TOTAL_PLAYERS],
             },
             SequenceSample {
-                frames: (0..200).map(|_| FrameFeatures::default()).collect(),
+                frames: (0..270).map(|_| FrameFeatures::default()).collect(), // 3 segments
                 target_mmr: [1500.0; TOTAL_PLAYERS],
+            },
+            SequenceSample {
+                frames: (0..90).map(|_| FrameFeatures::default()).collect(), // 1 segment
+                target_mmr: [2000.0; TOTAL_PLAYERS],
             },
         ];
 
-        let dataset = SequenceDataset::new(&samples, 50);
-        assert_eq!(dataset.len(), 2);
+        let dataset = SegmentDataset::new(samples, 90);
 
-        let item = dataset.get(0).expect("Should have item");
-        assert_eq!(item.features.len(), 50 * FEATURE_COUNT);
+        // Total: 2 + 3 + 1 = 6 segments
+        assert_eq!(dataset.len(), 6);
+
+        // Check that segments map to correct games
+        let seg0 = dataset.get(0).unwrap();
+        assert_eq!(seg0.target_mmr[0], 1000.0); // Game 0
+
+        let seg2 = dataset.get(2).unwrap();
+        assert_eq!(seg2.target_mmr[0], 1500.0); // Game 1
+
+        let seg5 = dataset.get(5).unwrap();
+        assert_eq!(seg5.target_mmr[0], 2000.0); // Game 2
     }
 
     #[test]
-    fn test_sample_frames_exact() {
-        let frames: Vec<FrameFeatures> = (0..100).map(|_| FrameFeatures::default()).collect();
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
-    }
+    fn test_segment_dataset_short_game() {
+        // Game shorter than segment length - should still work (padded)
+        let sample = SequenceSample {
+            frames: (0..50).map(|_| FrameFeatures::default()).collect(),
+            target_mmr: [1500.0; TOTAL_PLAYERS],
+        };
 
-    #[test]
-    fn test_sample_frames_downsample() {
-        let frames: Vec<FrameFeatures> = (0..1000).map(|_| FrameFeatures::default()).collect();
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
-    }
+        let dataset = SegmentDataset::new(vec![sample], 90);
 
-    #[test]
-    fn test_sample_frames_pad() {
-        let frames: Vec<FrameFeatures> = (0..30).map(|_| FrameFeatures::default()).collect();
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
-    }
+        // Short game still produces 1 segment
+        assert_eq!(dataset.len(), 1);
 
-    #[test]
-    fn test_sample_frames_empty() {
-        let frames: Vec<FrameFeatures> = vec![];
-        let sampled = sample_frames(&frames, 100);
-        assert_eq!(sampled.len(), 100);
+        let seg = dataset.get(0).unwrap();
+        assert_eq!(seg.features.len(), 90 * FEATURE_COUNT);
     }
 }

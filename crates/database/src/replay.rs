@@ -148,6 +148,75 @@ pub async fn list_replays_by_rank(
     }
 }
 
+/// Samples replays evenly across all ranks in a deterministic way.
+///
+/// Attempts to get approximately `target_count / num_ranks` replays per rank.
+/// If a rank doesn't have enough replays, it returns all available replays for that rank.
+///
+/// Only returns replays that are:
+/// - Flagged as training (dataset_split = 'training')
+/// - Have the specified download status (defaults to `Downloaded`)
+///
+/// Results are ordered by id for deterministic output across test runs.
+///
+/// # Arguments
+///
+/// * `target_count` - Target total number of replays to sample.
+/// * `status` - Optional download status filter (defaults to `Downloaded`).
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn list_replays_sampled(target_count: usize) -> Result<Vec<Replay>, sqlx::Error> {
+    let pool = get_pool();
+
+    // Get all ranks (excluding unranked for better distribution)
+    let ranks: Vec<Rank> = Rank::all_ranked().collect();
+    let num_ranks = ranks.len();
+
+    if num_ranks == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Calculate how many replays per rank (round up to ensure we get at least target_count)
+    let per_rank = target_count.div_ceil(num_ranks);
+
+    let mut all_replays = Vec::new();
+
+    // Sample from each rank deterministically (ordered by id)
+    for rank in ranks {
+        let rank_replays = sqlx::query_as!(
+            Replay,
+            r#"
+            SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+                   download_status as "download_status: DownloadStatus", file_path, error_message,
+                   dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
+            FROM replays
+            WHERE rank = $1 
+              AND download_status = 'downloaded'
+            ORDER BY id
+            LIMIT $2
+            "#,
+            rank as Rank,
+            per_rank as i64
+        )
+        .fetch_all(pool)
+        .await?;
+
+        all_replays.extend(rank_replays);
+    }
+
+    // Sort all replays by id to ensure deterministic ordering
+    all_replays.sort_by_key(|r| r.id);
+
+    // Truncate to target_count if we have more
+    if all_replays.len() > target_count {
+        all_replays.truncate(target_count);
+    }
+
+    Ok(all_replays)
+}
+
 /// Lists replays pending download (status = `not_downloaded`).
 ///
 /// # Errors

@@ -31,7 +31,8 @@ csv = { version = "1.4" }
 dotenvy = { version = "0.15" }
 governor = { version = "0.10.4" }
 object_store = { version = "0.13.0" }
-reqwest = { version = "0.12.28", features = ["json"] }
+parking_lot = { version = "0.12.5" }
+reqwest = { version = "0.13.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.148" }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "migrate", "uuid", "chrono", "json"] }
@@ -69,6 +70,7 @@ cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
+doc_markdown = "allow"
 if_not_else = "allow"
 option_if_let_else = "allow"
 items_after_statements = "allow"
@@ -121,7 +123,6 @@ redundant_type_annotations = "warn"
 ref_patterns = "warn"
 rest_pat_in_fully_bound_structs = "warn"
 same_name_method = "warn"
-std_instead_of_core = "warn"
 string_slice = "warn"
 tests_outside_test_module = "warn"
 todo = "warn"

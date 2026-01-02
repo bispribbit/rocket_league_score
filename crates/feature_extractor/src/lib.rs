@@ -756,32 +756,24 @@ pub fn extract_game_sequence(
     // Track score state as we iterate through frames
     let mut blue_score = 0;
     let mut orange_score = 0;
-    let mut last_goal_frame: Option<usize> = None;
+    let mut last_goal_time: Option<f32> = None;
 
-    // Extract features from all frames with score tracking
+    // Extract features from ALL frames with score tracking
     let frame_features: Vec<FrameFeatures> = frames
         .iter()
         .enumerate()
         .map(|(frame_idx, frame)| {
-            // Check if a goal was scored at this frame
+            // Check for goals at this frame
             if let Some(goal) = goal_map.get(&frame_idx) {
                 match goal.player_team {
                     Team::Blue => blue_score += 1,
                     Team::Orange => orange_score += 1,
                 }
-                last_goal_frame = Some(frame_idx);
+                last_goal_time = Some(frame.time);
             }
 
             // Calculate time since last goal
-            let time_since_last_goal = if let Some(last_frame) = last_goal_frame {
-                if frame_idx >= last_frame {
-                    Some(frame.time - frames[last_frame].time)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let time_since_last_goal = last_goal_time.map(|goal_time| frame.time - goal_time);
 
             // Create score context
             let score_context = ScoreContext {
@@ -921,7 +913,7 @@ pub fn extract_segment_samples(
 mod tests {
     use std::sync::Arc;
 
-    use replay_structs::{ActorState, BallState, RankDivision, Team};
+    use replay_structs::{ActorState, BallState, Team};
 
     use super::*;
 
