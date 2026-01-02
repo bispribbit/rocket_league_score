@@ -246,10 +246,9 @@ where
             // (fewer batches per epoch now with larger batch size)
             if batch_count % 20 == 0 {
                 let avg_loss_so_far = epoch_loss / batch_count as f64;
-                let total_batches = (num_samples + config.batch_size - 1) / config.batch_size;
+                let total_batches = num_samples.div_ceil(config.batch_size);
                 println!(
-                    "  Batch {batch_count}/{total_batches}, avg_loss = {:.6}",
-                    avg_loss_so_far
+                    "  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}"
                 );
             }
 

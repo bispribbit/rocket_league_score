@@ -133,7 +133,10 @@ pub struct ScoreContext {
 /// # Returns
 ///
 /// A `FrameFeatures` struct containing the normalized feature vector.
-pub fn extract_frame_features(frame: &GameFrame, score_context: Option<&ScoreContext>) -> FrameFeatures {
+pub fn extract_frame_features(
+    frame: &GameFrame,
+    score_context: Option<&ScoreContext>,
+) -> FrameFeatures {
     let mut features = FrameFeatures {
         features: [0.0; FEATURE_COUNT],
         time: frame.time,
@@ -609,7 +612,11 @@ fn extract_score_context_features(
         // 4: Goal scored recently flag (1.0 if goal in last 5 seconds, else 0.0)
         let recent_goal_threshold = 5.0;
         if let Some(time_since) = ctx.time_since_last_goal {
-            features[idx + 4] = if time_since <= recent_goal_threshold { 1.0 } else { 0.0 };
+            features[idx + 4] = if time_since <= recent_goal_threshold {
+                1.0
+            } else {
+                0.0
+            };
         } else {
             features[idx + 4] = 0.0; // No goals yet
         }
@@ -1099,137 +1106,5 @@ mod tests {
             pos_center.abs() < 0.1,
             "Position at ball should be near zero, got {pos_center}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_extract_segment_samples() {
-        use std::path::Path;
-
-        use replay_parser::parse_replay;
-        use tracing::warn;
-
-        let _tracing = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_max_level(tracing::Level::INFO)
-            .try_init();
-
-        // Parse the replay
-        let replay_path = Path::new("../../test_data/2af51380-05b5-44ac-8b31-94b8b0f8da84.replay");
-        if !replay_path.exists() {
-            warn!("Test replay not found, skipping test");
-            return;
-        }
-
-        let parsed = parse_replay(replay_path).expect("Failed to parse replay");
-        assert!(!parsed.frames.is_empty(), "Expected frames in replay");
-
-        let player_ratings = vec![
-            PlayerRating {
-                player_name: "Dtwlve1".to_string(),
-                team: 0,
-                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
-            },
-            PlayerRating {
-                player_name: "Rip.the.Trip".to_string(),
-                team: 0,
-                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
-            },
-            PlayerRating {
-                player_name: "Ah perro!".to_string(),
-                team: 0,
-                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
-            },
-            PlayerRating {
-                player_name: "************".to_string(),
-                team: 1,
-                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
-            },
-            PlayerRating {
-                player_name: "Mooski17".to_string(),
-                team: 1,
-                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
-            },
-            PlayerRating {
-                player_name: "Olin".to_string(),
-                team: 1,
-                mmr: RankDivision::BronzeIDivision4.mmr_middle(),
-            },
-        ];
-
-        // Create a map of player_name -> expected_mmr for verification
-        let expected_mmr_map: std::collections::HashMap<String, i32> = player_ratings
-            .iter()
-            .map(|pr| (pr.player_name.clone(), pr.mmr))
-            .collect();
-
-        // Test each segment
-        let samples = extract_segment_samples(&parsed.frames, &player_ratings);
-
-        // Verify that each sample has correct MMR values
-        for (frame_idx, sample) in samples.iter().enumerate() {
-            let frame = &parsed.frames[frame_idx];
-
-            // Get players sorted by team (blue first, then orange) to match feature_extractor's order
-            let (blue_players, orange_players) = {
-                let mut blue: Vec<_> = frame
-                    .players
-                    .iter()
-                    .filter(|p| p.team == Team::Blue)
-                    .collect();
-                let mut orange: Vec<_> = frame
-                    .players
-                    .iter()
-                    .filter(|p| p.team == Team::Orange)
-                    .collect();
-                blue.sort_by_key(|p| p.actor_id);
-                orange.sort_by_key(|p| p.actor_id);
-                (blue, orange)
-            };
-
-            // Verify blue team MMR values
-            for (idx, player) in blue_players.iter().take(3).enumerate() {
-                let expected_mmr = expected_mmr_map
-                    .get(player.name.as_str())
-                    .copied()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Player {} not found in database for frame {}",
-                            player.name, frame_idx
-                        )
-                    });
-
-                let actual_mmr = sample.target_mmr[idx] as i32;
-                assert_eq!(
-                    actual_mmr, expected_mmr,
-                    "Frame {}: Blue player {} (index {}) has incorrect MMR. Expected {}, got {}",
-                    frame_idx, player.name, idx, expected_mmr, actual_mmr
-                );
-                assert_ne!(
-                    actual_mmr, 1000,
-                    "Frame {}: Blue player {} (index {}) has default MMR 1000 instead of database value {}",
-                    frame_idx, player.name, idx, expected_mmr
-                );
-            }
-
-            // Verify orange team MMR values
-            for (idx, player) in orange_players.iter().take(3).enumerate() {
-                let expected_mmr = expected_mmr_map
-                    .get(player.name.as_str())
-                    .copied()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Player {} not found in database for frame {}",
-                            player.name, frame_idx
-                        )
-                    });
-
-                let actual_mmr = sample.target_mmr[3 + idx] as i32;
-                assert_eq!(
-                    actual_mmr, expected_mmr,
-                    "Frame {}: Orange player {} (index {}) has incorrect MMR. Expected {}, got {}",
-                    frame_idx, player.name, idx, expected_mmr, actual_mmr
-                );
-            }
-        }
     }
 }

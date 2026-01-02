@@ -10,23 +10,23 @@
 //!   cargo run --example pipeline
 //!
 //! Environment Variables:
-//!   DATABASE_URL     - PostgreSQL connection string (required)
-//!   MODEL_NAME       - Model name for saving (default: lstm_v1)
-//!   TRAIN_RATIO      - Training set ratio (default: 0.9)
+//!   `DATABASE_URL`     - `PostgreSQL` connection string (required)
+//!   `MODEL_NAME`       - Model name for saving (default: `lstm_v1`)
+//!   `TRAIN_RATIO`      - Training set ratio (default: 0.9)
 //!   EPOCHS           - Number of epochs (default: 100)
-//!   BATCH_SIZE       - Batch size (default: 32)
-//!   LEARNING_RATE    - Learning rate (default: 0.001)
+//!   `BATCH_SIZE`       - Batch size (default: 32)
+//!   `LEARNING_RATE`    - Learning rate (default: 0.001)
 //!   RESUME           - Resume from checkpoint (default: false)
 //!
 //! Example:
-//!   DATABASE_URL=postgres://... EPOCHS=50 cargo run --example pipeline
+//!   `DATABASE_URL=postgres`://... EPOCHS=50 cargo run --example pipeline
 
 use anyhow::Result;
 use database::initialize_pool;
 use rocket_league_score::commands;
 use tracing_subscriber::EnvFilter;
 
-fn get_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
+fn get_env_or_default<T: core::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
         .and_then(|s| s.parse().ok())

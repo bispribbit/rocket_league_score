@@ -1,16 +1,16 @@
 //! Example: Verify downloaded replays exist on disk.
 //!
 //! This script:
-//! - Selects all replays where download_status = 'downloaded'
+//! - Selects all replays where `download_status` = 'downloaded'
 //! - Checks if each file path exists on disk
-//! - Marks replays as 'not_downloaded' if the file doesn't exist
+//! - Marks replays as '`not_downloaded`' if the file doesn't exist
 //!
 //! Usage:
-//!   cargo run --example verify_downloaded_replays
+//!   cargo run --example `verify_downloaded_replays`
 //!
 //! Environment Variables:
-//!   DATABASE_URL - PostgreSQL connection string (required)
-//!   REPLAY_BASE_PATH - Base path for replay files (required)
+//!   `DATABASE_URL` - `PostgreSQL` connection string (required)
+//!   `REPLAY_BASE_PATH` - Base path for replay files (required)
 
 use std::path::PathBuf;
 
