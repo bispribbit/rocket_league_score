@@ -119,7 +119,7 @@ impl BallchasingClient {
         let count = count.min(200); // API max is 200
 
         let mut url = format!(
-            "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=upload-date&sort-dir=desc"
+            "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=created&sort-dir=desc"
         );
 
         if let Some(before_date) = before {

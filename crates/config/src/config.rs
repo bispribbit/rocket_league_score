@@ -5,8 +5,9 @@ use anyhow::Context;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 
-/// Global object store instance, lazily initialized.
-pub static OBJECT_STORE: LazyLock<Arc<dyn ObjectStore>> = LazyLock::new(|| {
+/// Returns the base path for the object store.
+#[must_use]
+pub fn get_base_path() -> PathBuf {
     dotenvy::dotenv().ok();
 
     #[cfg(target_os = "linux")]
@@ -15,8 +16,12 @@ pub static OBJECT_STORE: LazyLock<Arc<dyn ObjectStore>> = LazyLock::new(|| {
     #[cfg(target_os = "windows")]
     let base_path_unwrap = PathBuf::from(r"C:\GitHub\rocket_league_score\ballchasing");
 
-    let base_path =
-        std::env::var("REPLAY_BASE_PATH").map_or_else(|_| base_path_unwrap, PathBuf::from);
+    std::env::var("REPLAY_BASE_PATH").map_or_else(|_| base_path_unwrap, PathBuf::from)
+}
+
+/// Global object store instance, lazily initialized.
+pub static OBJECT_STORE: LazyLock<Arc<dyn ObjectStore>> = LazyLock::new(|| {
+    let base_path = get_base_path();
 
     std::fs::create_dir_all(&base_path).expect("Failed to create object store directory");
 

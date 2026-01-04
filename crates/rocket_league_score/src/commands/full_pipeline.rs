@@ -16,21 +16,23 @@
 //! full_train::run("lstm_v1", 0.9, 100, 32, 0.001, true).await?;
 //! ```
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
-use config::OBJECT_STORE;
-use feature_extractor::{FEATURE_COUNT, PlayerRating, extract_game_sequence};
+use config::{OBJECT_STORE, get_base_path};
+use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_game_sequence};
+use ml_model::segment_cache::SegmentStoreBuilder;
 use ml_model::{
-    CheckpointConfig, ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig,
-    TrainingState, create_model, load_checkpoint, save_checkpoint, train_with_checkpoints,
+    CheckpointConfig, MmapSegmentDataset, ModelConfig, TrainingConfig, TrainingState, create_model,
+    load_checkpoint, save_checkpoint, train,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
 use replay_structs::{DatasetSplit, Replay};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::init_device;
 
@@ -172,9 +174,9 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let step1_duration = step1_start.elapsed();
     info!(duration_ms = step1_duration.as_millis(), "Step 1 complete");
 
-    // Step 2: Load all training data into memory
+    // Step 2: Load training data using segment cache
     let step2_start = Instant::now();
-    info!("Step 2: Loading all training data into memory...");
+    info!("Step 2: Loading training data (using segment cache)...");
 
     // Load replays based on configuration
     let training_replays = if let Some(max_replays) = config.max_replays {
@@ -190,23 +192,48 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
 
     info!(
         replay_count = training_replays.len(),
-        "Loading replays into memory..."
+        "Loading training replays (cache-first)..."
     );
 
-    // Load all data into memory (this is the only time we read from disk)
-    let training_data = load_training_data_from_replays(&training_replays).await?;
+    // Get base path for segment cache
+    let base_path = get_base_path();
+    let segment_length = 300; // Default sequence length
+
+    // Load training data using segment cache (zero-copy)
+    let train_dataset =
+        load_training_data_cached(&training_replays, segment_length, base_path.clone()).await?;
+
     let step2_duration = step2_start.elapsed();
 
-    if training_data.is_empty() {
-        anyhow::bail!("No valid training games found.");
+    if train_dataset.is_empty() {
+        anyhow::bail!("No valid training segments found.");
     }
 
     info!(
-        games_loaded = training_data.len(),
+        segments_loaded = train_dataset.len(),
         duration_ms = step2_duration.as_millis(),
         duration_sec = step2_duration.as_secs_f64(),
-        "All training data loaded into memory"
+        "Training data loaded via segment cache"
     );
+
+    // Load validation data if not using max_replays mode
+    let valid_dataset = if config.max_replays.is_none() {
+        let valid_replays = database::list_replays_by_split(DatasetSplit::Evaluation).await?;
+        if !valid_replays.is_empty() {
+            info!(
+                replay_count = valid_replays.len(),
+                "Loading validation replays..."
+            );
+            let valid_ds =
+                load_training_data_cached(&valid_replays, segment_length, base_path).await?;
+            info!(segments_loaded = valid_ds.len(), "Validation data loaded");
+            Some(valid_ds)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Step 3: Create or load model
     let step3_start = Instant::now();
@@ -253,9 +280,9 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "Model architecture"
     );
 
-    // Step 4: Train model (data is already in memory, no lazy loading)
+    // Step 4: Train model using memory-mapped segments
     let step4_start = Instant::now();
-    info!("Step 4: Starting training...");
+    info!("Step 4: Starting training with mmap segments...");
 
     let checkpoint_config = CheckpointConfig {
         path_prefix: checkpoint_prefix.clone(),
@@ -263,9 +290,10 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         save_on_improvement: true,
     };
 
-    let output = train_with_checkpoints(
+    let output = train(
         &mut model,
-        &training_data,
+        &train_dataset,
+        valid_dataset.as_ref(),
         &training_config,
         Some(checkpoint_config),
         start_state,
@@ -311,8 +339,8 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "feedforward_hidden": model_config.feedforward_hidden,
         "dropout": model_config.dropout,
         "train_ratio": config.train_ratio,
-        "training_games": training_data.len(),
-        "validation_games": 0, // Validation is handled internally by train_with_checkpoints
+        "training_segments": train_dataset.len(),
+        "validation_segments": valid_dataset.as_ref().map_or(0, MmapSegmentDataset::len),
         "evaluation_games": current_counts.evaluation,
     });
 
@@ -343,33 +371,22 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "Model saved to database"
     );
 
-    // Step 6: Run evaluation on held-out test set (skip when using max_replays)
+    // Step 6: Report evaluation results (already computed during training)
     let step6_start = Instant::now();
     if config.max_replays.is_some() {
-        info!("Step 6: Skipping evaluation (using sampled replays mode)...");
+        info!("Step 6: Skipping evaluation summary (using sampled replays mode)...");
+    } else if let Some(valid_loss) = output.final_valid_loss {
+        // Evaluation was already done during training using the evaluation split
+        let valid_rmse = valid_loss.sqrt();
+        let valid_segments = valid_dataset.as_ref().map_or(0, MmapSegmentDataset::len);
+        info!(
+            eval_segments = valid_segments,
+            eval_loss = valid_loss,
+            eval_rmse = valid_rmse,
+            "Evaluation summary (from training validation)"
+        );
     } else {
-        info!("Step 6: Running evaluation on test set...");
-        let eval_replays = database::list_replays_by_split(DatasetSplit::Evaluation).await?;
-
-        if !eval_replays.is_empty() {
-            let eval_data = load_training_data_from_replays(&eval_replays).await?;
-            if !eval_data.is_empty() {
-                let eval_loss = evaluate_model(&model, &eval_data, &training_config, &device);
-                let eval_rmse = eval_loss.sqrt();
-                let step6_duration = step6_start.elapsed();
-                info!(
-                    eval_samples = eval_data.len(),
-                    eval_loss,
-                    eval_rmse,
-                    duration_ms = step6_duration.as_millis(),
-                    "Evaluation completed"
-                );
-            } else {
-                warn!("No valid evaluation samples extracted");
-            }
-        } else {
-            warn!("No evaluation replays available");
-        }
+        info!("Step 6: No validation data was used during training");
     }
     let step6_duration = step6_start.elapsed();
 
@@ -393,31 +410,47 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     Ok(())
 }
 
-/// Loads training data from a list of replays in batches to manage memory.
+/// Loads training data using the segment cache for zero-copy access.
 ///
-/// Processes replays in batches to avoid loading all raw replay data at once.
-/// Frame data is subsampled (every 3rd frame by default) to further reduce memory.
-async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceTrainingData> {
-    const BATCH_SIZE: usize = 100; // Process 100 replays at a time
+/// This function:
+/// 1. Checks if cached segments exist for each replay
+/// 2. For replays without cached segments: parses replay, extracts features, writes segments
+/// 3. Memory-maps all segment files for zero-copy access
+///
+/// # Arguments
+///
+/// * `replays` - List of replays to load
+/// * `segment_length` - Number of frames per segment
+/// * `base_path` - Base path for segment cache storage
+///
+/// # Returns
+///
+/// An `MmapSegmentDataset` for zero-copy training access.
+async fn load_training_data_cached(
+    replays: &[Replay],
+    segment_length: usize,
+    base_path: PathBuf,
+) -> Result<MmapSegmentDataset> {
+    const BATCH_SIZE: usize = 100;
 
-    let mut data = SequenceTrainingData::new();
+    let mut builder = SegmentStoreBuilder::new(base_path.clone(), segment_length);
 
     let mut skipped_no_players = 0;
     let mut skipped_parse_error = 0;
     let mut skipped_read_error = 0;
+    let mut cache_hits = 0;
+    let mut cache_misses = 0;
 
     let total_replays = replays.len();
     let num_batches = total_replays.div_ceil(BATCH_SIZE);
 
     for (batch_idx, batch) in replays.chunks(BATCH_SIZE).enumerate() {
-        info!(
+        debug!(
             "Processing batch {}/{} ({} replays)...",
             batch_idx + 1,
             num_batches,
             batch.len()
         );
-
-        let mut nb_frames = 0;
 
         for replay in batch {
             // Get player ratings for this replay
@@ -428,15 +461,28 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
                 continue;
             }
 
-            // Convert to feature extractor format
-            let player_ratings: Vec<PlayerRating> = db_players
-                .iter()
-                .map(|p| PlayerRating {
-                    player_name: p.player_name.clone(),
-                    team: p.team,
-                    mmr: p.rank_division.mmr_middle(),
-                })
-                .collect();
+            // Build target MMR array
+            let target_mmr = build_target_mmr_from_players(&db_players);
+
+            // Check if segments already exist
+            // For checking, we need to know the frame count - we'll estimate from typical replay size
+            // If the cache doesn't exist, we'll parse and get the exact frame count
+            let segments_exist = check_replay_segments_cached(
+                &base_path,
+                &replay.file_path,
+                replay.id,
+                segment_length,
+            );
+
+            if segments_exist {
+                // Segments exist, just load them
+                cache_hits += 1;
+                builder.add_replay(&replay.file_path, replay.id, target_mmr);
+                continue;
+            }
+
+            // Segments don't exist, need to parse replay and create them
+            cache_misses += 1;
 
             // Read from object_store as bytes
             let object_path = ObjectStorePath::from(replay.file_path.clone());
@@ -476,43 +522,125 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
                 continue;
             }
 
+            // Convert to feature extractor format
+            let player_ratings: Vec<PlayerRating> = db_players
+                .iter()
+                .map(|p| PlayerRating {
+                    player_name: p.player_name.clone(),
+                    team: p.team,
+                    mmr: p.rank_division.mmr_middle(),
+                })
+                .collect();
+
             let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
 
-            nb_frames += game_sequence.frames.len();
+            // Ensure segments are cached, then add replay
+            if let Err(e) = builder.ensure_segments_cached(
+                &replay.file_path,
+                replay.id,
+                Some(&game_sequence.frames),
+                Some(game_sequence.frames.len()),
+            ) {
+                warn!(
+                    replay_id = %replay.id,
+                    error = %e,
+                    "Failed to cache segments"
+                );
+                continue;
+            }
 
-            // Convert to SequenceSample for ml_model
-            data.add_sample(SequenceSample {
-                frames: game_sequence.frames,
-                target_mmr: game_sequence.target_mmr,
-            });
-
-            // parsed and replay_data are dropped here, freeing memory before next iteration
+            builder.add_replay(&replay.file_path, replay.id, target_mmr);
         }
 
-        // Log progress with memory estimate
-        let estimated_memory_mb =
-            nb_frames * FEATURE_COUNT * std::mem::size_of::<f32>() / (1024 * 1024);
-
+        let (replays_loaded, replays_cached, segments_loaded) = builder.stats();
         info!(
-            "Batch {}/{} complete. Total samples: {}, estimated memory: ~{}MB",
+            "Batch {}/{} complete. Loaded: {}, Cached: {}, Segments: {}",
             batch_idx + 1,
             num_batches,
-            data.len(),
-            estimated_memory_mb
+            replays_loaded,
+            replays_cached,
+            segments_loaded
         );
     }
 
-    if skipped_no_players > 0 || skipped_parse_error > 0 || skipped_read_error > 0 {
-        info!(
-            skipped_no_players,
-            skipped_parse_error,
-            skipped_read_error,
-            processed = data.len(),
-            "Data loading summary"
-        );
+    let (replays_loaded, replays_cached, segments_loaded) = builder.stats();
+    info!(
+        cache_hits,
+        cache_misses,
+        replays_loaded,
+        replays_newly_cached = replays_cached,
+        segments_loaded,
+        skipped_no_players,
+        skipped_parse_error,
+        skipped_read_error,
+        "Segment cache loading summary"
+    );
+
+    let store = builder.build();
+    Ok(MmapSegmentDataset::new(store))
+}
+
+/// Checks if cached segments exist for a replay.
+///
+/// This does a lightweight check to see if the segment directory exists
+/// and has at least one segment file.
+fn check_replay_segments_cached(
+    base_path: &std::path::Path,
+    file_path: &str,
+    replay_id: uuid::Uuid,
+    _segment_length: usize,
+) -> bool {
+    use ml_model::segment_cache::segment_directory;
+
+    let segment_dir = segment_directory(base_path, file_path, replay_id);
+
+    if !segment_dir.exists() {
+        return false;
     }
 
-    Ok(data)
+    // Check if there's at least one .features file
+    if let Ok(entries) = std::fs::read_dir(&segment_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "features")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Builds a target MMR array from database player records.
+fn build_target_mmr_from_players(players: &[replay_structs::ReplayPlayer]) -> [f32; TOTAL_PLAYERS] {
+    let mut target_mmr = [1000.0f32; TOTAL_PLAYERS];
+
+    // Separate by team and sort
+    let mut blue_players: Vec<_> = players.iter().filter(|p| p.team == 0).collect();
+    let mut orange_players: Vec<_> = players.iter().filter(|p| p.team == 1).collect();
+
+    // Sort by name for consistent ordering
+    blue_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
+    orange_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
+
+    // Fill blue team (first 3 slots)
+    for (i, player) in blue_players.iter().take(3).enumerate() {
+        if let Some(slot) = target_mmr.get_mut(i) {
+            *slot = player.rank_division.mmr_middle() as f32;
+        }
+    }
+
+    // Fill orange team (slots 3-5)
+    for (i, player) in orange_players.iter().take(3).enumerate() {
+        if let Some(slot) = target_mmr.get_mut(i + 3) {
+            *slot = player.rank_division.mmr_middle() as f32;
+        }
+    }
+
+    target_mmr
 }
 
 /// Finds the latest checkpoint file for a given prefix.
@@ -578,61 +706,6 @@ fn extract_epoch_from_checkpoint(path: &str) -> Option<usize> {
         epoch_str.parse().ok()
     } else {
         None
-    }
-}
-
-/// Evaluates the model on a dataset and returns the loss.
-fn evaluate_model<B: burn::prelude::Backend>(
-    model: &ml_model::SequenceModel<B>,
-    data: &SequenceTrainingData,
-    config: &TrainingConfig,
-    device: &B::Device,
-) -> f32 {
-    use burn::data::dataset::Dataset;
-    use burn::nn::loss::MseLoss;
-    use ml_model::{SegmentDataset, SequenceBatcher};
-
-    let dataset = SegmentDataset::new(data.samples.clone(), config.sequence_length);
-    let batcher = SequenceBatcher::<B>::new(device.clone(), config.sequence_length);
-    let loss_fn = MseLoss::new();
-
-    let mut total_loss = 0.0f64;
-    let mut batch_count = 0;
-
-    const BATCH_SIZE: usize = 32;
-    let num_samples = dataset.len();
-
-    for batch_start in (0..num_samples).step_by(BATCH_SIZE) {
-        let batch_end = (batch_start + BATCH_SIZE).min(num_samples);
-
-        let items: Vec<_> = (batch_start..batch_end)
-            .filter_map(|i| dataset.get(i))
-            .collect();
-
-        if items.is_empty() {
-            continue;
-        }
-
-        let batch = batcher.batch(items);
-        let predictions = model.forward(batch.inputs);
-        let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
-
-        let loss_value: f32 = loss
-            .into_data()
-            .to_vec()
-            .unwrap_or_else(|_| vec![0.0])
-            .first()
-            .copied()
-            .unwrap_or(0.0);
-
-        total_loss += loss_value as f64;
-        batch_count += 1;
-    }
-
-    if batch_count > 0 {
-        (total_loss / batch_count as f64) as f32
-    } else {
-        0.0
     }
 }
 

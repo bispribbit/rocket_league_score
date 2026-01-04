@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
     let log_file = std::fs::File::create("/workspace/target/logs/debug.log")
         .expect("Failed to create debug log file");
 
-    let env_filter = EnvFilter::new("debug");
+    let env_filter = EnvFilter::new("info");
 
     // Console layer
     let console_layer = fmt::layer()

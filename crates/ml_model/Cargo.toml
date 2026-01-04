@@ -12,4 +12,6 @@ feature_extractor.workspace = true
 
 anyhow.workspace = true
 burn.workspace = true
+memmap2.workspace = true
 tracing.workspace = true
+uuid.workspace = true

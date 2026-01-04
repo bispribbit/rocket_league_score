@@ -16,6 +16,7 @@
 //! The model outputs one MMR prediction per player per game/segment.
 
 mod dataset;
+pub mod segment_cache;
 mod training;
 
 use std::path::Path;
@@ -25,11 +26,9 @@ use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-pub use dataset::{SegmentDataset, SequenceBatcher, SequenceDatasetItem};
+pub use dataset::{MmapSegmentDataset, SequenceBatch, SequenceBatcher};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
-pub use training::{
-    CheckpointConfig, TrainingOutput, TrainingState, train, train_with_checkpoints,
-};
+pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};
 
 /// Configuration for the sequence model.
 #[derive(Config, Debug)]

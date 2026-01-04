@@ -4,6 +4,9 @@
 //! - Selects all replays where `download_status` = 'downloaded'
 //! - Checks if each file path exists on disk
 //! - Marks replays as '`not_downloaded`' if the file doesn't exist
+//! - Selects all replays where `download_status` = 'not_downloaded'
+//! - Checks if each file path exists on disk
+//! - Marks replays as '`downloaded`' if the file exists
 //!
 //! Usage:
 //!   cargo run --example `verify_downloaded_replays`
@@ -111,10 +114,72 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("\n=== Summary ===");
+    info!("\n=== Summary (Downloaded Replays) ===");
     info!("Total downloaded replays: {}", downloaded_replays.len());
     info!("Existing on disk:         {existing_count}");
     info!("Missing (marked as not_downloaded): {missing_count}");
+
+    // Select all replays where download_status = 'not_downloaded'
+    info!("\n=== Verify Not Downloaded Replays ===");
+    let not_downloaded_rows = sqlx::query!(
+        "
+        SELECT id, file_path
+        FROM replays
+        WHERE download_status = 'not_downloaded'
+        "
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let not_downloaded_replays: Vec<DownloadedReplay> = not_downloaded_rows
+        .into_iter()
+        .map(|row| DownloadedReplay {
+            id: row.id,
+            file_path: row.file_path,
+        })
+        .collect();
+
+    info!(
+        "Found {} replays with download_status = 'not_downloaded'\n",
+        not_downloaded_replays.len()
+    );
+
+    // Check each file path and mark as 'downloaded' if it exists
+    let mut found_count = 0;
+    let mut still_missing_count = 0;
+
+    for replay in &not_downloaded_replays {
+        let path = base_path.join(&replay.file_path);
+
+        if path.exists() {
+            info!("Found: {} (ID: {})", replay.file_path, replay.id);
+
+            // Mark as 'downloaded'
+            sqlx::query!(
+                "
+                UPDATE replays
+                SET download_status = $1, updated_at = NOW()
+                WHERE id = $2
+                ",
+                DownloadStatus::Downloaded as DownloadStatus,
+                replay.id
+            )
+            .execute(pool)
+            .await?;
+
+            found_count += 1;
+        } else {
+            still_missing_count += 1;
+        }
+    }
+
+    info!("\n=== Summary (Not Downloaded Replays) ===");
+    info!(
+        "Total not_downloaded replays: {}",
+        not_downloaded_replays.len()
+    );
+    info!("Found on disk (marked as downloaded): {found_count}");
+    info!("Still missing: {still_missing_count}");
 
     Ok(())
 }
