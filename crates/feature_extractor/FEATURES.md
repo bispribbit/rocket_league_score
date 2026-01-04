@@ -17,10 +17,9 @@ This document describes all features extracted from game frames for ML training 
 |----------|-------------------|-------|-------|
 | Ball State | 7 | 1 | 7 |
 | Player State | 13 | 6 | 78 |
-| Player Geometry | 9 | 6 | 54 |
-| Team Context | 3 | 2 | 6 |
-| Game Context | 2 | 1 | 2 |
-| **TOTAL** | | | **147** |
+| Player Geometry | 7 | 6 | 42 |
+| Game Context | 1 | 1 | 1 |
+| **TOTAL** | | | **128** |
 
 ---
 
@@ -71,51 +70,37 @@ For each player (indices relative to player offset):
 
 ---
 
-## 3. Player Geometry (9 features × 6 players = 54 features)
+## 3. Player Geometry (7 features × 6 players = 42 features)
 
 Derived geometric relationships for each player:
 
 | Offset | Feature | Range | Description |
 |--------|---------|-------|-------------|
 | 0 | `dist_to_ball` | [0, 1] | Distance to ball (normalized by field diagonal) |
-| 1 | `dist_to_own_goal` | [0, 1] | Distance to own goal |
-| 2 | `facing_ball` | [-1, 1] | Dot product of forward vector with direction to ball |
-| 3 | `goal_line_position` | [-1, 1] | Position on ball-to-goal line: -1=attacking, +1=defending |
-| 4 | `dist_to_teammate_1` | [0, 1] | Distance to 1st teammate (sorted by actor_id) |
-| 5 | `dist_to_teammate_2` | [0, 1] | Distance to 2nd teammate (sorted by actor_id) |
-| 6 | `dist_to_opponent_1` | [0, 1] | Distance to 1st opponent (sorted by actor_id) |
-| 7 | `dist_to_opponent_2` | [0, 1] | Distance to 2nd opponent (sorted by actor_id) |
-| 8 | `dist_to_opponent_3` | [0, 1] | Distance to 3rd opponent (sorted by actor_id) |
+| 1 | `facing_ball` | [-1, 1] | Dot product of forward vector with direction to ball |
+| 2 | `dist_to_teammate_1` | [0, 1] | Distance to 1st teammate (sorted by actor_id) |
+| 3 | `dist_to_teammate_2` | [0, 1] | Distance to 2nd teammate (sorted by actor_id) |
+| 4 | `dist_to_opponent_1` | [0, 1] | Distance to 1st opponent (sorted by actor_id) |
+| 5 | `dist_to_opponent_2` | [0, 1] | Distance to 2nd opponent (sorted by actor_id) |
+| 6 | `dist_to_opponent_3` | [0, 1] | Distance to 3rd opponent (sorted by actor_id) |
 
 **Index Mapping:**
-- Features 85-93: Blue Player 1
-- Features 94-102: Blue Player 2
-- Features 103-111: Blue Player 3
-- Features 112-120: Orange Player 1
-- Features 121-129: Orange Player 2
-- Features 130-138: Orange Player 3
+- Features 85-91: Blue Player 1
+- Features 92-98: Blue Player 2
+- Features 99-105: Blue Player 3
+- Features 106-112: Orange Player 1
+- Features 113-119: Orange Player 2
+- Features 120-126: Orange Player 3
 
 ---
 
-## 4. Team Context (3 features × 2 teams = 6 features)
+## 4. Game Context (1 feature)
 
 | Index | Feature | Range | Description |
 |-------|---------|-------|-------------|
-| 139 | `blue_centroid_x` | [-1, 1] | Average X position of blue team |
-| 140 | `blue_centroid_y` | [-1, 1] | Average Y position of blue team |
-| 141 | `blue_avg_boost` | [0, 1] | Average boost of blue team |
-| 142 | `orange_centroid_x` | [-1, 1] | Average X position of orange team |
-| 143 | `orange_centroid_y` | [-1, 1] | Average Y position of orange team |
-| 144 | `orange_avg_boost` | [0, 1] | Average boost of orange team |
+| 127 | `ball_dist_to_blue_goal` | [0, 1] | Distance from ball to blue goal |
 
----
-
-## 5. Game Context (2 features)
-
-| Index | Feature | Range | Description |
-|-------|---------|-------|-------------|
-| 145 | `ball_dist_to_blue_goal` | [0, 1] | Distance from ball to blue goal |
-| 146 | `ball_dist_to_orange_goal` | [0, 1] | Distance from ball to orange goal |
+Note: `ball_dist_to_orange_goal` is not necessary because it's perfectly negatively correlated with `ball_dist_to_blue_goal`.
 
 ---
 
@@ -139,15 +124,6 @@ const ORANGE_GOAL_Y: f32 = 5120.0;
 
 ---
 
-## Future Considerations (v2)
-
-Features we may add in future iterations:
-
-1. **Temporal features** - Rolling averages, velocity trends
-2. **Boost pad state** - Which pads are available
-3. **Touch history** - Who touched ball last, time since touch
-4. **Angular velocity** - Car rotation speed (recovery detection)
-5. **Challenge probability** - Predicted 50/50 outcomes
 
 ---
 
@@ -163,4 +139,3 @@ Features we may add in future iterations:
 - Run model forward pass
 - Output is predicted MMR/impact score
 - Update at ~30Hz for real-time display
-

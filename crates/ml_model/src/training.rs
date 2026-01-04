@@ -1,5 +1,7 @@
 //! Training logic for the sequence model.
 
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Instant;
 
 use burn::data::dataset::Dataset;
@@ -8,9 +10,9 @@ use burn::nn::loss::MseLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
-use tracing::info;
+use tracing::{error, info};
 
-use crate::dataset::{SegmentDataset, SequenceBatcher};
+use crate::dataset::{SegmentDataset, SequenceBatcher, SequenceDatasetItem};
 use crate::{SequenceModel, SequenceTrainingData, TrainingConfig, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
@@ -160,6 +162,9 @@ where
     let dataset = SegmentDataset::new(train_samples, config.sequence_length);
     let batcher = SequenceBatcher::<B>::new(device, config.sequence_length);
 
+    // Create Arc for dataset (used for prefetching across epochs)
+    let dataset_arc = Arc::new(dataset);
+
     // Create validation dataset if we have validation data
     let valid_dataset = if !valid_samples.is_empty() {
         Some(SegmentDataset::new(valid_samples, config.sequence_length))
@@ -183,12 +188,12 @@ where
     info!(
         "Starting training with {} games ({} train, {} valid)",
         data.len(),
-        dataset.game_count(),
+        dataset_arc.game_count(),
         valid_dataset.as_ref().map_or(0, SegmentDataset::game_count)
     );
     info!(
         "Total segments: {} train, {} valid (segment_length={})",
-        dataset.len(),
+        dataset_arc.len(),
         valid_segments,
         config.sequence_length
     );
@@ -213,33 +218,123 @@ where
         let mut batch_processing_time = std::time::Duration::ZERO;
         let mut data_loading_time = std::time::Duration::ZERO;
 
-        // Simple batching with shuffling
-        let num_samples = dataset.len();
+        // Set up prefetching: load next batch while GPU processes current one
+        let num_samples = dataset_arc.len();
         let mut indices: Vec<usize> = (0..num_samples).collect();
 
         // Shuffle indices using epoch as seed
         shuffle_indices(&mut indices, epoch as u64);
 
-        // Process batches
-        for batch_start in (0..num_samples).step_by(config.batch_size) {
+        // Clone config values needed in thread (they're Copy or cheap to clone)
+        let batch_size = config.batch_size;
+
+        let (prefetch_tx, prefetch_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        // Clone indices for prefetch thread (just Vec<usize>, cheap to clone)
+        let indices_for_prefetch = indices.clone();
+
+        // Spawn prefetch thread
+        let dataset_for_thread = Arc::clone(&dataset_arc);
+        let prefetch_thread = thread::spawn(move || {
+            let mut next_batch_idx = 0;
+            let total_batches = num_samples.div_ceil(batch_size);
+
+            loop {
+                // Wait for signal to prefetch next batch
+                if prefetch_rx.recv().is_err() {
+                    break; // Channel closed, exit thread
+                }
+
+                if next_batch_idx >= total_batches {
+                    // Signal that we're done
+                    _ = ready_tx.send(None);
+                    break;
+                }
+
+                let batch_start = next_batch_idx * batch_size;
+                let batch_end = (batch_start + batch_size).min(num_samples);
+                next_batch_idx += 1;
+
+                let Some(batch_indices) = indices_for_prefetch.get(batch_start..batch_end) else {
+                    _ = ready_tx.send(None);
+                    continue;
+                };
+
+                // Load batch items (CPU work)
+                let items: Vec<SequenceDatasetItem> = batch_indices
+                    .iter()
+                    .filter_map(|&i| dataset_for_thread.get(i))
+                    .collect();
+
+                if items.is_empty() {
+                    _ = ready_tx.send(None);
+                    continue;
+                }
+
+                // Send loaded items to main thread
+                _ = ready_tx.send(Some(items));
+            }
+        });
+
+        // Process batches with prefetching
+        let mut next_batch_items: Option<Vec<SequenceDatasetItem>> = None;
+        let mut batch_idx = 0;
+        let total_batches = num_samples.div_ceil(config.batch_size);
+
+        // Start prefetching the first batch immediately
+        if total_batches > 0
+            && let Err(err) = prefetch_tx.send(())
+        {
+            error!("Failed to prefetch first batch: {err}");
+        }
+
+        loop {
             let batch_start_time = Instant::now();
-            let batch_end = (batch_start + config.batch_size).min(num_samples);
-            let Some(batch_indices) = indices.get(batch_start..batch_end) else {
-                continue;
+
+            // Get current batch (prefetched if available, otherwise wait for it or load)
+            let items = if let Some(items) = next_batch_items.take() {
+                // Use prefetched batch (ideal case - no waiting!)
+                items
+            } else if batch_idx < total_batches {
+                // Prefetch not ready yet - wait for it (should be rare after first batch)
+                if let Ok(Some(items)) = ready_rx.recv() {
+                    items
+                } else {
+                    // Prefetch failed or thread ended, load synchronously
+                    let batch_start = batch_idx * batch_size;
+                    let batch_end = (batch_start + batch_size).min(num_samples);
+                    let Some(batch_indices) = indices.get(batch_start..batch_end) else {
+                        break;
+                    };
+
+                    let data_load_start = Instant::now();
+                    let items: Vec<_> = batch_indices
+                        .iter()
+                        .filter_map(|&i| dataset_arc.get(i))
+                        .collect();
+                    data_loading_time += data_load_start.elapsed();
+
+                    if items.is_empty() {
+                        break;
+                    }
+                    items
+                }
+            } else {
+                // No more batches
+                break;
             };
 
-            // Collect batch items
-            let data_load_start = Instant::now();
-            let items: Vec<_> = batch_indices
-                .iter()
-                .filter_map(|&i| dataset.get(i))
-                .collect();
-            data_loading_time += data_load_start.elapsed();
-
-            if items.is_empty() {
-                continue;
+            // Start prefetching next batch (if not the last one)
+            if batch_idx + 1 < total_batches {
+                _ = prefetch_tx.send(());
             }
 
+            // Update data loading time for prefetched batches (they were loaded in parallel)
+            // Note: We don't track this separately for prefetched vs sync loads,
+            // but the overall epoch time will show the improvement
+
+            // Create batch on GPU
             let batch = batcher.batch(items);
 
             // Forward pass
@@ -264,7 +359,6 @@ where
             // (fewer batches per epoch now with larger batch size)
             if batch_count % 20 == 0 {
                 let avg_loss_so_far = epoch_loss / batch_count as f64;
-                let total_batches = num_samples.div_ceil(config.batch_size);
                 info!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
             }
 
@@ -275,7 +369,27 @@ where
             // Update weights
             *model = optimizer.step(config.learning_rate, model.clone(), grads);
             batch_processing_time += batch_start_time.elapsed();
+
+            batch_idx += 1;
+
+            // Try to receive prefetched next batch (non-blocking)
+            // This happens while GPU is processing, so if it's ready we save time
+            if batch_idx < total_batches {
+                match ready_rx.try_recv() {
+                    Ok(Some(items)) => {
+                        next_batch_items = Some(items);
+                    }
+                    Ok(None)
+                    | Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                        // Prefetch returned empty, will load synchronously next iteration
+                    }
+                }
+            }
         }
+
+        // Clean up prefetch thread
+        drop(prefetch_tx);
+        _ = prefetch_thread.join();
 
         let epoch_duration = epoch_start.elapsed();
         state.current_train_loss = if batch_count > 0 {

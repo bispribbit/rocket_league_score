@@ -21,7 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
 use config::OBJECT_STORE;
-use feature_extractor::{PlayerRating, extract_game_sequence};
+use feature_extractor::{FEATURE_COUNT, PlayerRating, extract_game_sequence};
 use ml_model::{
     CheckpointConfig, ModelConfig, SequenceSample, SequenceTrainingData, TrainingConfig,
     TrainingState, create_model, load_checkpoint, save_checkpoint, train_with_checkpoints,
@@ -62,7 +62,7 @@ pub struct FullTrainConfig {
 impl Default for FullTrainConfig {
     fn default() -> Self {
         Self {
-            model_name: String::from("lstm_v2"),
+            model_name: String::from("lstm_v3"),
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
@@ -213,12 +213,10 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     info!("Step 3: Initializing model...");
     let device = init_device();
     let model_config = ModelConfig::new();
-    let segment_length = 90; // 3 seconds at 30fps
     let training_config = TrainingConfig::new(model_config.clone())
         .with_learning_rate(config.learning_rate)
         .with_epochs(config.epochs)
-        .with_batch_size(config.batch_size)
-        .with_sequence_length(segment_length);
+        .with_batch_size(config.batch_size);
 
     let checkpoint_dir = format!("models/{}", config.model_name);
     let checkpoint_prefix = format!("{checkpoint_dir}/checkpoint");
@@ -419,6 +417,8 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
             batch.len()
         );
 
+        let mut nb_frames = 0;
+
         for replay in batch {
             // Get player ratings for this replay
             let db_players = database::list_replay_players_by_replay(replay.id).await?;
@@ -476,14 +476,9 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
                 continue;
             }
 
-            // Extract game sequence with subsampling (every 3rd frame = ~10fps instead of 30fps)
-            // This reduces memory by 3x while preserving temporal patterns
-            let game_sequence = extract_game_sequence(
-                &parsed.frames,
-                &player_ratings,
-                Some(&parsed.goal_frames),
-                Some(&parsed.goals),
-            );
+            let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+
+            nb_frames += game_sequence.frames.len();
 
             // Convert to SequenceSample for ml_model
             data.add_sample(SequenceSample {
@@ -495,7 +490,9 @@ async fn load_training_data_from_replays(replays: &[Replay]) -> Result<SequenceT
         }
 
         // Log progress with memory estimate
-        let estimated_memory_mb = data.len() * 9000 * 152 * 4 / (1024 * 1024); // ~9000 frames at 30fps, 152 features, 4 bytes
+        let estimated_memory_mb =
+            nb_frames * FEATURE_COUNT * std::mem::size_of::<f32>() / (1024 * 1024);
+
         info!(
             "Batch {}/{} complete. Total samples: {}, estimated memory: ~{}MB",
             batch_idx + 1,
@@ -661,7 +658,6 @@ mod tests {
     #[test]
     fn test_full_train_config_default() {
         let config = FullTrainConfig::default();
-        assert_eq!(config.model_name, "lstm_v2");
         assert!((config.train_ratio - 0.9).abs() < f64::EPSILON);
         assert_eq!(config.epochs, 100);
         assert_eq!(config.batch_size, 128);

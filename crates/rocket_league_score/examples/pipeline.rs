@@ -11,7 +11,7 @@
 //!
 //! Environment Variables:
 //!   `DATABASE_URL`     - `PostgreSQL` connection string (required)
-//!   `MODEL_NAME`       - Model name for saving (default: `lstm_v2`)
+//!   `MODEL_NAME`       - Model name for saving (default: `lstm_v3`)
 //!   `TRAIN_RATIO`      - Training set ratio (default: 0.9)
 //!   EPOCHS           - Number of epochs (default: 100)
 //!   `BATCH_SIZE`       - Batch size (default: 32)
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Read configuration from environment
-    let model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "lstm_v2".to_string());
+    let model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "lstm_v3".to_string());
     let train_ratio: f64 = get_env_or_default("TRAIN_RATIO", 0.9);
     let epochs: usize = get_env_or_default("EPOCHS", 100);
     let batch_size: usize = get_env_or_default("BATCH_SIZE", 2048);

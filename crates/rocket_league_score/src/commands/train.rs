@@ -210,12 +210,7 @@ async fn load_training_data() -> Result<SequenceTrainingData> {
         }
 
         // Extract game sequence (one sample per replay)
-        let game_sequence = extract_game_sequence(
-            &parsed.frames,
-            &player_ratings,
-            Some(&parsed.goal_frames),
-            Some(&parsed.goals),
-        );
+        let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
 
         // Convert to SequenceSample for ml_model
         data.add_sample(SequenceSample {

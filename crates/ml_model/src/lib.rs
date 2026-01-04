@@ -66,9 +66,9 @@ pub struct TrainingConfig {
     #[config(default = 0.1)]
     pub validation_split: f64,
     /// Sequence length (number of frames per segment).
-    /// At 30fps, 90 frames = 3 seconds of gameplay.
+    /// At 30fps, 300 frames = 10 seconds of gameplay.
     /// Each game is split into non-overlapping segments of this length.
-    #[config(default = 90)]
+    #[config(default = 300)]
     pub sequence_length: usize,
 }
 
