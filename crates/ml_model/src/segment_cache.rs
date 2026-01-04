@@ -710,13 +710,16 @@ mod tests {
     #[test]
     fn test_segment_directory() {
         let base = Path::new("/workspace/ballchasing");
-        let file_path = "replays/ranked-standard/bronze-1/abc123.replay";
+        let file_path =
+            "replays/ranked-standard/bronze-1/550e8400-e29b-41d4-a716-446655440000.replay";
         let replay_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
 
         let dir = segment_directory(base, file_path, replay_id);
         assert_eq!(
             dir,
-            PathBuf::from("/workspace/ballchasing/segments/ranked-standard/bronze-1/abc123")
+            PathBuf::from(
+                "/workspace/ballchasing/segments/ranked-standard/bronze-1/550e8400-e29b-41d4-a716-446655440000"
+            )
         );
     }
 
