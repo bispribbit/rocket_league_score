@@ -1,0 +1,186 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata,\n                   download_status as \"download_status: DownloadStatus\", file_path, error_message,\n                   dataset_split as \"dataset_split: DatasetSplit\", created_at, updated_at\n            FROM replays\n            WHERE rank = $1 \n              AND download_status = 'downloaded'\n            ORDER BY id\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "game_mode: GameMode",
+        "type_info": {
+          "Custom": {
+            "name": "game_mode",
+            "kind": {
+              "Enum": [
+                "unranked_duels",
+                "unranked_doubles",
+                "unranked_standard",
+                "unranked_chaos",
+                "private",
+                "season",
+                "offline",
+                "ranked_duels",
+                "ranked_doubles",
+                "ranked_solo_standard",
+                "ranked_standard",
+                "snowday",
+                "rocketlabs",
+                "hoops",
+                "rumble",
+                "tournament",
+                "dropshot",
+                "ranked_hoops",
+                "ranked_rumble",
+                "ranked_dropshot",
+                "ranked_snowday",
+                "dropshot_rumble",
+                "heatseeker"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "rank: Rank",
+        "type_info": {
+          "Custom": {
+            "name": "rank",
+            "kind": {
+              "Enum": [
+                "unranked",
+                "bronze1",
+                "bronze2",
+                "bronze3",
+                "silver1",
+                "silver2",
+                "silver3",
+                "gold1",
+                "gold2",
+                "gold3",
+                "platinum1",
+                "platinum2",
+                "platinum3",
+                "diamond1",
+                "diamond2",
+                "diamond3",
+                "champion1",
+                "champion2",
+                "champion3",
+                "grand_champion"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "download_status: DownloadStatus",
+        "type_info": {
+          "Custom": {
+            "name": "download_status",
+            "kind": {
+              "Enum": [
+                "not_downloaded",
+                "in_progress",
+                "downloaded",
+                "failed"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "file_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "dataset_split: DatasetSplit",
+        "type_info": {
+          "Custom": {
+            "name": "dataset_split",
+            "kind": {
+              "Enum": [
+                "training",
+                "evaluation"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "rank",
+            "kind": {
+              "Enum": [
+                "unranked",
+                "bronze1",
+                "bronze2",
+                "bronze3",
+                "silver1",
+                "silver2",
+                "silver3",
+                "gold1",
+                "gold2",
+                "gold3",
+                "platinum1",
+                "platinum2",
+                "platinum3",
+                "diamond1",
+                "diamond2",
+                "diamond3",
+                "champion1",
+                "champion2",
+                "champion3",
+                "grand_champion"
+              ]
+            }
+          }
+        },
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "2c8f55669e3340c9af85c7f1399db69c26df90861bda765dbd9df02749c1d5dc"
+}
