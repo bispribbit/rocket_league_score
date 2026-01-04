@@ -17,6 +17,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -290,9 +291,11 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         save_on_improvement: true,
     };
 
+    // Wrap training dataset in Arc for the prefetcher to share across threads
+    let train_dataset = Arc::new(train_dataset);
     let output = train(
         &mut model,
-        &train_dataset,
+        Arc::clone(&train_dataset),
         valid_dataset.as_ref(),
         &training_config,
         Some(checkpoint_config),

@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Configuration for quick testing
-    let num_replays: usize = 1_000;
+    let num_replays: usize = 200;
 
     info!("=== Full Pipeline Test ===");
     info!("Testing with {num_replays} replays");

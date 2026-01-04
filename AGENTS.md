@@ -24,6 +24,8 @@ fn something() -> HashMap<String, Vec<Player>>
 }
 ```
 
+Before finishing, run cargo fmt --all
+
 # Sqlx
 Always use the query! and query_as! macros instead of query, query_as unelss you absolutely must use a QueryBuilder.
 Run sqlx migrate run in crates/database when you generate a new schema before trying to compile

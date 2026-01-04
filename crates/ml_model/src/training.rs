@@ -1,5 +1,6 @@
 //! Training logic for the sequence model.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use burn::module::AutodiffModule;
@@ -9,7 +10,7 @@ use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use tracing::info;
 
-use crate::dataset::{MmapSegmentDataset, SequenceBatcher};
+use crate::dataset::{BatchPrefetcher, MmapSegmentDataset, SequenceBatcher};
 use crate::{SequenceModel, TrainingConfig, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
@@ -86,6 +87,13 @@ pub struct TrainingOutput {
     pub checkpoint_paths: Vec<String>,
 }
 
+/// Number of batches to prefetch ahead (keep GPU fed while loading next batches).
+const PREFETCH_COUNT: usize = 4;
+
+/// How often to sync with GPU to extract loss value (every N batches).
+/// Higher values = better GPU utilization but less frequent progress updates.
+const LOSS_SYNC_INTERVAL: usize = 10;
+
 /// Trains the sequence model using memory-mapped segment data.
 ///
 /// This training method uses zero-copy access to cached feature segments.
@@ -105,7 +113,7 @@ pub struct TrainingOutput {
 /// Returns an error if training fails.
 pub fn train<B: AutodiffBackend>(
     model: &mut SequenceModel<B>,
-    train_dataset: &MmapSegmentDataset,
+    train_dataset: Arc<MmapSegmentDataset>,
     valid_dataset: Option<&MmapSegmentDataset>,
     config: &TrainingConfig,
     checkpoint_config: Option<CheckpointConfig>,
@@ -119,7 +127,6 @@ where
     }
 
     let device = model.linear1.weight.device();
-    let batcher = SequenceBatcher::<B>::new(device, config.sequence_length);
 
     // Create optimizer
     let mut optimizer = AdamConfig::new().init();
@@ -139,8 +146,8 @@ where
         valid_segments
     );
     info!(
-        "Batch size: {}, Learning rate: {}, Segment length: {}",
-        config.batch_size, config.learning_rate, config.sequence_length
+        "Batch size: {}, Learning rate: {}, Segment length: {}, Prefetch: {}",
+        config.batch_size, config.learning_rate, config.sequence_length, PREFETCH_COUNT
     );
     if start_epoch > 0 {
         info!("Resuming from epoch {}", start_epoch + 1);
@@ -150,63 +157,124 @@ where
 
     for epoch in start_epoch..config.epochs {
         let epoch_start = Instant::now();
-        let mut epoch_loss = 0.0;
         let mut batch_count = 0;
 
         // Create shuffled indices for this epoch
         let mut indices: Vec<usize> = (0..num_samples).collect();
         shuffle_indices(&mut indices, epoch as u64);
 
-        // Process batches
-        let total_batches = num_samples.div_ceil(config.batch_size);
+        // Create prefetcher for this epoch - batches will be loaded in background
+        let mut prefetcher = BatchPrefetcher::new(
+            Arc::clone(&train_dataset),
+            indices,
+            config.batch_size,
+            config.sequence_length,
+            PREFETCH_COUNT,
+        );
 
-        for batch_idx in 0..total_batches {
-            let batch_start = batch_idx * config.batch_size;
-            let batch_end = (batch_start + config.batch_size).min(num_samples);
+        let total_batches = prefetcher.total_batches();
 
-            let Some(batch_indices) = indices.get(batch_start..batch_end) else {
-                continue;
+        // Accumulate loss on GPU to avoid sync on every batch
+        let mut accumulated_loss: Option<Tensor<B, 1>> = None;
+        let mut accumulated_count = 0;
+        let mut epoch_loss_sum = 0.0f64;
+        let mut epoch_loss_count = 0usize;
+
+        // Timing accumulators (in microseconds)
+        let mut time_prefetch_wait_us = 0u64;
+        let mut time_to_gpu_us = 0u64;
+        let mut time_forward_us = 0u64;
+        let mut time_backward_us = 0u64;
+        let mut time_optimizer_us = 0u64;
+
+        // Process batches from prefetcher
+        loop {
+            // Time waiting for prefetcher
+            let t_prefetch_start = Instant::now();
+            let Some(preloaded_batch) = prefetcher.next_batch() else {
+                break;
             };
+            time_prefetch_wait_us += t_prefetch_start.elapsed().as_micros() as u64;
 
-            // Create batch directly from mmap indices
-            let Some(batch) = batcher.batch_from_indices(train_dataset, batch_indices) else {
-                continue;
-            };
+            // Time converting to GPU tensors
+            let t_to_gpu_start = Instant::now();
+            let batch = preloaded_batch.to_batch::<B>(&device);
+            time_to_gpu_us += t_to_gpu_start.elapsed().as_micros() as u64;
 
-            // Forward pass
+            // Time for forward pass
+            let t_forward_start = Instant::now();
             let predictions = model.forward(batch.inputs);
             let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
+            time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
-            // Extract loss value
-            let loss_value: f32 = loss
-                .clone()
-                .into_data()
-                .to_vec()
-                .unwrap_or_else(|_| vec![0.0])
-                .first()
-                .copied()
-                .unwrap_or(0.0);
-
-            epoch_loss += loss_value as f64;
+            // Accumulate loss on GPU (no sync)
+            let loss_unsqueezed = loss.clone().unsqueeze::<1>();
+            accumulated_loss = Some(match accumulated_loss {
+                Some(acc) => acc + loss_unsqueezed,
+                None => loss_unsqueezed,
+            });
+            accumulated_count += 1;
             batch_count += 1;
 
-            // Log progress every 20 batches
-            if batch_count % 20 == 0 {
-                let avg_loss_so_far = epoch_loss / batch_count as f64;
-                info!("  Batch {batch_count}/{total_batches}, avg_loss = {avg_loss_so_far:.6}");
+            // Only sync with GPU periodically to get loss value
+            if (accumulated_count >= LOSS_SYNC_INTERVAL || batch_count == total_batches)
+                && let Some(acc_loss) = accumulated_loss.take()
+            {
+                let avg_loss = acc_loss / (accumulated_count as f32);
+                let loss_value: f32 = avg_loss
+                    .into_data()
+                    .to_vec()
+                    .unwrap_or_else(|_| vec![0.0])
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0);
+
+                epoch_loss_sum += loss_value as f64 * accumulated_count as f64;
+                epoch_loss_count += accumulated_count;
+                accumulated_count = 0;
+
+                // Log progress with timing breakdown
+                let avg_epoch_loss = epoch_loss_sum / epoch_loss_count as f64;
+                let n = batch_count as f64;
+                info!(
+                    "  Batch {batch_count}/{total_batches}, avg_loss={avg_epoch_loss:.6} | \
+                     prefetch={:.1}ms, to_gpu={:.1}ms, forward={:.1}ms, backward={:.1}ms, optim={:.1}ms (per batch avg)",
+                    time_prefetch_wait_us as f64 / 1000.0 / n,
+                    time_to_gpu_us as f64 / 1000.0 / n,
+                    time_forward_us as f64 / 1000.0 / n,
+                    time_backward_us as f64 / 1000.0 / n,
+                    time_optimizer_us as f64 / 1000.0 / n,
+                );
             }
 
-            // Backward pass
+            // Time for backward pass
+            let t_backward_start = Instant::now();
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, model);
+            time_backward_us += t_backward_start.elapsed().as_micros() as u64;
 
-            // Update weights
+            // Time for optimizer step
+            let t_optimizer_start = Instant::now();
             *model = optimizer.step(config.learning_rate, model.clone(), grads);
+            time_optimizer_us += t_optimizer_start.elapsed().as_micros() as u64;
+        }
+
+        // Log epoch timing summary
+        let batches = batch_count as f64;
+        if batches > 0.0 {
+            info!(
+                "  Epoch timing breakdown (avg per batch): prefetch={:.2}ms, to_gpu={:.2}ms, forward={:.2}ms, backward={:.2}ms, optim={:.2}ms",
+                time_prefetch_wait_us as f64 / 1000.0 / batches,
+                time_to_gpu_us as f64 / 1000.0 / batches,
+                time_forward_us as f64 / 1000.0 / batches,
+                time_backward_us as f64 / 1000.0 / batches,
+                time_optimizer_us as f64 / 1000.0 / batches,
+            );
         }
 
         let epoch_duration = epoch_start.elapsed();
-        state.current_train_loss = if batch_count > 0 {
-            (epoch_loss / batch_count as f64) as f32
+        state.current_train_loss = if epoch_loss_count > 0 {
+            (epoch_loss_sum / epoch_loss_count as f64) as f32
         } else {
             0.0
         };
