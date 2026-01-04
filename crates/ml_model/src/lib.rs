@@ -26,7 +26,9 @@ use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-pub use dataset::{BatchPrefetcher, MmapSegmentDataset, PreloadedBatchData, SequenceBatch, SequenceBatcher};
+pub use dataset::{
+    BatchPrefetcher, MmapSegmentDataset, PreloadedBatchData, SequenceBatch, SequenceBatcher,
+};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};
 
