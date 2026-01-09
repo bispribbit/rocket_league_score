@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     let epochs: usize = get_env_or_default("EPOCHS", 100);
     let batch_size: usize = get_env_or_default("BATCH_SIZE", 2048);
     let learning_rate: f64 = get_env_or_default("LEARNING_RATE", 0.001);
-    let resume: bool = get_env_or_default("RESUME", false);
+    let resume: bool = get_env_or_default("RESUME", true);
     let max_replays: Option<usize> = std::env::var("MAX_REPLAYS")
         .ok()
         .and_then(|s| s.parse().ok());

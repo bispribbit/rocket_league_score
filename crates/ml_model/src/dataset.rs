@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 
 use burn::prelude::*;
 use feature_extractor::{FEATURE_COUNT, TOTAL_PLAYERS};
+use parking_lot::Mutex;
 use tracing::info;
 
 use crate::segment_cache::MmapSegmentStore;
@@ -16,62 +17,59 @@ use crate::segment_cache::MmapSegmentStore;
 
 /// Dataset backed by memory-mapped segment files.
 ///
-/// This provides zero-copy access to cached feature segments.
-/// The underlying `MmapSegmentStore` owns the memory-mapped files.
+/// This provides lazy-loaded access to cached feature segments.
+/// The underlying `MmapSegmentStore` loads segments on-demand.
 pub struct MmapSegmentDataset {
-    /// The backing segment store.
-    store: MmapSegmentStore,
+    /// The backing segment store (wrapped in Mutex for thread-safe mutable access).
+    store: Arc<Mutex<MmapSegmentStore>>,
 }
 
 impl MmapSegmentDataset {
     /// Creates a new dataset from a segment store.
     #[must_use]
-    pub const fn new(store: MmapSegmentStore) -> Self {
-        Self { store }
-    }
-
-    /// Returns the segment store reference.
-    #[must_use]
-    pub const fn store(&self) -> &MmapSegmentStore {
-        &self.store
+    pub fn new(store: MmapSegmentStore) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(store)),
+        }
     }
 
     /// Returns the segment length.
     #[must_use]
-    pub const fn segment_length(&self) -> usize {
-        self.store.segment_length()
+    pub fn segment_length(&self) -> usize {
+        let store = self.store.lock();
+        store.segment_length()
     }
 
     /// Returns the number of segments.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.store.len()
+    pub fn len(&self) -> usize {
+        let store = self.store.lock();
+        store.len()
     }
 
     /// Returns true if the dataset is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.store.is_empty()
+    pub fn is_empty(&self) -> bool {
+        let store = self.store.lock();
+        store.is_empty()
     }
 
     /// Gets features and target MMR for a segment by index.
-    #[must_use]
-    pub fn get(&self, index: usize) -> Option<(&[f32], [f32; TOTAL_PLAYERS])> {
-        self.store.get(index)
-    }
-
-    /// Consumes the dataset and returns the underlying store.
-    #[must_use]
-    pub fn into_store(self) -> MmapSegmentStore {
-        self.store
+    ///
+    /// This loads the segment on-demand from disk.
+    /// Returns owned data since we can't return references across the Mutex boundary.
+    pub fn get(&self, index: usize) -> Option<(Vec<f32>, [f32; TOTAL_PLAYERS])> {
+        let store = self.store.lock();
+        store.get(index)
     }
 }
 
 impl std::fmt::Debug for MmapSegmentDataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let store = self.store.lock();
         f.debug_struct("MmapSegmentDataset")
-            .field("segment_count", &self.store.len())
-            .field("segment_length", &self.store.segment_length())
+            .field("segment_count", &store.len())
+            .field("segment_length", &store.segment_length())
             .finish()
     }
 }
@@ -106,7 +104,7 @@ impl<B: Backend> SequenceBatcher<B> {
 
     /// Batches segments from an MmapSegmentDataset by indices.
     ///
-    /// This reads directly from memory-mapped storage using the provided indices.
+    /// This loads segments on-demand using the provided indices.
     pub fn batch_from_indices(
         &self,
         dataset: &MmapSegmentDataset,
@@ -123,8 +121,8 @@ impl<B: Backend> SequenceBatcher<B> {
         let mut target_data = Vec::with_capacity(batch_size * TOTAL_PLAYERS);
 
         for &idx in indices {
-            let (features, target_mmr) = dataset.store.get(idx)?;
-            input_data.extend_from_slice(features);
+            let (features, target_mmr) = dataset.get(idx)?;
+            input_data.extend_from_slice(&features);
             target_data.extend_from_slice(&target_mmr);
         }
 
@@ -252,8 +250,8 @@ impl BatchPrefetcher {
 
             let mut valid = true;
             for &idx in batch_indices {
-                if let Some((features, target_mmr)) = dataset.store().get(idx) {
-                    input_data.extend_from_slice(features);
+                if let Some((features, target_mmr)) = dataset.get(idx) {
+                    input_data.extend_from_slice(&features);
                     target_data.extend_from_slice(&target_mmr);
                 } else {
                     valid = false;

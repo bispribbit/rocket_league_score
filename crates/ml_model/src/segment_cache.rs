@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 use memmap2::Mmap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Information about a cached segment file.
@@ -328,90 +328,94 @@ const fn bytemuck_cast_slice(slice: &[f32; FEATURE_COUNT]) -> &[u8] {
 // MmapSegmentStore - Zero-copy segment storage using memory-mapped files
 // =============================================================================
 
-/// Entry in the segment index mapping segment index to mmap data.
-#[derive(Debug)]
+/// Entry in the segment index mapping segment index to segment metadata.
+#[derive(Debug, Clone)]
 struct SegmentEntry {
-    /// Index into the mmaps vector.
-    mmap_index: usize,
+    /// Path to the segment file.
+    path: PathBuf,
     /// Target MMR for the replay this segment belongs to.
     target_mmr: [f32; TOTAL_PLAYERS],
 }
 
-/// Memory-mapped segment store for zero-copy access to cached features.
+/// Memory-mapped segment store for lazy-loaded access to cached features.
 ///
-/// This struct holds memory-mapped files for all segments and provides
-/// efficient access via index lookups. The segments are stored as raw
-/// f32 arrays that can be directly used for training.
+/// This struct holds metadata for all segments and loads them on-demand.
+/// Segments are loaded from disk when needed and immediately released after copying.
+/// The segments are stored as raw f32 arrays that can be directly used for training.
 pub struct MmapSegmentStore {
-    /// Memory-mapped segment files.
-    mmaps: Vec<Mmap>,
-    /// Maps segment index to mmap index and metadata.
-    segment_entries: Vec<SegmentEntry>,
+    /// Maps segment index to segment metadata.
+    entries: Vec<SegmentEntry>,
     /// Number of frames per segment.
-    segment_length: usize,
+    length: usize,
     /// Expected size of each segment in bytes.
-    segment_size_bytes: usize,
+    size_bytes: usize,
 }
 
 impl MmapSegmentStore {
     /// Creates a new empty segment store.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_length` - Number of frames per segment
     #[must_use]
     pub const fn new(segment_length: usize) -> Self {
         let segment_size_bytes = segment_length * FEATURE_COUNT * std::mem::size_of::<f32>();
         Self {
-            mmaps: Vec::new(),
-            segment_entries: Vec::new(),
-            segment_length,
-            segment_size_bytes,
+            entries: Vec::new(),
+            length: segment_length,
+            size_bytes: segment_size_bytes,
         }
     }
 
-    /// Loads all segments from a list of segment files.
+    /// Adds segment metadata from a list of segment files.
+    ///
+    /// This only stores metadata, not the actual segment data.
+    /// Segments will be loaded on-demand when accessed.
     ///
     /// # Arguments
     ///
-    /// * `segment_files` - List of segment files to load
+    /// * `segment_files` - List of segment files to add
     /// * `target_mmr` - Target MMR for all segments (from the same replay)
     ///
-    /// # Errors
+    /// # Returns
     ///
-    /// Returns an error if any segment file cannot be memory-mapped.
-    pub fn load_segments(
+    /// Number of segments successfully added.
+    pub fn add_segments(
         &mut self,
         segment_files: &[SegmentFileInfo],
         target_mmr: [f32; TOTAL_PLAYERS],
     ) -> usize {
-        let mut loaded = 0;
+        let mut added = 0;
 
         for segment_file in segment_files {
-            if let Err(e) = self.load_segment(&segment_file.path, target_mmr) {
-                warn!(
-                    path = %segment_file.path.display(),
-                    error = %e,
-                    "Failed to load segment"
-                );
-                continue;
-            }
-            loaded += 1;
+            self.entries.push(SegmentEntry {
+                path: segment_file.path.clone(),
+                target_mmr,
+            });
+            added += 1;
         }
 
-        loaded
+        added
     }
 
-    /// Loads a single segment file.
-    fn load_segment(
-        &mut self,
-        path: &Path,
-        target_mmr: [f32; TOTAL_PLAYERS],
-    ) -> anyhow::Result<()> {
-        let file = File::open(path)?;
+    /// Loads a segment from disk and returns its data.
+    ///
+    /// The segment is loaded, data is copied, and then immediately released.
+    fn load_segment_data(&self, index: usize) -> anyhow::Result<Vec<f32>> {
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("Segment index out of bounds: {index}"))?;
+
+        // Load the segment file
+        let file = File::open(&entry.path)?;
         let metadata = file.metadata()?;
 
         // Verify file size
-        if metadata.len() != self.segment_size_bytes as u64 {
+        if metadata.len() != self.size_bytes as u64 {
             anyhow::bail!(
                 "Segment file has wrong size: expected {}, got {}",
-                self.segment_size_bytes,
+                self.size_bytes,
                 metadata.len()
             );
         }
@@ -421,36 +425,35 @@ impl MmapSegmentStore {
         #[expect(unsafe_code)]
         let mmap = unsafe { Mmap::map(&file)? };
 
-        let mmap_index = self.mmaps.len();
-        self.mmaps.push(mmap);
+        // SAFETY: The mmap contains raw f32 values written by write_segment_file.
+        // We verify the size on load, so we know it's correctly aligned.
+        let slice = bytes_to_f32_slice(&mmap);
 
-        self.segment_entries.push(SegmentEntry {
-            mmap_index,
-            target_mmr,
-        });
-
-        Ok(())
+        // Copy the data (mmap will be dropped when this function returns)
+        Ok(slice.to_vec())
     }
 
     /// Returns the number of segments in the store.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.segment_entries.len()
+        self.entries.len()
     }
 
     /// Returns true if the store is empty.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.segment_entries.is_empty()
+        self.entries.is_empty()
     }
 
     /// Returns the segment length (frames per segment).
     #[must_use]
     pub const fn segment_length(&self) -> usize {
-        self.segment_length
+        self.length
     }
 
-    /// Gets a segment's features as a slice of f32 values.
+    /// Gets a segment's features as a vector of f32 values.
+    ///
+    /// Loads the segment on-demand from disk.
     ///
     /// # Arguments
     ///
@@ -458,16 +461,10 @@ impl MmapSegmentStore {
     ///
     /// # Returns
     ///
-    /// A slice of f32 values with length `segment_length * FEATURE_COUNT`,
-    /// or `None` if the index is out of bounds.
-    #[must_use]
-    pub fn get_features(&self, index: usize) -> Option<&[f32]> {
-        let entry = self.segment_entries.get(index)?;
-        let mmap = self.mmaps.get(entry.mmap_index)?;
-
-        // SAFETY: The mmap contains raw f32 values written by write_segment_file.
-        // We verify the size on load, so we know it's correctly aligned.
-        Some(bytes_to_f32_slice(mmap))
+    /// A vector of f32 values with length `segment_length * FEATURE_COUNT`,
+    /// or `None` if the index is out of bounds or loading fails.
+    pub fn get_features(&self, index: usize) -> Option<Vec<f32>> {
+        self.load_segment_data(index).ok()
     }
 
     /// Gets a segment's target MMR.
@@ -481,17 +478,17 @@ impl MmapSegmentStore {
     /// The target MMR array for this segment, or `None` if index is out of bounds.
     #[must_use]
     pub fn get_target_mmr(&self, index: usize) -> Option<[f32; TOTAL_PLAYERS]> {
-        self.segment_entries.get(index).map(|e| e.target_mmr)
+        self.entries.get(index).map(|e| e.target_mmr)
     }
 
     /// Gets both features and target MMR for a segment.
     ///
     /// This is the primary access method for training, returning both
     /// input features and target labels.
-    #[must_use]
-    pub fn get(&self, index: usize) -> Option<(&[f32], [f32; TOTAL_PLAYERS])> {
-        let features = self.get_features(index)?;
+    /// Loads the segment on-demand from disk.
+    pub fn get(&self, index: usize) -> Option<(Vec<f32>, [f32; TOTAL_PLAYERS])> {
         let target_mmr = self.get_target_mmr(index)?;
+        let features = self.get_features(index)?;
         Some((features, target_mmr))
     }
 }
@@ -499,10 +496,9 @@ impl MmapSegmentStore {
 impl std::fmt::Debug for MmapSegmentStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MmapSegmentStore")
-            .field("segment_count", &self.segment_entries.len())
-            .field("segment_length", &self.segment_length)
-            .field("segment_size_bytes", &self.segment_size_bytes)
-            .field("mmap_count", &self.mmaps.len())
+            .field("segment_count", &self.entries.len())
+            .field("segment_length", &self.length)
+            .field("segment_size_bytes", &self.size_bytes)
             .finish()
     }
 }
@@ -543,7 +539,7 @@ fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
 ///
 /// This handles the two-phase loading process:
 /// 1. Ensure segments are cached (parse replay and write if missing)
-/// 2. Memory-map all segment files
+/// 2. Add segment metadata (segments are loaded on-demand)
 pub struct SegmentStoreBuilder {
     /// Base path for segment storage.
     base_path: PathBuf,
@@ -559,6 +555,11 @@ pub struct SegmentStoreBuilder {
 
 impl SegmentStoreBuilder {
     /// Creates a new builder.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_path` - Base path for segment storage
+    /// * `segment_length` - Number of frames per segment
     #[must_use]
     pub const fn new(base_path: PathBuf, segment_length: usize) -> Self {
         Self {
@@ -630,7 +631,7 @@ impl SegmentStoreBuilder {
 
     /// Adds a replay's segments to the store.
     ///
-    /// Loads existing segment files into the memory-mapped store.
+    /// Adds segment metadata to the store (segments are loaded on-demand).
     /// Assumes segments are already cached (call `ensure_segments_cached` first if needed).
     ///
     /// # Arguments
@@ -638,10 +639,6 @@ impl SegmentStoreBuilder {
     /// * `file_path` - Original replay file path (for directory structure)
     /// * `replay_id` - Unique replay identifier
     /// * `target_mmr` - Target MMR for this replay
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if segments cannot be loaded.
     pub fn add_replay(
         &mut self,
         file_path: &str,
@@ -651,8 +648,8 @@ impl SegmentStoreBuilder {
         let segment_files =
             list_segment_files(&self.base_path, file_path, replay_id, self.segment_length);
 
-        let loaded = self.store.load_segments(&segment_files, target_mmr);
-        self.segments_loaded += loaded;
+        let added = self.store.add_segments(&segment_files, target_mmr);
+        self.segments_loaded += added;
         self.replays_loaded += 1;
     }
 
