@@ -345,9 +345,14 @@ struct SegmentEntry {
 /// The segments are stored as raw f32 arrays that can be directly used for training.
 ///
 /// For validation datasets, all segments can be preloaded into memory for faster access.
+#[expect(clippy::partial_pub_fields)]
 pub struct MmapSegmentStore {
+    /// Name of the dataset.
+    pub name: String,
+
     /// Maps segment index to segment metadata.
     entries: Vec<SegmentEntry>,
+
     /// Number of frames per segment.
     length: usize,
     /// Expected size of each segment in bytes.
@@ -364,10 +369,11 @@ impl MmapSegmentStore {
     ///
     /// * `segment_length` - Number of frames per segment
     #[must_use]
-    pub const fn new(segment_length: usize) -> Self {
+    pub const fn new(name: String, segment_length: usize) -> Self {
         let segment_size_bytes = segment_length * FEATURE_COUNT * std::mem::size_of::<f32>();
         Self {
             entries: Vec::new(),
+            name,
             length: segment_length,
             size_bytes: segment_size_bytes,
             preloaded_segments: None,
@@ -460,6 +466,7 @@ impl MmapSegmentStore {
     pub fn preload_all_segments(&mut self) -> anyhow::Result<()> {
         info!(
             segment_count = self.entries.len(),
+            store_name = %self.name,
             "Preloading all segments into memory"
         );
 
@@ -494,6 +501,7 @@ impl MmapSegmentStore {
                 .preloaded_segments
                 .as_ref()
                 .map_or(0, std::collections::HashMap::len),
+            store_name = %self.name,
             "All segments preloaded"
         );
 
@@ -618,11 +626,11 @@ impl SegmentStoreBuilder {
     /// * `base_path` - Base path for segment storage
     /// * `segment_length` - Number of frames per segment
     #[must_use]
-    pub const fn new(base_path: PathBuf, segment_length: usize) -> Self {
+    pub const fn new(base_path: PathBuf, name: String, segment_length: usize) -> Self {
         Self {
             base_path,
             segment_length,
-            store: MmapSegmentStore::new(segment_length),
+            store: MmapSegmentStore::new(name, segment_length),
             replays_loaded: 0,
             replays_cached: 0,
             segments_loaded: 0,
@@ -720,24 +728,6 @@ impl SegmentStoreBuilder {
             "Segment store built"
         );
         self.store
-    }
-
-    /// Finishes building and returns the segment store with all segments preloaded.
-    ///
-    /// This is useful for validation datasets that should stay in memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any segment cannot be preloaded.
-    pub fn build_preloaded(mut self) -> anyhow::Result<MmapSegmentStore> {
-        info!(
-            replays_loaded = self.replays_loaded,
-            replays_cached = self.replays_cached,
-            segments_loaded = self.segments_loaded,
-            "Preloading all segments into memory"
-        );
-        self.store.preload_all_segments()?;
-        Ok(self.store)
     }
 
     /// Returns loading statistics.

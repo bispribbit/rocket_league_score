@@ -442,7 +442,8 @@ async fn load_training_data_cached(
 ) -> Result<Arc<MmapSegmentStore>> {
     const BATCH_SIZE: usize = 100;
 
-    let mut builder = SegmentStoreBuilder::new(base_path.clone(), segment_length);
+    let mut builder =
+        SegmentStoreBuilder::new(base_path.clone(), "training".to_string(), segment_length);
 
     let mut skipped_no_players = 0;
     let mut skipped_parse_error = 0;
@@ -612,7 +613,8 @@ async fn load_validation_data_cached(
 ) -> Result<Arc<MmapSegmentStore>> {
     const BATCH_SIZE: usize = 100;
 
-    let mut builder = SegmentStoreBuilder::new(base_path.clone(), segment_length);
+    let mut builder =
+        SegmentStoreBuilder::new(base_path.clone(), "validation".to_string(), segment_length);
 
     let mut skipped_no_players = 0;
     let mut skipped_parse_error = 0;
@@ -754,7 +756,13 @@ async fn load_validation_data_cached(
     );
 
     // Preload all segments into memory for faster validation access
-    let store = builder.build_preloaded()?;
+    let mut store = builder.build();
+    info!(
+        store_name = %store.name,
+        "Preloading all segments into memory"
+    );
+    store.preload_all_segments()?;
+
     Ok(Arc::new(store))
 }
 
