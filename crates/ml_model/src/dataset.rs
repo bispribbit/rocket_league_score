@@ -9,7 +9,7 @@ use feature_extractor::{FEATURE_COUNT, TOTAL_PLAYERS};
 use rayon::prelude::*;
 use tracing::info;
 
-use crate::segment_cache::MmapSegmentStore;
+use crate::segment_cache::SegmentStore;
 
 // =============================================================================
 // Batching
@@ -44,7 +44,7 @@ impl<B: Backend> SequenceBatcher<B> {
     /// This loads segments on-demand using the provided indices.
     pub fn batch_from_indices(
         &self,
-        dataset: &Arc<MmapSegmentStore>,
+        dataset: &Arc<SegmentStore>,
         indices: &[usize],
     ) -> Option<SequenceBatch<B>> {
         if indices.is_empty() {
@@ -59,7 +59,7 @@ impl<B: Backend> SequenceBatcher<B> {
 
         for &idx in indices {
             let (features, target_mmr) = dataset.get(idx)?;
-            input_data.extend_from_slice(&features);
+            input_data.extend_from_slice(features.as_slice());
             target_data.extend_from_slice(&target_mmr);
         }
 
@@ -113,7 +113,7 @@ impl PreloadedBatchData {
 /// Prefetches batches in a background thread to keep the GPU fed.
 ///
 /// This struct manages a background thread that prepares batches ahead of time,
-/// loading data from memory-mapped files while the GPU processes the current batch.
+/// loading data from disk while the GPU processes the current batch.
 pub struct BatchPrefetcher {
     /// Channel receiver for preloaded batches
     receiver: Receiver<PreloadedBatchData>,
@@ -137,7 +137,7 @@ impl BatchPrefetcher {
     /// * `prefetch_count` - Number of batches to keep buffered (recommended: 2-4)
     #[must_use]
     pub fn new(
-        dataset: Arc<MmapSegmentStore>,
+        dataset: Arc<SegmentStore>,
         indices: Vec<usize>,
         batch_size: usize,
         sequence_length: usize,
@@ -165,7 +165,7 @@ impl BatchPrefetcher {
     ///
     /// Loads segments in parallel using rayon to maximize I/O throughput.
     fn prefetch_worker(
-        dataset: Arc<MmapSegmentStore>,
+        dataset: Arc<SegmentStore>,
         indices: Vec<usize>,
         batch_size: usize,
         sequence_length: usize,
@@ -184,7 +184,7 @@ impl BatchPrefetcher {
             let actual_batch_size = batch_indices.len();
 
             // Load segments in parallel using rayon
-            let segment_data: Vec<Option<(Vec<f32>, [f32; TOTAL_PLAYERS])>> = batch_indices
+            let segment_data: Vec<Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])>> = batch_indices
                 .par_iter()
                 .map(|&idx| dataset.get(idx))
                 .collect();
@@ -197,7 +197,7 @@ impl BatchPrefetcher {
 
             for data in segment_data {
                 if let Some((features, target_mmr)) = data {
-                    input_data.extend_from_slice(&features);
+                    input_data.extend_from_slice(features.as_slice());
                     target_data.extend_from_slice(&target_mmr);
                 } else {
                     valid = false;

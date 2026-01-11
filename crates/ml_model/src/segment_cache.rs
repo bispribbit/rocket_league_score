@@ -3,15 +3,15 @@
 //! This module provides functionality to:
 //! - Write extracted feature segments to disk in binary format
 //! - Check if cached segments exist for a replay
-//! - Memory-map cached segments for zero-copy access
+//! - Read cached segments from disk
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
-use memmap2::Mmap;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -326,7 +326,7 @@ const fn bytemuck_cast_slice(slice: &[f32; FEATURE_COUNT]) -> &[u8] {
 }
 
 // =============================================================================
-// MmapSegmentStore - Zero-copy segment storage using memory-mapped files
+// SegmentStore - Segment storage with on-demand loading
 // =============================================================================
 
 /// Entry in the segment index mapping segment index to segment metadata.
@@ -338,15 +338,15 @@ struct SegmentEntry {
     target_mmr: [f32; TOTAL_PLAYERS],
 }
 
-/// Memory-mapped segment store for lazy-loaded access to cached features.
+/// Segment store for lazy-loaded access to cached features.
 ///
 /// This struct holds metadata for all segments and loads them on-demand.
-/// Segments are loaded from disk when needed and immediately released after copying.
+/// Segments are loaded from disk when needed using std::fs::read.
 /// The segments are stored as raw f32 arrays that can be directly used for training.
 ///
 /// For validation datasets, all segments can be preloaded into memory for faster access.
 #[expect(clippy::partial_pub_fields)]
-pub struct MmapSegmentStore {
+pub struct SegmentStore {
     /// Name of the dataset.
     pub name: String,
 
@@ -357,12 +357,12 @@ pub struct MmapSegmentStore {
     length: usize,
     /// Expected size of each segment in bytes.
     size_bytes: usize,
-    /// Preloaded segments in memory (index -> mmap).
+    /// Preloaded segments in memory (index -> Arc<Vec<f32>>).
     /// Used for validation datasets that should stay in memory.
-    preloaded_segments: Option<HashMap<usize, Mmap>>,
+    preloaded_segments: Option<HashMap<usize, Arc<Vec<f32>>>>,
 }
 
-impl MmapSegmentStore {
+impl SegmentStore {
     /// Creates a new empty segment store.
     ///
     /// # Arguments
@@ -413,15 +413,14 @@ impl MmapSegmentStore {
 
     /// Loads a segment from disk and returns its data.
     ///
-    /// If the segment is preloaded, uses the cached mmap.
-    /// Otherwise, loads from disk, copies data, and releases immediately.
-    fn load_segment_data(&self, index: usize) -> anyhow::Result<Vec<f32>> {
+    /// If the segment is preloaded, uses the cached data.
+    /// Otherwise, loads from disk using std::fs::read.
+    fn load_segment_data(&self, index: usize) -> anyhow::Result<Arc<Vec<f32>>> {
         // Check if preloaded first
         if let Some(preloaded) = &self.preloaded_segments
-            && let Some(mmap) = preloaded.get(&index)
+            && let Some(data) = preloaded.get(&index)
         {
-            let slice = bytes_to_f32_slice(mmap);
-            return Ok(slice.to_vec());
+            return Ok(Arc::clone(data));
         }
 
         let entry = self
@@ -429,30 +428,34 @@ impl MmapSegmentStore {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("Segment index out of bounds: {index}"))?;
 
-        // Load the segment file
-        let file = File::open(&entry.path)?;
-        let metadata = file.metadata()?;
+        // Load the segment file using std::fs::read
+        let bytes = fs::read(&entry.path)?;
 
         // Verify file size
-        if metadata.len() != self.size_bytes as u64 {
+        if bytes.len() != self.size_bytes {
             anyhow::bail!(
                 "Segment file has wrong size: expected {}, got {}",
                 self.size_bytes,
-                metadata.len()
+                bytes.len()
             );
         }
 
-        // SAFETY: We're memory-mapping a read-only file that we own.
-        // The file must not be modified while mapped.
-        #[expect(unsafe_code)]
-        let mmap = unsafe { Mmap::map(&file)? };
+        // Convert bytes to f32 slice
+        // The data was written as f32 arrays by write_segment_file, so we can safely cast
+        let f32_count = bytes.len() / std::mem::size_of::<f32>();
+        let mut result = Vec::with_capacity(f32_count);
 
-        // SAFETY: The mmap contains raw f32 values written by write_segment_file.
-        // We verify the size on load, so we know it's correctly aligned.
-        let slice = bytes_to_f32_slice(&mmap);
+        // Read f32 values from the byte slice
+        for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
+            let value = f32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("Failed to convert bytes to f32: {e}"))?,
+            );
+            result.push(value);
+        }
 
-        // Copy the data (mmap will be dropped when this function returns)
-        Ok(slice.to_vec())
+        Ok(Arc::new(result))
     }
 
     /// Preloads all segments into memory.
@@ -473,26 +476,35 @@ impl MmapSegmentStore {
         let mut preloaded = HashMap::new();
 
         for (index, entry) in self.entries.iter().enumerate() {
-            let file = File::open(&entry.path)?;
-            let metadata = file.metadata()?;
+            // Load the segment file using std::fs::read
+            let bytes = fs::read(&entry.path)?;
 
             // Verify file size
-            if metadata.len() != self.size_bytes as u64 {
+            if bytes.len() != self.size_bytes {
                 warn!(
                     path = %entry.path.display(),
                     expected = self.size_bytes,
-                    actual = metadata.len(),
+                    actual = bytes.len(),
                     "Segment file has wrong size, skipping"
                 );
                 continue;
             }
 
-            // SAFETY: We're memory-mapping a read-only file that we own.
-            // The file must not be modified while mapped.
-            #[expect(unsafe_code)]
-            let mmap = unsafe { Mmap::map(&file)? };
+            // Convert bytes to f32 vector
+            let f32_count = bytes.len() / std::mem::size_of::<f32>();
+            let mut data = Vec::with_capacity(f32_count);
 
-            preloaded.insert(index, mmap);
+            // Read f32 values from the byte slice
+            for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
+                let value = f32::from_le_bytes(
+                    chunk
+                        .try_into()
+                        .map_err(|e| anyhow::anyhow!("Failed to convert bytes to f32: {e}"))?,
+                );
+                data.push(value);
+            }
+
+            preloaded.insert(index, Arc::new(data));
         }
 
         self.preloaded_segments = Some(preloaded);
@@ -526,7 +538,7 @@ impl MmapSegmentStore {
         self.length
     }
 
-    /// Gets a segment's features as a vector of f32 values.
+    /// Gets a segment's features as an Arc<Vec<f32>>.
     ///
     /// Loads the segment on-demand from disk.
     ///
@@ -536,9 +548,9 @@ impl MmapSegmentStore {
     ///
     /// # Returns
     ///
-    /// A vector of f32 values with length `segment_length * FEATURE_COUNT`,
+    /// An Arc<Vec<f32>> with length `segment_length * FEATURE_COUNT`,
     /// or `None` if the index is out of bounds or loading fails.
-    pub fn get_features(&self, index: usize) -> Option<Vec<f32>> {
+    pub fn get_features(&self, index: usize) -> Option<Arc<Vec<f32>>> {
         self.load_segment_data(index).ok()
     }
 
@@ -561,38 +573,10 @@ impl MmapSegmentStore {
     /// This is the primary access method for training, returning both
     /// input features and target labels.
     /// Loads the segment on-demand from disk.
-    pub fn get(&self, index: usize) -> Option<(Vec<f32>, [f32; TOTAL_PLAYERS])> {
+    pub fn get(&self, index: usize) -> Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])> {
         let target_mmr = self.get_target_mmr(index)?;
         let features = self.get_features(index)?;
         Some((features, target_mmr))
-    }
-}
-
-/// Converts a byte slice to a slice of f32 values.
-///
-/// # Panics
-///
-/// Panics if the byte slice is not properly aligned for f32.
-#[expect(clippy::cast_ptr_alignment)]
-fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
-    let ptr = bytes.as_ptr();
-    let align = std::mem::align_of::<f32>();
-
-    // Verify alignment - mmap pages are typically 4096-byte aligned,
-    // so f32 alignment (4 bytes) should always be satisfied.
-    assert!(
-        ptr.align_offset(align) == 0,
-        "Mmap data is not properly aligned for f32"
-    );
-
-    let f32_ptr = ptr.cast::<f32>();
-    let len = bytes.len() / std::mem::size_of::<f32>();
-
-    // SAFETY: We verified alignment above and size constraints on load.
-    // The data was written as f32 arrays by write_segment_file.
-    #[expect(unsafe_code)]
-    unsafe {
-        std::slice::from_raw_parts(f32_ptr, len)
     }
 }
 
@@ -600,7 +584,7 @@ fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
 // Builder for loading segments from replays
 // =============================================================================
 
-/// Builder for creating an `MmapSegmentStore` from replay data.
+/// Builder for creating a `SegmentStore` from replay data.
 ///
 /// This handles the two-phase loading process:
 /// 1. Ensure segments are cached (parse replay and write if missing)
@@ -611,7 +595,7 @@ pub struct SegmentStoreBuilder {
     /// Number of frames per segment.
     segment_length: usize,
     /// Accumulated segment store.
-    store: MmapSegmentStore,
+    store: SegmentStore,
     /// Statistics.
     replays_loaded: usize,
     replays_cached: usize,
@@ -630,7 +614,7 @@ impl SegmentStoreBuilder {
         Self {
             base_path,
             segment_length,
-            store: MmapSegmentStore::new(name, segment_length),
+            store: SegmentStore::new(name, segment_length),
             replays_loaded: 0,
             replays_cached: 0,
             segments_loaded: 0,
@@ -720,7 +704,7 @@ impl SegmentStoreBuilder {
 
     /// Finishes building and returns the segment store.
     #[must_use]
-    pub fn build(self) -> MmapSegmentStore {
+    pub fn build(self) -> SegmentStore {
         info!(
             replays_loaded = self.replays_loaded,
             replays_cached = self.replays_cached,

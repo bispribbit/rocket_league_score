@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
 use config::{OBJECT_STORE, get_base_path};
 use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_game_sequence};
-use ml_model::segment_cache::{MmapSegmentStore, SegmentStoreBuilder};
+use ml_model::segment_cache::{SegmentStore, SegmentStoreBuilder};
 use ml_model::{
     CheckpointConfig, ModelConfig, TrainingConfig, TrainingState, create_model, load_checkpoint,
     save_checkpoint, train,
@@ -206,7 +206,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let base_path = get_base_path();
 
     // Load training data using segment cache (zero-copy)
-    let train_dataset = load_training_data_cached(
+    let train_dataset: Arc<SegmentStore> = load_training_data_cached(
         &training_replays,
         training_config.sequence_length,
         base_path.clone(),
@@ -234,7 +234,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
                 replay_count = valid_replays.len(),
                 "Loading validation replays..."
             );
-            let valid_ds = load_validation_data_cached(
+            let valid_ds: Arc<SegmentStore> = load_validation_data_cached(
                 &valid_replays,
                 training_config.sequence_length,
                 base_path,
@@ -349,7 +349,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "dropout": model_config.dropout,
         "train_ratio": config.train_ratio,
         "training_segments": train_dataset.len(),
-        "validation_segments": valid_dataset.as_ref().map_or(0, |ds| ds.len()),
+        "validation_segments": valid_dataset.as_ref().map_or(0, |ds: &Arc<SegmentStore>| ds.len()),
         "evaluation_games": current_counts.evaluation,
     });
 
@@ -387,7 +387,9 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     } else if let Some(valid_loss) = output.final_valid_loss {
         // Evaluation was already done during training using the evaluation split
         let valid_rmse = valid_loss.sqrt();
-        let valid_segments = valid_dataset.as_ref().map_or(0, |ds| ds.len());
+        let valid_segments = valid_dataset
+            .as_ref()
+            .map_or(0, |ds: &Arc<SegmentStore>| ds.len());
         info!(
             eval_segments = valid_segments,
             eval_loss = valid_loss,
@@ -439,7 +441,7 @@ async fn load_training_data_cached(
     replays: &[Replay],
     segment_length: usize,
     base_path: PathBuf,
-) -> Result<Arc<MmapSegmentStore>> {
+) -> Result<Arc<SegmentStore>> {
     const BATCH_SIZE: usize = 100;
 
     let mut builder =
@@ -610,7 +612,7 @@ async fn load_validation_data_cached(
     replays: &[Replay],
     segment_length: usize,
     base_path: PathBuf,
-) -> Result<Arc<MmapSegmentStore>> {
+) -> Result<Arc<SegmentStore>> {
     const BATCH_SIZE: usize = 100;
 
     let mut builder =

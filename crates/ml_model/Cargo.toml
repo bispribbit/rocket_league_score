@@ -12,7 +12,6 @@ feature_extractor.workspace = true
 
 anyhow.workspace = true
 burn.workspace = true
-memmap2.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
 tracing.workspace = true

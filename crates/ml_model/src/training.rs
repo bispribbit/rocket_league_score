@@ -11,7 +11,7 @@ use burn::tensor::backend::AutodiffBackend;
 use tracing::info;
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
-use crate::segment_cache::MmapSegmentStore;
+use crate::segment_cache::SegmentStore;
 use crate::{SequenceModel, TrainingConfig, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
@@ -96,16 +96,16 @@ const PREFETCH_COUNT: usize = 8;
 /// Higher values = better GPU utilization but less frequent progress updates.
 const LOSS_SYNC_INTERVAL: usize = 10;
 
-/// Trains the sequence model using memory-mapped segment data.
+/// Trains the sequence model using cached segment data.
 ///
-/// This training method uses zero-copy access to cached feature segments.
+/// This training method loads segments from disk on-demand.
 /// The data must already be split into train/valid datasets before calling.
 ///
 /// # Arguments
 ///
 /// * `model` - The model to train (will be modified in place).
-/// * `train_dataset` - Training data as memory-mapped segments.
-/// * `valid_dataset` - Optional validation data as memory-mapped segments.
+/// * `train_dataset` - Training data as cached segments.
+/// * `valid_dataset` - Optional validation data as cached segments.
 /// * `config` - Training configuration.
 /// * `checkpoint_config` - Optional checkpoint configuration for saving during training.
 /// * `start_state` - Optional starting state for resumption.
@@ -115,8 +115,8 @@ const LOSS_SYNC_INTERVAL: usize = 10;
 /// Returns an error if training fails.
 pub fn train<B: AutodiffBackend>(
     model: &mut SequenceModel<B>,
-    train_dataset: Arc<MmapSegmentStore>,
-    valid_dataset: Option<&Arc<MmapSegmentStore>>,
+    train_dataset: Arc<SegmentStore>,
+    valid_dataset: Option<&Arc<SegmentStore>>,
     config: &TrainingConfig,
     checkpoint_config: Option<CheckpointConfig>,
     start_state: Option<TrainingState>,
@@ -389,10 +389,10 @@ where
     })
 }
 
-/// Computes validation loss on an mmap dataset.
+/// Computes validation loss on a segment dataset.
 fn compute_validation_loss<B: Backend>(
     model: &SequenceModel<B>,
-    dataset: &Arc<MmapSegmentStore>,
+    dataset: &Arc<SegmentStore>,
     batcher: &SequenceBatcher<B>,
     batch_size: usize,
 ) -> f32 {
