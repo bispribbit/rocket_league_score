@@ -26,9 +26,7 @@ use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-pub use dataset::{
-    BatchPrefetcher, MmapSegmentDataset, PreloadedBatchData, SequenceBatch, SequenceBatcher,
-};
+pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};
 
@@ -67,9 +65,9 @@ pub struct TrainingConfig {
     #[config(default = 0.1)]
     pub validation_split: f64,
     /// Sequence length (number of frames per segment).
-    /// At 30fps, 300 frames = 10 seconds of gameplay.
+    /// At 30fps, 1800 frames = 60 seconds of gameplay.
     /// Each game is split into non-overlapping segments of this length.
-    #[config(default = 300)]
+    #[config(default = 150)]
     pub sequence_length: usize,
 }
 

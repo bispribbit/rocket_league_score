@@ -6,73 +6,10 @@ use std::thread::{self, JoinHandle};
 
 use burn::prelude::*;
 use feature_extractor::{FEATURE_COUNT, TOTAL_PLAYERS};
-use parking_lot::Mutex;
+use rayon::prelude::*;
 use tracing::info;
 
 use crate::segment_cache::MmapSegmentStore;
-
-// =============================================================================
-// MmapSegmentDataset - Zero-copy dataset backed by memory-mapped files
-// =============================================================================
-
-/// Dataset backed by memory-mapped segment files.
-///
-/// This provides lazy-loaded access to cached feature segments.
-/// The underlying `MmapSegmentStore` loads segments on-demand.
-pub struct MmapSegmentDataset {
-    /// The backing segment store (wrapped in Mutex for thread-safe mutable access).
-    store: Arc<Mutex<MmapSegmentStore>>,
-}
-
-impl MmapSegmentDataset {
-    /// Creates a new dataset from a segment store.
-    #[must_use]
-    pub fn new(store: MmapSegmentStore) -> Self {
-        Self {
-            store: Arc::new(Mutex::new(store)),
-        }
-    }
-
-    /// Returns the segment length.
-    #[must_use]
-    pub fn segment_length(&self) -> usize {
-        let store = self.store.lock();
-        store.segment_length()
-    }
-
-    /// Returns the number of segments.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        let store = self.store.lock();
-        store.len()
-    }
-
-    /// Returns true if the dataset is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        let store = self.store.lock();
-        store.is_empty()
-    }
-
-    /// Gets features and target MMR for a segment by index.
-    ///
-    /// This loads the segment on-demand from disk.
-    /// Returns owned data since we can't return references across the Mutex boundary.
-    pub fn get(&self, index: usize) -> Option<(Vec<f32>, [f32; TOTAL_PLAYERS])> {
-        let store = self.store.lock();
-        store.get(index)
-    }
-}
-
-impl std::fmt::Debug for MmapSegmentDataset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let store = self.store.lock();
-        f.debug_struct("MmapSegmentDataset")
-            .field("segment_count", &store.len())
-            .field("segment_length", &store.segment_length())
-            .finish()
-    }
-}
 
 // =============================================================================
 // Batching
@@ -102,12 +39,12 @@ impl<B: Backend> SequenceBatcher<B> {
         }
     }
 
-    /// Batches segments from an MmapSegmentDataset by indices.
+    /// Batches segments from a dataset by indices.
     ///
     /// This loads segments on-demand using the provided indices.
     pub fn batch_from_indices(
         &self,
-        dataset: &MmapSegmentDataset,
+        dataset: &Arc<MmapSegmentStore>,
         indices: &[usize],
     ) -> Option<SequenceBatch<B>> {
         if indices.is_empty() {
@@ -200,7 +137,7 @@ impl BatchPrefetcher {
     /// * `prefetch_count` - Number of batches to keep buffered (recommended: 2-4)
     #[must_use]
     pub fn new(
-        dataset: Arc<MmapSegmentDataset>,
+        dataset: Arc<MmapSegmentStore>,
         indices: Vec<usize>,
         batch_size: usize,
         sequence_length: usize,
@@ -225,8 +162,10 @@ impl BatchPrefetcher {
     }
 
     /// Background worker that loads batches and sends them through the channel.
+    ///
+    /// Loads segments in parallel using rayon to maximize I/O throughput.
     fn prefetch_worker(
-        dataset: Arc<MmapSegmentDataset>,
+        dataset: Arc<MmapSegmentStore>,
         indices: Vec<usize>,
         batch_size: usize,
         sequence_length: usize,
@@ -242,15 +181,22 @@ impl BatchPrefetcher {
                 continue;
             };
 
-            // Load data from mmap into CPU vectors
             let actual_batch_size = batch_indices.len();
+
+            // Load segments in parallel using rayon
+            let segment_data: Vec<Option<(Vec<f32>, [f32; TOTAL_PLAYERS])>> = batch_indices
+                .par_iter()
+                .map(|&idx| dataset.get(idx))
+                .collect();
+
+            // Check if all segments loaded successfully
+            let mut valid = true;
             let mut input_data =
                 Vec::with_capacity(actual_batch_size * sequence_length * FEATURE_COUNT);
             let mut target_data = Vec::with_capacity(actual_batch_size * TOTAL_PLAYERS);
 
-            let mut valid = true;
-            for &idx in batch_indices {
-                if let Some((features, target_mmr)) = dataset.get(idx) {
+            for data in segment_data {
+                if let Some((features, target_mmr)) = data {
                     input_data.extend_from_slice(&features);
                     target_data.extend_from_slice(&target_mmr);
                 } else {

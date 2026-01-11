@@ -5,13 +5,14 @@
 //! - Check if cached segments exist for a replay
 //! - Memory-map cached segments for zero-copy access
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 use memmap2::Mmap;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Information about a cached segment file.
@@ -342,6 +343,8 @@ struct SegmentEntry {
 /// This struct holds metadata for all segments and loads them on-demand.
 /// Segments are loaded from disk when needed and immediately released after copying.
 /// The segments are stored as raw f32 arrays that can be directly used for training.
+///
+/// For validation datasets, all segments can be preloaded into memory for faster access.
 pub struct MmapSegmentStore {
     /// Maps segment index to segment metadata.
     entries: Vec<SegmentEntry>,
@@ -349,6 +352,9 @@ pub struct MmapSegmentStore {
     length: usize,
     /// Expected size of each segment in bytes.
     size_bytes: usize,
+    /// Preloaded segments in memory (index -> mmap).
+    /// Used for validation datasets that should stay in memory.
+    preloaded_segments: Option<HashMap<usize, Mmap>>,
 }
 
 impl MmapSegmentStore {
@@ -364,6 +370,7 @@ impl MmapSegmentStore {
             entries: Vec::new(),
             length: segment_length,
             size_bytes: segment_size_bytes,
+            preloaded_segments: None,
         }
     }
 
@@ -400,8 +407,17 @@ impl MmapSegmentStore {
 
     /// Loads a segment from disk and returns its data.
     ///
-    /// The segment is loaded, data is copied, and then immediately released.
+    /// If the segment is preloaded, uses the cached mmap.
+    /// Otherwise, loads from disk, copies data, and releases immediately.
     fn load_segment_data(&self, index: usize) -> anyhow::Result<Vec<f32>> {
+        // Check if preloaded first
+        if let Some(preloaded) = &self.preloaded_segments
+            && let Some(mmap) = preloaded.get(&index)
+        {
+            let slice = bytes_to_f32_slice(mmap);
+            return Ok(slice.to_vec());
+        }
+
         let entry = self
             .entries
             .get(index)
@@ -431,6 +447,57 @@ impl MmapSegmentStore {
 
         // Copy the data (mmap will be dropped when this function returns)
         Ok(slice.to_vec())
+    }
+
+    /// Preloads all segments into memory.
+    ///
+    /// This is useful for validation datasets that are accessed frequently
+    /// and are small enough to fit in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any segment file cannot be loaded.
+    pub fn preload_all_segments(&mut self) -> anyhow::Result<()> {
+        info!(
+            segment_count = self.entries.len(),
+            "Preloading all segments into memory"
+        );
+
+        let mut preloaded = HashMap::new();
+
+        for (index, entry) in self.entries.iter().enumerate() {
+            let file = File::open(&entry.path)?;
+            let metadata = file.metadata()?;
+
+            // Verify file size
+            if metadata.len() != self.size_bytes as u64 {
+                warn!(
+                    path = %entry.path.display(),
+                    expected = self.size_bytes,
+                    actual = metadata.len(),
+                    "Segment file has wrong size, skipping"
+                );
+                continue;
+            }
+
+            // SAFETY: We're memory-mapping a read-only file that we own.
+            // The file must not be modified while mapped.
+            #[expect(unsafe_code)]
+            let mmap = unsafe { Mmap::map(&file)? };
+
+            preloaded.insert(index, mmap);
+        }
+
+        self.preloaded_segments = Some(preloaded);
+        info!(
+            preloaded_count = self
+                .preloaded_segments
+                .as_ref()
+                .map_or(0, std::collections::HashMap::len),
+            "All segments preloaded"
+        );
+
+        Ok(())
     }
 
     /// Returns the number of segments in the store.
@@ -490,16 +557,6 @@ impl MmapSegmentStore {
         let target_mmr = self.get_target_mmr(index)?;
         let features = self.get_features(index)?;
         Some((features, target_mmr))
-    }
-}
-
-impl std::fmt::Debug for MmapSegmentStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MmapSegmentStore")
-            .field("segment_count", &self.entries.len())
-            .field("segment_length", &self.length)
-            .field("segment_size_bytes", &self.size_bytes)
-            .finish()
     }
 }
 
@@ -663,6 +720,24 @@ impl SegmentStoreBuilder {
             "Segment store built"
         );
         self.store
+    }
+
+    /// Finishes building and returns the segment store with all segments preloaded.
+    ///
+    /// This is useful for validation datasets that should stay in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any segment cannot be preloaded.
+    pub fn build_preloaded(mut self) -> anyhow::Result<MmapSegmentStore> {
+        info!(
+            replays_loaded = self.replays_loaded,
+            replays_cached = self.replays_cached,
+            segments_loaded = self.segments_loaded,
+            "Preloading all segments into memory"
+        );
+        self.store.preload_all_segments()?;
+        Ok(self.store)
     }
 
     /// Returns loading statistics.

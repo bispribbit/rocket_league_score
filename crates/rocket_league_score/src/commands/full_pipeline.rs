@@ -24,10 +24,10 @@ use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
 use config::{OBJECT_STORE, get_base_path};
 use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_game_sequence};
-use ml_model::segment_cache::SegmentStoreBuilder;
+use ml_model::segment_cache::{MmapSegmentStore, SegmentStoreBuilder};
 use ml_model::{
-    CheckpointConfig, MmapSegmentDataset, ModelConfig, TrainingConfig, TrainingState, create_model,
-    load_checkpoint, save_checkpoint, train,
+    CheckpointConfig, ModelConfig, TrainingConfig, TrainingState, create_model, load_checkpoint,
+    save_checkpoint, train,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
@@ -136,6 +136,12 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "Starting full training pipeline (lazy loading mode)"
     );
 
+    let model_config = ModelConfig::new();
+    let training_config = TrainingConfig::new(model_config.clone())
+        .with_learning_rate(config.learning_rate)
+        .with_epochs(config.epochs)
+        .with_batch_size(config.batch_size);
+
     // Step 1: Assign dataset splits to unassigned replays (skip when using max_replays limit)
     let step1_start = Instant::now();
     let current_counts = if config.max_replays.is_some() {
@@ -198,11 +204,14 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
 
     // Get base path for segment cache
     let base_path = get_base_path();
-    let segment_length = 300; // Default sequence length
 
     // Load training data using segment cache (zero-copy)
-    let train_dataset =
-        load_training_data_cached(&training_replays, segment_length, base_path.clone()).await?;
+    let train_dataset = load_training_data_cached(
+        &training_replays,
+        training_config.sequence_length,
+        base_path.clone(),
+    )
+    .await?;
 
     let step2_duration = step2_start.elapsed();
 
@@ -225,8 +234,12 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
                 replay_count = valid_replays.len(),
                 "Loading validation replays..."
             );
-            let valid_ds =
-                load_training_data_cached(&valid_replays, segment_length, base_path).await?;
+            let valid_ds = load_validation_data_cached(
+                &valid_replays,
+                training_config.sequence_length,
+                base_path,
+            )
+            .await?;
             info!(segments_loaded = valid_ds.len(), "Validation data loaded");
             Some(valid_ds)
         } else {
@@ -240,11 +253,6 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let step3_start = Instant::now();
     info!("Step 3: Initializing model...");
     let device = init_device();
-    let model_config = ModelConfig::new();
-    let training_config = TrainingConfig::new(model_config.clone())
-        .with_learning_rate(config.learning_rate)
-        .with_epochs(config.epochs)
-        .with_batch_size(config.batch_size);
 
     let checkpoint_dir = format!("models/{}", config.model_name);
     let checkpoint_prefix = format!("{checkpoint_dir}/checkpoint");
@@ -291,11 +299,9 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         save_on_improvement: true,
     };
 
-    // Wrap training dataset in Arc for the prefetcher to share across threads
-    let train_dataset = Arc::new(train_dataset);
     let output = train(
         &mut model,
-        Arc::clone(&train_dataset),
+        train_dataset.clone(),
         valid_dataset.as_ref(),
         &training_config,
         Some(checkpoint_config),
@@ -343,7 +349,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         "dropout": model_config.dropout,
         "train_ratio": config.train_ratio,
         "training_segments": train_dataset.len(),
-        "validation_segments": valid_dataset.as_ref().map_or(0, MmapSegmentDataset::len),
+        "validation_segments": valid_dataset.as_ref().map_or(0, |ds| ds.len()),
         "evaluation_games": current_counts.evaluation,
     });
 
@@ -381,7 +387,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     } else if let Some(valid_loss) = output.final_valid_loss {
         // Evaluation was already done during training using the evaluation split
         let valid_rmse = valid_loss.sqrt();
-        let valid_segments = valid_dataset.as_ref().map_or(0, MmapSegmentDataset::len);
+        let valid_segments = valid_dataset.as_ref().map_or(0, |ds| ds.len());
         info!(
             eval_segments = valid_segments,
             eval_loss = valid_loss,
@@ -428,12 +434,12 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
 ///
 /// # Returns
 ///
-/// An `MmapSegmentDataset` for zero-copy training access.
+/// Loads training data with lazy-loaded segments.
 async fn load_training_data_cached(
     replays: &[Replay],
     segment_length: usize,
     base_path: PathBuf,
-) -> Result<MmapSegmentDataset> {
+) -> Result<Arc<MmapSegmentStore>> {
     const BATCH_SIZE: usize = 100;
 
     let mut builder = SegmentStoreBuilder::new(base_path.clone(), segment_length);
@@ -580,7 +586,176 @@ async fn load_training_data_cached(
     );
 
     let store = builder.build();
-    Ok(MmapSegmentDataset::new(store))
+    Ok(Arc::new(store))
+}
+
+/// Loads validation data with all segments preloaded into memory.
+///
+/// This function is similar to `load_training_data_cached` but preloads
+/// all segments into memory for faster validation access.
+/// Validation datasets are typically smaller and accessed frequently,
+/// so keeping them in memory is a good trade-off.
+///
+/// # Arguments
+///
+/// * `replays` - List of replays to load
+/// * `segment_length` - Number of frames per segment
+/// * `base_path` - Base path for segment cache storage
+///
+/// # Returns
+///
+/// Loads validation data with all segments preloaded into memory.
+async fn load_validation_data_cached(
+    replays: &[Replay],
+    segment_length: usize,
+    base_path: PathBuf,
+) -> Result<Arc<MmapSegmentStore>> {
+    const BATCH_SIZE: usize = 100;
+
+    let mut builder = SegmentStoreBuilder::new(base_path.clone(), segment_length);
+
+    let mut skipped_no_players = 0;
+    let mut skipped_parse_error = 0;
+    let mut skipped_read_error = 0;
+    let mut cache_hits = 0;
+    let mut cache_misses = 0;
+
+    let total_replays = replays.len();
+    let num_batches = total_replays.div_ceil(BATCH_SIZE);
+
+    for (batch_idx, batch) in replays.chunks(BATCH_SIZE).enumerate() {
+        debug!(
+            "Processing validation batch {}/{} ({} replays)...",
+            batch_idx + 1,
+            num_batches,
+            batch.len()
+        );
+
+        for replay in batch {
+            // Get player ratings for this replay
+            let db_players = database::list_replay_players_by_replay(replay.id).await?;
+
+            if db_players.is_empty() {
+                skipped_no_players += 1;
+                continue;
+            }
+
+            // Build target MMR array
+            let target_mmr = build_target_mmr_from_players(&db_players);
+
+            // Check if segments already exist
+            let segments_exist = check_replay_segments_cached(
+                &base_path,
+                &replay.file_path,
+                replay.id,
+                segment_length,
+            );
+
+            if segments_exist {
+                // Segments exist, just load them
+                cache_hits += 1;
+                builder.add_replay(&replay.file_path, replay.id, target_mmr);
+                continue;
+            }
+
+            // Segments don't exist, need to parse replay and create them
+            cache_misses += 1;
+
+            // Read from object_store as bytes
+            let object_path = ObjectStorePath::from(replay.file_path.clone());
+            let replay_data = match OBJECT_STORE
+                .get(&object_path)
+                .await
+                .context("Failed to read from object_store")
+            {
+                Ok(get_result) => match get_result.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!(replay = %object_path.to_string(), error = %e, "Failed to read bytes");
+                        skipped_read_error += 1;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    error!(replay = %object_path.to_string(), error = %e, "Failed to get from object_store");
+                    skipped_read_error += 1;
+                    continue;
+                }
+            };
+
+            // Parse the replay from bytes
+            let parsed = match parse_replay_from_bytes(&replay_data) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(replay = %object_path.to_string(), error = %e, "Failed to parse replay");
+                    skipped_parse_error += 1;
+                    continue;
+                }
+            };
+
+            if parsed.frames.is_empty() {
+                warn!(replay = %object_path.to_string(), "Replay has no frames");
+                skipped_parse_error += 1;
+                continue;
+            }
+
+            // Convert to feature extractor format
+            let player_ratings: Vec<PlayerRating> = db_players
+                .iter()
+                .map(|p| PlayerRating {
+                    player_name: p.player_name.clone(),
+                    team: p.team,
+                    mmr: p.rank_division.mmr_middle(),
+                })
+                .collect();
+
+            let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+
+            // Ensure segments are cached, then add replay
+            if let Err(e) = builder.ensure_segments_cached(
+                &replay.file_path,
+                replay.id,
+                Some(&game_sequence.frames),
+                Some(game_sequence.frames.len()),
+            ) {
+                warn!(
+                    replay_id = %replay.id,
+                    error = %e,
+                    "Failed to cache segments"
+                );
+                continue;
+            }
+
+            builder.add_replay(&replay.file_path, replay.id, target_mmr);
+        }
+
+        let (replays_loaded, replays_cached, segments_loaded) = builder.stats();
+        info!(
+            "Validation batch {}/{} complete. Loaded: {}, Cached: {}, Segments: {}",
+            batch_idx + 1,
+            num_batches,
+            replays_loaded,
+            replays_cached,
+            segments_loaded
+        );
+    }
+
+    let (replays_loaded, replays_cached, segments_loaded) = builder.stats();
+    info!(
+        cache_hits,
+        cache_misses,
+        replays_loaded,
+        replays_newly_cached = replays_cached,
+        segments_loaded,
+        skipped_no_players,
+        skipped_parse_error,
+        skipped_read_error,
+        "Validation segment cache loading summary"
+    );
+
+    // Preload all segments into memory for faster validation access
+    let store = builder.build_preloaded()?;
+    Ok(Arc::new(store))
 }
 
 /// Checks if cached segments exist for a replay.

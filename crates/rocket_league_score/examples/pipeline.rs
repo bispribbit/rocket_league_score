@@ -22,11 +22,16 @@
 //! Example:
 //!   `DATABASE_URL=postgres`://... EPOCHS=50 cargo run --example pipeline
 
+use std::fs::File;
+
 use anyhow::Result;
+use chrono::Local;
 use database::initialize_pool;
 use rocket_league_score::commands;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn get_env_or_default<T: core::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -37,16 +42,32 @@ fn get_env_or_default<T: core::str::FromStr>(name: &str, default: T) -> T {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("info"))
+    // Create log file with current date and time
+    let now = Local::now();
+    let filename = format!("models/{}.txt", now.format("%Y%m%d_%H%M%S"));
+    let log_file = File::create(&filename)?;
+
+    // Initialize tracing with both stdout and file output
+    let env_filter = EnvFilter::new("info");
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(env_filter.clone());
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(log_file)
+        .with_filter(env_filter);
+
+    tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
 
     // Read configuration from environment
-    let model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "lstm_v4".to_string());
+    let model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "lstm_v5".to_string());
     let train_ratio: f64 = get_env_or_default("TRAIN_RATIO", 0.9);
     let epochs: usize = get_env_or_default("EPOCHS", 100);
-    let batch_size: usize = get_env_or_default("BATCH_SIZE", 2048);
+    let batch_size: usize = get_env_or_default("BATCH_SIZE", 5000);
     let learning_rate: f64 = get_env_or_default("LEARNING_RATE", 0.001);
     let resume: bool = get_env_or_default("RESUME", true);
     let max_replays: Option<usize> = std::env::var("MAX_REPLAYS")
