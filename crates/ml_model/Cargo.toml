@@ -15,5 +15,6 @@ bytemuck.workspace = true
 burn.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 uuid.workspace = true

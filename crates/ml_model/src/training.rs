@@ -292,7 +292,7 @@ where
         let mut improved = false;
         if let Some(valid_ds) = valid_dataset {
             let valid_start = Instant::now();
-            let inner_model = model.clone().valid();
+            let inner_model = model.valid();
             let inner_device = inner_model.linear1.weight.device();
             let valid_batcher =
                 SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length);
@@ -422,7 +422,7 @@ fn compute_validation_loss<B: Backend>(
 
         // Compute MSE manually
         let diff = predictions - batch.targets;
-        let squared = diff.clone() * diff;
+        let squared = diff.powf_scalar(2.0);
         let mse = squared.mean();
 
         let loss_value: f32 = mse
