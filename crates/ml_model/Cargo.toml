@@ -11,6 +11,7 @@ workspace = true
 feature_extractor.workspace = true
 
 anyhow.workspace = true
+bytemuck.workspace = true
 burn.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true

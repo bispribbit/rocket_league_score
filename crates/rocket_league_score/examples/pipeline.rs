@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
+        .with_ansi(false)
         .with_filter(env_filter);
 
     tracing_subscriber::registry()

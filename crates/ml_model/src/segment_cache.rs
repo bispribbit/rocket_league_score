@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytemuck::{cast_slice, cast_vec};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -164,7 +165,7 @@ pub fn write_segment_file(
     let mut frames_written = 0;
     for frame in frames.iter().take(segment_length) {
         // Write the raw f32 array as bytes (little-endian)
-        let bytes: &[u8] = bytemuck_cast_slice(&frame.features);
+        let bytes: &[u8] = cast_slice(&frame.features);
         file.write_all(bytes)?;
         frames_written += 1;
     }
@@ -175,7 +176,7 @@ pub fn write_segment_file(
         let padding_frame = frames
             .last()
             .map_or([0.0f32; FEATURE_COUNT], |f| f.features);
-        let padding_bytes: &[u8] = bytemuck_cast_slice(&padding_frame);
+        let padding_bytes: &[u8] = cast_slice(&padding_frame);
 
         for _ in frames_written..segment_length {
             file.write_all(padding_bytes)?;
@@ -307,24 +308,6 @@ fn parse_frame_range(stem: &str) -> Option<(usize, usize)> {
     }
 }
 
-/// Casts a slice of f32 to a slice of bytes.
-///
-/// # Safety
-///
-/// This is safe because f32 has a well-defined representation and we're
-/// casting to bytes which can represent any bit pattern.
-const fn bytemuck_cast_slice(slice: &[f32; FEATURE_COUNT]) -> &[u8] {
-    // SAFETY: f32 is POD (plain old data) and can be safely reinterpreted as bytes
-    let ptr = slice.as_ptr().cast::<u8>();
-    let len = slice.len() * std::mem::size_of::<f32>();
-    // SAFETY: We're creating a byte slice from a valid f32 slice
-    // The lifetime is tied to the input slice
-    #[expect(unsafe_code)]
-    unsafe {
-        std::slice::from_raw_parts(ptr, len)
-    }
-}
-
 // =============================================================================
 // SegmentStore - Segment storage with on-demand loading
 // =============================================================================
@@ -440,20 +423,10 @@ impl SegmentStore {
             );
         }
 
-        // Convert bytes to f32 slice
+        // Convert bytes to f32 Vec directly without copying using bytemuck
         // The data was written as f32 arrays by write_segment_file, so we can safely cast
-        let f32_count = bytes.len() / std::mem::size_of::<f32>();
-        let mut result = Vec::with_capacity(f32_count);
-
-        // Read f32 values from the byte slice
-        for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
-            let value = f32::from_le_bytes(
-                chunk
-                    .try_into()
-                    .map_err(|e| anyhow::anyhow!("Failed to convert bytes to f32: {e}"))?,
-            );
-            result.push(value);
-        }
+        // bytemuck::cast_vec will panic if alignment or size requirements aren't met
+        let result = cast_vec(bytes);
 
         Ok(Arc::new(result))
     }
@@ -490,19 +463,9 @@ impl SegmentStore {
                 continue;
             }
 
-            // Convert bytes to f32 vector
-            let f32_count = bytes.len() / std::mem::size_of::<f32>();
-            let mut data = Vec::with_capacity(f32_count);
-
-            // Read f32 values from the byte slice
-            for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
-                let value = f32::from_le_bytes(
-                    chunk
-                        .try_into()
-                        .map_err(|e| anyhow::anyhow!("Failed to convert bytes to f32: {e}"))?,
-                );
-                data.push(value);
-            }
+            // Convert bytes to f32 vector directly without copying using bytemuck
+            // bytemuck::cast_vec will panic if alignment or size requirements aren't met
+            let data = cast_vec(bytes);
 
             preloaded.insert(index, Arc::new(data));
         }
