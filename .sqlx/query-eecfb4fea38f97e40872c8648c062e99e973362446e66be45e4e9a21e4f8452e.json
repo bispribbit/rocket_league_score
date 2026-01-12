@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE replays\n                SET download_status = $1, updated_at = NOW()\n                WHERE id = $2\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "download_status",
+            "kind": {
+              "Enum": [
+                "not_downloaded",
+                "in_progress",
+                "downloaded",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eecfb4fea38f97e40872c8648c062e99e973362446e66be45e4e9a21e4f8452e"
+}
