@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bytemuck::{cast_slice, cast_vec};
+use bytemuck::{cast_slice, try_cast_vec};
 use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -308,6 +308,25 @@ fn parse_frame_range(stem: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Converts a Vec<u8> to a Vec<f32> without copying when possible.
+///
+/// Tries to use `bytemuck::try_cast_vec` for zero-copy conversion.
+/// If alignment fails, falls back to copying via `cast_slice`.
+fn bytes_to_f32_vec(bytes: Vec<u8>) -> Vec<f32> {
+    // Try zero-copy conversion first
+    // This will succeed if the Vec is properly aligned for f32
+    match try_cast_vec(bytes) {
+        Ok(f32_vec) => f32_vec,
+        Err((_error, original_bytes)) => {
+            // Alignment mismatch - fall back to copying
+            // try_cast_vec returns (PodCastError, Vec<u8>) in the error
+            // This is safe because we know the bytes represent valid f32 values
+            let f32_slice: &[f32] = cast_slice(&original_bytes);
+            f32_slice.to_vec()
+        }
+    }
+}
+
 // =============================================================================
 // SegmentStore - Segment storage with on-demand loading
 // =============================================================================
@@ -423,10 +442,9 @@ impl SegmentStore {
             );
         }
 
-        // Convert bytes to f32 Vec directly without copying using bytemuck
-        // The data was written as f32 arrays by write_segment_file, so we can safely cast
-        // bytemuck::cast_vec will panic if alignment or size requirements aren't met
-        let result = cast_vec(bytes);
+        // Convert bytes to f32 Vec, using zero-copy when possible
+        // Falls back to copying if alignment doesn't match
+        let result = bytes_to_f32_vec(bytes);
 
         Ok(Arc::new(result))
     }
@@ -463,9 +481,9 @@ impl SegmentStore {
                 continue;
             }
 
-            // Convert bytes to f32 vector directly without copying using bytemuck
-            // bytemuck::cast_vec will panic if alignment or size requirements aren't met
-            let data = cast_vec(bytes);
+            // Convert bytes to f32 vector, using zero-copy when possible
+            // Falls back to copying if alignment doesn't match
+            let data = bytes_to_f32_vec(bytes);
 
             preloaded.insert(index, Arc::new(data));
         }

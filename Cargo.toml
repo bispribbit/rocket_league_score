@@ -27,7 +27,7 @@ bytemuck = { version = "1.24.0" }
 burn = { version = "0.19.1", default-features = false, features = ["train", "wgpu", "ndarray", "std", "autodiff"] }
 bytes = { version = "1.11.0" }
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.5.53", features = ["derive"] }
+clap = { version = "4.5.54", features = ["derive"] }
 csv = { version = "1.4" }
 dotenvy = { version = "0.15" }
 governor = { version = "0.10.4" }
@@ -37,11 +37,11 @@ parking_lot = { version = "0.12.5" }
 rayon = { version = "1.11.0" }
 reqwest = { version = "0.13.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.148" }
+serde_json = { version = "1.0.149" }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "migrate", "uuid", "chrono", "json"] }
 strum = { version = "0.27.2", features = ["derive"] }
 thiserror = { version = "2.0" }
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
 tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1.19.0", features = ["v4"] }
