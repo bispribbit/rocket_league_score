@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use burn::backend::Wgpu;
 use feature_extractor::extract_frame_features;
 use ml_model::{SequenceModel, load_checkpoint, predict, predict_evolving};
@@ -18,41 +18,45 @@ const DEFAULT_SEQUENCE_LENGTH: usize = 300;
 
 /// Runs the predict command.
 ///
+/// # Arguments
+///
+/// * `replay_path` - Path to the replay file to analyze
+/// * `model_path` - Path to model checkpoint file
+///
 /// # Errors
 ///
 /// Returns an error if prediction fails.
-pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> Result<()> {
-    info!(replay = %replay_path.display(), "Predicting player MMR with LSTM model");
+pub fn run(replay_path: &Path, model_path: &Path) -> Result<()> {
+    info!(
+        replay = %replay_path.display(),
+        model_path = %model_path.display(),
+        "Predicting player MMR with LSTM model"
+    );
 
-    // Load the model
-    let model_record = if let Some(v) = version {
-        database::find_model_by_name_version(model_name, v).await?
+    // Try to load sequence length from config file if available
+    let config_path = format!("{}.config.json", model_path.to_string_lossy());
+    let sequence_length = if std::path::Path::new(&config_path).exists() {
+        if let Ok(config_data) = std::fs::read_to_string(&config_path) {
+            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_data) {
+                config_json
+                    .get("sequence_length")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(DEFAULT_SEQUENCE_LENGTH, |v| v as usize)
+            } else {
+                DEFAULT_SEQUENCE_LENGTH
+            }
+        } else {
+            DEFAULT_SEQUENCE_LENGTH
+        }
     } else {
-        database::find_latest_model(model_name).await?
+        DEFAULT_SEQUENCE_LENGTH
     };
 
-    let model_record = model_record.context(format!(
-        "Model '{model_name}' not found. Train a model first."
-    ))?;
-
-    // Get sequence length from training config if available
-    let sequence_length = model_record
-        .training_config
-        .as_ref()
-        .and_then(|c| c.get("sequence_length"))
-        .and_then(serde_json::Value::as_u64)
-        .map_or(DEFAULT_SEQUENCE_LENGTH, |v| v as usize);
-
-    info!(
-        model = %model_record.name,
-        version = model_record.version,
-        sequence_length,
-        "Using model"
-    );
+    info!(sequence_length, "Using sequence length");
 
     // Load model weights
     let device = init_device();
-    let model: SequenceModel<Backend> = load_checkpoint(&model_record.checkpoint_path, &device)?;
+    let model: SequenceModel<Backend> = load_checkpoint(&model_path.to_string_lossy(), &device)?;
 
     // Parse the replay
     let parsed = parse_replay(replay_path)?;
@@ -64,6 +68,19 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
 
     info!(frames = parsed.frames.len(), "Analyzing gameplay sequence");
 
+    // Extract player names from the first frame (players are sorted by team then actor_id)
+    let player_names: Vec<String> = parsed
+        .frames
+        .first()
+        .map(|frame| {
+            frame
+                .players
+                .iter()
+                .map(|p| p.name.as_ref().clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Extract features from all frames (no score context available in predict mode)
     let frame_features: Vec<_> = parsed.frames.iter().map(extract_frame_features).collect();
 
@@ -74,12 +91,17 @@ pub async fn run(replay_path: &Path, model_name: &str, version: Option<i32>) -> 
     info!("Blue Team:");
     for (i, mmr) in final_predictions.iter().take(3).enumerate() {
         let skill_level = interpret_mmr(*mmr);
-        info!("  Player {} - MMR: {:.0} ({})", i + 1, mmr, skill_level);
+        let player_name = player_names.get(i).map(String::as_str).unwrap_or("Unknown");
+        info!("  {} - MMR: {:.0} ({})", player_name, mmr, skill_level);
     }
     info!("Orange Team:");
     for (i, mmr) in final_predictions.iter().skip(3).enumerate() {
         let skill_level = interpret_mmr(*mmr);
-        info!("  Player {} - MMR: {:.0} ({})", i + 1, mmr, skill_level);
+        let player_name = player_names
+            .get(i + 3)
+            .map(String::as_str)
+            .unwrap_or("Unknown");
+        info!("  {} - MMR: {:.0} ({})", player_name, mmr, skill_level);
     }
 
     // Show how predictions evolved over the game
