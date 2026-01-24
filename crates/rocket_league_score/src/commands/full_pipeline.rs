@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use burn::backend::{Autodiff, Wgpu};
+use burn::backend::{Autodiff, Cuda};
 use config::{OBJECT_STORE, get_base_path};
 use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_player_centric_game_sequence};
 use ml_model::segment_cache::{SegmentStore, SegmentStoreBuilder};
@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 use super::init_device;
 
 /// Training requires Autodiff wrapper for automatic differentiation.
-type TrainBackend = Autodiff<Wgpu>;
+type TrainBackend = Autodiff<Cuda>;
 
 /// Configuration for the full training pipeline.
 #[derive(Debug, Clone)]

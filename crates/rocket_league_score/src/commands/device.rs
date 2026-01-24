@@ -1,13 +1,12 @@
-use burn::backend::wgpu::WgpuDevice;
+use burn::backend::cuda::CudaDevice;
 use tracing::info;
 
-/// Initializes a WGPU device for GPU acceleration.
+/// Initializes a CUDA device for GPU acceleration.
 ///
-/// WGPU is a cross-platform GPU API that works on Windows, Linux, and macOS.
-/// It uses Vulkan on Linux/Windows and Metal on macOS.
+/// CUDA is NVIDIA's GPU API that provides high-performance computing.
 ///
 /// This function only exists to be able to change the device at a single location.
-pub fn init_device() -> WgpuDevice {
-    info!("Initializing device...");
-    WgpuDevice::default()
+pub fn init_device() -> CudaDevice {
+    info!("Initializing CUDA device...");
+    CudaDevice::default()
 }

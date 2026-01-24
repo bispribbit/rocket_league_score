@@ -306,27 +306,27 @@ pub fn extract_player_centric_frame_features(
     idx += 13;
 
     // 6. Teammate relationships (4 features)
-    if let Some(&teammate1) = teammates.first()
-        && !teammate1.actor_state.is_demolished
-    {
-        let dist_to_ball = distance(&teammate1.actor_state.position, &frame.ball.position);
-        features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-        let dist_to_this = distance(
-            &teammate1.actor_state.position,
-            &this_player.actor_state.position,
-        );
-        features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
+    if let Some(&teammate1) = teammates.first() {
+        if !teammate1.actor_state.is_demolished {
+            let dist_to_ball = distance(&teammate1.actor_state.position, &frame.ball.position);
+            features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+            let dist_to_this = distance(
+                &teammate1.actor_state.position,
+                &this_player.actor_state.position,
+            );
+            features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
+        }
     }
-    if let Some(&teammate2) = teammates.get(1)
-        && !teammate2.actor_state.is_demolished
-    {
-        let dist_to_ball = distance(&teammate2.actor_state.position, &frame.ball.position);
-        features.features[idx + 2] = (dist_to_ball / field::DIAGONAL).min(1.0);
-        let dist_to_this = distance(
-            &teammate2.actor_state.position,
-            &this_player.actor_state.position,
-        );
-        features.features[idx + 3] = (dist_to_this / field::DIAGONAL).min(1.0);
+    if let Some(&teammate2) = teammates.get(1) {
+        if !teammate2.actor_state.is_demolished {
+            let dist_to_ball = distance(&teammate2.actor_state.position, &frame.ball.position);
+            features.features[idx + 2] = (dist_to_ball / field::DIAGONAL).min(1.0);
+            let dist_to_this = distance(
+                &teammate2.actor_state.position,
+                &this_player.actor_state.position,
+            );
+            features.features[idx + 3] = (dist_to_this / field::DIAGONAL).min(1.0);
+        }
     }
     idx += 4;
 
@@ -340,16 +340,16 @@ pub fn extract_player_centric_frame_features(
 
     // 10. Opponent relationships (6 features)
     for i in 0..3 {
-        if let Some(&opponent) = opponents.get(i)
-            && !opponent.actor_state.is_demolished
-        {
-            let dist_to_ball = distance(&opponent.actor_state.position, &frame.ball.position);
-            features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-            let dist_to_this = distance(
-                &opponent.actor_state.position,
-                &this_player.actor_state.position,
-            );
-            features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
+        if let Some(&opponent) = opponents.get(i) {
+            if !opponent.actor_state.is_demolished {
+                let dist_to_ball = distance(&opponent.actor_state.position, &frame.ball.position);
+                features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+                let dist_to_this = distance(
+                    &opponent.actor_state.position,
+                    &this_player.actor_state.position,
+                );
+                features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
+            }
         }
         idx += 2;
     }
@@ -464,7 +464,15 @@ pub struct PlayerCentricGameSequence {
     pub target_mmr: [f32; TOTAL_PLAYERS],
 }
 
+/// Frame subsampling rate: take 1 frame out of every N frames.
+/// This reduces data size while still capturing gameplay patterns.
+/// At 30fps, taking 1/6 frames gives ~5fps effective sampling rate.
+pub const FRAME_SUBSAMPLE_RATE: usize = 6;
+
 /// Extracts a game sequence sample with player-centric features.
+///
+/// Uses frame subsampling (1 frame out of every `FRAME_SUBSAMPLE_RATE` frames)
+/// to reduce data size while preserving gameplay patterns.
 ///
 /// # Arguments
 ///
@@ -473,16 +481,17 @@ pub struct PlayerCentricGameSequence {
 ///
 /// # Returns
 ///
-/// A `PlayerCentricGameSequence` with features for all 6 players across all frames
+/// A `PlayerCentricGameSequence` with features for all 6 players across subsampled frames
 pub fn extract_player_centric_game_sequence(
     frames: &[GameFrame],
     player_ratings: &[PlayerRating],
 ) -> PlayerCentricGameSequence {
     let target_mmr = build_target_mmr_array(player_ratings);
 
-    // Extract features for all frames, all players
+    // Extract features for subsampled frames (1 out of every FRAME_SUBSAMPLE_RATE), all players
     let player_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
         .iter()
+        .step_by(FRAME_SUBSAMPLE_RATE)
         .map(extract_all_player_centric_features)
         .collect();
 
