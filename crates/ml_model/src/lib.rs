@@ -45,10 +45,6 @@ pub struct ModelConfig {
     /// Dropout rate for regularization.
     #[config(default = 0.5)]
     pub dropout: f64,
-    /// Size of player position embeddings (0 to disable).
-    /// When > 0, adds learnable embeddings to distinguish player positions.
-    #[config(default = 8)]
-    pub player_embedding_size: usize,
 }
 
 /// Configuration for training the model.
@@ -80,7 +76,6 @@ pub struct TrainingConfig {
 /// This model processes sequences of game frames to predict player MMR.
 /// It uses stacked LSTM layers to capture temporal patterns in gameplay,
 /// then projects the final hidden state to per-player MMR predictions.
-/// Each player has a separate output head to encourage distinct predictions.
 #[derive(Module, Debug)]
 pub struct SequenceModel<B: Backend> {
     /// First LSTM layer processes raw frame features.
@@ -91,20 +86,14 @@ pub struct SequenceModel<B: Backend> {
     dropout: Dropout,
     /// First feedforward layer after LSTM.
     linear1: Linear<B>,
-    /// Player position embeddings (one per player slot).
-    /// When enabled, these are concatenated to the hidden state before output.
-    player_embeddings: Option<Linear<B>>,
-    /// Separate output head for each player to encourage distinct predictions.
-    /// Shape: [6, feedforward_hidden + player_embedding_size] -> [6, 1]
-    player_output_heads: Vec<Linear<B>>,
+    /// Output layer predicting MMR for each player.
+    linear_out: Linear<B>,
     /// `ReLU` activation.
     activation: Relu,
     /// Hidden size of first LSTM (needed for inference).
     lstm1_hidden: usize,
     /// Hidden size of second LSTM (needed for inference).
     lstm2_hidden: usize,
-    /// Size of player embeddings (0 if disabled).
-    player_embedding_size: usize,
 }
 
 impl<B: Backend> SequenceModel<B> {
@@ -120,25 +109,7 @@ impl<B: Backend> SequenceModel<B> {
         // Feedforward layers
         let linear1 =
             LinearConfig::new(config.lstm_hidden_2, config.feedforward_hidden).init(device);
-
-        // Player embeddings: create a lookup table using Linear layer
-        // We'll use a Linear layer as an embedding table: [num_players, embedding_size]
-        let player_embeddings = if config.player_embedding_size > 0 {
-            Some(
-                LinearConfig::new(TOTAL_PLAYERS, config.player_embedding_size)
-                    .with_bias(false)
-                    .init(device),
-            )
-        } else {
-            None
-        };
-
-        // Separate output head for each player
-        // Input size: feedforward_hidden + player_embedding_size (if enabled)
-        let input_size = config.feedforward_hidden + config.player_embedding_size;
-        let player_output_heads: Vec<Linear<B>> = (0..TOTAL_PLAYERS)
-            .map(|_| LinearConfig::new(input_size, 1).init(device))
-            .collect();
+        let linear_out = LinearConfig::new(config.feedforward_hidden, TOTAL_PLAYERS).init(device);
 
         let activation = Relu::new();
 
@@ -147,12 +118,10 @@ impl<B: Backend> SequenceModel<B> {
             lstm2,
             dropout,
             linear1,
-            player_embeddings,
-            player_output_heads,
+            linear_out,
             activation,
             lstm1_hidden: config.lstm_hidden_1,
             lstm2_hidden: config.lstm_hidden_2,
-            player_embedding_size: config.player_embedding_size,
         }
     }
 
@@ -186,63 +155,9 @@ impl<B: Backend> SequenceModel<B> {
         let x = self.linear1.forward(x);
         let x = self.activation.forward(x);
         let x = self.dropout.forward(x);
-        // x is now [batch, feedforward_hidden]
-        let feedforward_hidden = x.dims()[1];
 
-        // Get player embeddings if enabled
-        let player_emb = if let Some(emb_layer) = &self.player_embeddings {
-            // Create one-hot indices for each player: [6, 6]
-            // Each row is a one-hot vector for player 0, 1, 2, 3, 4, 5
-            let device = x.device();
-            let mut one_hot_data = vec![0.0f32; TOTAL_PLAYERS * TOTAL_PLAYERS];
-            for i in 0..TOTAL_PLAYERS {
-                if let Some(elem) = one_hot_data.get_mut(i * TOTAL_PLAYERS + i) {
-                    *elem = 1.0;
-                }
-            }
-            let one_hot = Tensor::<B, 2>::from_floats(one_hot_data.as_slice(), &device)
-                .reshape([TOTAL_PLAYERS, TOTAL_PLAYERS]);
-            // Embed: [6, TOTAL_PLAYERS] -> [6, embedding_size]
-            let emb = emb_layer.forward(one_hot);
-            // Expand to batch: [6, embedding_size] -> [batch, 6, embedding_size]
-            emb.unsqueeze::<3>()
-                .expand([batch_size, TOTAL_PLAYERS, self.player_embedding_size])
-        } else {
-            // Create zero embeddings if disabled
-            let device = x.device();
-            Tensor::<B, 3>::zeros([batch_size, TOTAL_PLAYERS, 0], &device)
-        };
-
-        // Expand hidden state for each player: [batch, feedforward_hidden] -> [batch, 6, feedforward_hidden]
-        let x_expanded = x
-            .unsqueeze::<3>()
-            .expand([batch_size, TOTAL_PLAYERS, feedforward_hidden]);
-
-        // Concatenate hidden state with player embeddings for each player
-        // x_expanded: [batch, 6, feedforward_hidden]
-        // player_emb: [batch, 6, embedding_size]
-        // combined: [batch, 6, feedforward_hidden + embedding_size]
-        let combined = if self.player_embedding_size > 0 {
-            Tensor::cat(vec![x_expanded, player_emb], 2)
-        } else {
-            x_expanded
-        };
-
-        // Apply separate output head for each player
-        let mut outputs = Vec::new();
-        for (player_idx, head) in self.player_output_heads.iter().enumerate() {
-            // Extract features for this player: [batch, feedforward_hidden + embedding_size]
-            let player_features = combined
-                .clone()
-                .narrow(1, player_idx, 1)
-                .reshape([batch_size, feedforward_hidden + self.player_embedding_size]);
-            // Apply output head: [batch, features] -> [batch, 1]
-            let output = head.forward(player_features);
-            outputs.push(output);
-        }
-
-        // Concatenate all player outputs: [batch, 6]
-        Tensor::cat(outputs, 1)
+        // Output: [batch, 6]
+        self.linear_out.forward(x)
     }
 
     /// Forward pass for inference (without dropout).

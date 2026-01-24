@@ -1206,6 +1206,54 @@ impl From<crate::RankInfo> for RankDivision {
     }
 }
 
+impl From<i32> for RankDivision {
+    /// Converts an MMR value to the corresponding `RankDivision`.
+    ///
+    /// Iterates through all ranks and finds the one where the MMR falls
+    /// within the `mmr_min` to `mmr_max` range.
+    ///
+    /// # Returns
+    ///
+    /// - If MMR is below the minimum, returns `BronzeIDivision1`
+    /// - If MMR is above the maximum, returns `SupersonicLegend`
+    /// - Otherwise returns the matching rank division
+    fn from(mmr: i32) -> Self {
+        for rank in Self::iter() {
+            if mmr >= rank.mmr_min() && mmr <= rank.mmr_max() {
+                return rank;
+            }
+        }
+
+        // If no exact match found, handle edge cases
+        if mmr < Self::BronzeIDivision1.mmr_min() {
+            return Self::BronzeIDivision1;
+        }
+
+        if mmr > Self::SupersonicLegend.mmr_max() {
+            return Self::SupersonicLegend;
+        }
+
+        Self::BronzeIDivision1
+    }
+}
+
+impl From<f32> for RankDivision {
+    /// Converts an MMR value to the corresponding `RankDivision`.
+    ///
+    /// Iterates through all ranks and finds the one where the MMR falls
+    /// within the `mmr_min` to `mmr_max` range.
+    ///
+    /// # Returns
+    ///
+    /// - If MMR is below the minimum, returns `BronzeIDivision1`
+    /// - If MMR is above the maximum, returns `SupersonicLegend`
+    /// - Otherwise returns the matching rank division
+    fn from(mmr: f32) -> Self {
+        let mmr = mmr as i32;
+        Self::from(mmr)
+    }
+}
+
 impl From<RankDivision> for Rank {
     fn from(division: RankDivision) -> Self {
         match division {
@@ -1478,5 +1526,27 @@ mod tests {
         assert!(RankDivision::BronzeIDivision1 < RankDivision::BronzeIDivision2);
         assert!(RankDivision::BronzeIDivision4 < RankDivision::BronzeIIDivision1);
         assert!(RankDivision::GrandChampionIIIDivision4 < RankDivision::SupersonicLegend);
+    }
+
+    #[test]
+    fn test_from_mmr() {
+        // Test exact matches within ranges
+        assert_eq!(RankDivision::from(0), RankDivision::BronzeIDivision1);
+        assert_eq!(RankDivision::from(100), RankDivision::BronzeIDivision1);
+        assert_eq!(RankDivision::from(1900), RankDivision::SupersonicLegend);
+        assert_eq!(RankDivision::from(2000), RankDivision::SupersonicLegend);
+
+        // Test edge cases: below minimum
+        assert_eq!(RankDivision::from(-100), RankDivision::BronzeIDivision1);
+
+        // Test edge cases: above maximum
+        assert_eq!(RankDivision::from(3000), RankDivision::SupersonicLegend);
+
+        // Test mid-range values
+        assert_eq!(RankDivision::from(1200), RankDivision::ChampionIIDivision1);
+        assert_eq!(
+            RankDivision::from(1500),
+            RankDivision::GrandChampionIDivision3
+        );
     }
 }
