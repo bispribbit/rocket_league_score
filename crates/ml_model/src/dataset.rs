@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 
 use burn::prelude::*;
-use feature_extractor::{FEATURE_COUNT, TOTAL_PLAYERS};
+use feature_extractor::{PLAYER_CENTRIC_FEATURE_COUNT, TOTAL_PLAYERS};
 use rayon::prelude::*;
 use tracing::info;
 
@@ -18,9 +18,11 @@ use crate::segment_cache::SegmentStore;
 /// Batch of sequence data ready for model input.
 #[derive(Debug, Clone)]
 pub struct SequenceBatch<B: Backend> {
-    /// Input tensor of shape [`batch_size`, `seq_len`, `FEATURE_COUNT`].
+    /// Input tensor for player-centric model.
+    /// Shape: `[batch_size * 6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
+    /// Already reshaped so all 6 players are processed in parallel.
     pub inputs: Tensor<B, 3>,
-    /// Target tensor of shape [`batch_size`, `TOTAL_PLAYERS`].
+    /// Target tensor of shape `[batch_size, TOTAL_PLAYERS]`.
     pub targets: Tensor<B, 2>,
 }
 
@@ -39,9 +41,10 @@ impl<B: Backend> SequenceBatcher<B> {
         }
     }
 
-    /// Batches segments from a dataset by indices.
+    /// Batches segments from a dataset by indices using player-centric features.
     ///
     /// This loads segments on-demand using the provided indices.
+    /// Each segment contains features for all 6 players.
     pub fn batch_from_indices(
         &self,
         dataset: &Arc<SegmentStore>,
@@ -53,20 +56,24 @@ impl<B: Backend> SequenceBatcher<B> {
 
         let batch_size = indices.len();
 
-        // Build input tensor [batch_size, seq_len, FEATURE_COUNT]
-        let mut input_data = Vec::with_capacity(batch_size * self.sequence_length * FEATURE_COUNT);
+        // Build input tensor [batch_size * 6, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]
+        let mut input_data = Vec::with_capacity(
+            batch_size * 6 * self.sequence_length * PLAYER_CENTRIC_FEATURE_COUNT,
+        );
         let mut target_data = Vec::with_capacity(batch_size * TOTAL_PLAYERS);
 
         for &idx in indices {
-            let (features, target_mmr) = dataset.get(idx)?;
-            input_data.extend_from_slice(features.as_slice());
+            let (player_features, target_mmr) = dataset.get_player_centric(idx)?;
+            // player_features is already flattened as [6, seq_len, features]
+            input_data.extend_from_slice(player_features.as_slice());
             target_data.extend_from_slice(&target_mmr);
         }
 
+        // Create input tensor: [batch * 6, seq_len, features]
         let inputs = Tensor::<B, 1>::from_floats(input_data.as_slice(), &self.device).reshape([
-            batch_size,
+            batch_size * 6,
             self.sequence_length,
-            FEATURE_COUNT,
+            PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
         let targets = Tensor::<B, 1>::from_floats(target_data.as_slice(), &self.device)
@@ -84,7 +91,7 @@ impl<B: Backend> SequenceBatcher<B> {
 /// Contains raw f32 vectors that can be quickly converted to tensors.
 #[derive(Debug)]
 pub struct PreloadedBatchData {
-    /// Flattened input data: [batch_size * seq_len * FEATURE_COUNT]
+    /// Flattened input data: [batch_size * 6 * seq_len * PLAYER_CENTRIC_FEATURE_COUNT]
     pub input_data: Vec<f32>,
     /// Flattened target data: [batch_size * TOTAL_PLAYERS]
     pub target_data: Vec<f32>,
@@ -98,9 +105,9 @@ impl PreloadedBatchData {
     /// Converts the preloaded data to GPU tensors.
     pub fn to_batch<B: Backend>(&self, device: &B::Device) -> SequenceBatch<B> {
         let inputs = Tensor::<B, 1>::from_floats(self.input_data.as_slice(), device).reshape([
-            self.batch_size,
+            self.batch_size * 6,
             self.sequence_length,
-            FEATURE_COUNT,
+            PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
         let targets = Tensor::<B, 1>::from_floats(self.target_data.as_slice(), device)
@@ -186,13 +193,14 @@ impl BatchPrefetcher {
             // Load segments in parallel using rayon
             let segment_data: Vec<Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])>> = batch_indices
                 .par_iter()
-                .map(|&idx| dataset.get(idx))
+                .map(|&idx| dataset.get_player_centric(idx))
                 .collect();
 
             // Check if all segments loaded successfully
             let mut valid = true;
-            let mut input_data =
-                Vec::with_capacity(actual_batch_size * sequence_length * FEATURE_COUNT);
+            let mut input_data = Vec::with_capacity(
+                actual_batch_size * 6 * sequence_length * PLAYER_CENTRIC_FEATURE_COUNT,
+            );
             let mut target_data = Vec::with_capacity(actual_batch_size * TOTAL_PLAYERS);
 
             for data in segment_data {

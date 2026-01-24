@@ -4,8 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use burn::backend::Wgpu;
-use feature_extractor::extract_frame_features;
-use ml_model::{SequenceModel, load_checkpoint, predict};
+use ml_model::{SequenceModel, load_checkpoint, predict_player_centric};
 use replay_parser::parse_replay;
 use replay_structs::RankDivision;
 use tracing::{info, warn};
@@ -82,11 +81,9 @@ pub fn run(replay_path: &Path, model_path: &Path) -> Result<()> {
         })
         .unwrap_or_default();
 
-    // Extract features from all frames (no score context available in predict mode)
-    let frame_features: Vec<_> = parsed.frames.iter().map(extract_frame_features).collect();
-
+    // Use player-centric prediction (features extracted inside predict_player_centric)
     // Show predictions per segment
-    let num_segments = frame_features.len() / sequence_length;
+    let num_segments = parsed.frames.len() / sequence_length;
     info!("=== MMR Per Segment ({} segments) ===", num_segments.max(1));
 
     let mut blue_avg_segments = Vec::with_capacity(num_segments);
@@ -97,12 +94,13 @@ pub fn run(replay_path: &Path, model_path: &Path) -> Result<()> {
 
     for segment_idx in 0..num_segments.max(1) {
         let start = segment_idx * sequence_length;
-        let end = (start + sequence_length).min(frame_features.len());
-        let Some(segment_frames) = frame_features.get(start..end) else {
+        let end = (start + sequence_length).min(parsed.frames.len());
+        let Some(segment_frames) = parsed.frames.get(start..end) else {
             continue;
         };
 
-        let segment_prediction = predict(&model, segment_frames, &device, sequence_length);
+        let segment_prediction =
+            predict_player_centric(&model, segment_frames, &device, sequence_length);
 
         let start_time = segment_frames.first().map_or(0.0, |f| f.time);
         let end_time = segment_frames.last().map_or(0.0, |f| f.time);

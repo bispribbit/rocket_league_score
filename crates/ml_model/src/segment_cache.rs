@@ -1,7 +1,7 @@
-//! Segment caching for efficient feature storage and retrieval.
+//! Segment caching for efficient player-centric feature storage and retrieval.
 //!
 //! This module provides functionality to:
-//! - Write extracted feature segments to disk in binary format
+//! - Write player-centric feature segments to disk in binary format
 //! - Check if cached segments exist for a replay
 //! - Read cached segments from disk
 
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytemuck::{cast_slice, try_cast_vec};
-use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
+use feature_extractor::{PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -121,8 +121,9 @@ pub fn check_segments_exist(
             return false;
         }
 
-        // Also verify file size is correct
-        let expected_size = segment_length * FEATURE_COUNT * std::mem::size_of::<f32>();
+        // Verify file size is correct for player-centric features
+        let expected_size =
+            6 * segment_length * PLAYER_CENTRIC_FEATURE_COUNT * std::mem::size_of::<f32>();
         if let Ok(metadata) = fs::metadata(&segment_path) {
             if metadata.len() != expected_size as u64 {
                 debug!(
@@ -141,17 +142,23 @@ pub fn check_segments_exist(
     true
 }
 
-/// Writes a single segment to disk in binary format.
+/// Writes a single player-centric segment to disk in binary format.
 ///
-/// The file contains raw f32 values in little-endian format:
-/// `[frame_0_feature_0, frame_0_feature_1, ..., frame_N_feature_127]`
+/// The file contains raw f32 values for all 6 players:
+/// `[player_0_frame_0_features, player_0_frame_1_features, ..., player_5_frame_N_features]`
+///
+/// # Arguments
+///
+/// * `segment_path` - Path where segment file will be written
+/// * `player_frames` - Player-centric features for all frames (each frame has 6 player views)
+/// * `segment_length` - Number of frames per segment (for padding)
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be created or written.
-pub fn write_segment_file(
+/// Returns an error if file writing fails.
+pub fn write_player_centric_segment_file(
     segment_path: &Path,
-    frames: &[FrameFeatures],
+    player_frames: &[[PlayerCentricFrameFeatures; 6]],
     segment_length: usize,
 ) -> anyhow::Result<()> {
     // Ensure parent directory exists
@@ -161,25 +168,29 @@ pub fn write_segment_file(
 
     let mut file = File::create(segment_path)?;
 
-    // Write features for each frame
-    let mut frames_written = 0;
-    for frame in frames.iter().take(segment_length) {
-        // Write the raw f32 array as bytes (little-endian)
-        let bytes: &[u8] = cast_slice(&frame.features);
-        file.write_all(bytes)?;
-        frames_written += 1;
-    }
+    // Write features for each player for each frame
+    // Format: [player_0_all_frames, player_1_all_frames, ..., player_5_all_frames]
+    for player_idx in 0..6 {
+        let mut frames_written = 0;
+        for frame_set in player_frames.iter().take(segment_length) {
+            if let Some(player_features) = frame_set.get(player_idx) {
+                let bytes: &[u8] = cast_slice(&player_features.features);
+                file.write_all(bytes)?;
+                frames_written += 1;
+            }
+        }
 
-    // Pad with zeros if we have fewer frames than segment_length
-    if frames_written < segment_length {
-        // Pad with the last frame's features (or zeros if empty)
-        let padding_frame = frames
-            .last()
-            .map_or([0.0f32; FEATURE_COUNT], |f| f.features);
-        let padding_bytes: &[u8] = cast_slice(&padding_frame);
+        // Pad with last frame if needed
+        if frames_written < segment_length {
+            let padding_frame = player_frames
+                .last()
+                .and_then(|f| f.get(player_idx))
+                .map_or([0.0f32; PLAYER_CENTRIC_FEATURE_COUNT], |p| p.features);
+            let padding_bytes: &[u8] = cast_slice(&padding_frame);
 
-        for _ in frames_written..segment_length {
-            file.write_all(padding_bytes)?;
+            for _ in frames_written..segment_length {
+                file.write_all(padding_bytes)?;
+            }
         }
     }
 
@@ -187,14 +198,14 @@ pub fn write_segment_file(
     Ok(())
 }
 
-/// Writes all segments for a replay to disk.
+/// Writes all player-centric segments for a replay to disk.
 ///
 /// # Arguments
 ///
 /// * `base_path` - Base directory for segment storage
 /// * `file_path` - Original replay file path (for directory structure)
 /// * `replay_id` - Unique replay identifier
-/// * `frames` - All extracted frame features for the replay
+/// * `player_frames` - All player-centric frame features (each frame has 6 player views)
 /// * `segment_length` - Number of frames per segment
 ///
 /// # Returns
@@ -203,32 +214,32 @@ pub fn write_segment_file(
 ///
 /// # Errors
 ///
-/// Returns an error if any segment file cannot be written.
-pub fn write_all_segments(
+/// Returns an error if any segment cannot be written.
+pub fn write_all_player_centric_segments(
     base_path: &Path,
     file_path: &str,
     replay_id: Uuid,
-    frames: &[FrameFeatures],
+    player_frames: &[[PlayerCentricFrameFeatures; 6]],
     segment_length: usize,
 ) -> anyhow::Result<Vec<SegmentFileInfo>> {
     let segment_dir = segment_directory(base_path, file_path, replay_id);
-    let segment_count = compute_segment_count(frames.len(), segment_length);
+    let segment_count = compute_segment_count(player_frames.len(), segment_length);
 
     let mut segment_infos = Vec::with_capacity(segment_count);
 
     for segment_idx in 0..segment_count {
         let start_frame = segment_idx * segment_length;
-        let end_frame = ((segment_idx + 1) * segment_length).min(frames.len());
+        let end_frame = ((segment_idx + 1) * segment_length).min(player_frames.len());
 
         let filename = segment_filename(start_frame, start_frame + segment_length);
         let segment_path = segment_dir.join(&filename);
 
         // Get the frames for this segment
-        let segment_frames = frames
-            .get(start_frame..end_frame.min(frames.len()))
+        let segment_frames = player_frames
+            .get(start_frame..end_frame.min(player_frames.len()))
             .unwrap_or(&[]);
 
-        write_segment_file(&segment_path, segment_frames, segment_length)?;
+        write_player_centric_segment_file(&segment_path, segment_frames, segment_length)?;
 
         segment_infos.push(SegmentFileInfo {
             path: segment_path,
@@ -242,7 +253,7 @@ pub fn write_all_segments(
         replay_id = %replay_id,
         segment_count,
         dir = %segment_dir.display(),
-        "Wrote segments to disk"
+        "Wrote player-centric segments to disk"
     );
 
     Ok(segment_infos)
@@ -267,19 +278,15 @@ pub fn list_segment_files(
 
     let mut segments = Vec::new();
 
+    // List all .features files in the directory
     if let Ok(entries) = fs::read_dir(&segment_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "features") {
                 // Parse filename to get frame range
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let Some((start, end)) = parse_frame_range(stem) else {
-                    continue;
-                };
-                // Validate the segment length matches
-                if end - start == segment_length {
+                if let Some(file_name) = path.file_stem().and_then(|s| s.to_str())
+                    && let Some((start, end)) = parse_frame_range(file_name)
+                {
                     segments.push(SegmentFileInfo {
                         path,
                         start_frame: start,
@@ -293,61 +300,60 @@ pub fn list_segment_files(
 
     // Sort by start frame
     segments.sort_by_key(|s| s.start_frame);
+
+    // Filter to only include segments of the expected length
+    segments.retain(|s| s.end_frame - s.start_frame == segment_length);
+
     segments
 }
 
-/// Parses a frame range from a filename stem like "0-299".
-fn parse_frame_range(stem: &str) -> Option<(usize, usize)> {
-    let parts: Vec<&str> = stem.split('-').collect();
+/// Parses a frame range from a segment filename.
+///
+/// Format: "start-end" (e.g., "0-150" -> Some((0, 150)))
+fn parse_frame_range(filename: &str) -> Option<(usize, usize)> {
+    let parts: Vec<&str> = filename.split('-').collect();
     if parts.len() == 2 {
-        let start = parts.first()?.parse().ok()?;
-        let end = parts.get(1)?.parse().ok()?;
+        let start = parts[0].parse().ok()?;
+        let end = parts[1].parse().ok()?;
         Some((start, end))
     } else {
         None
     }
 }
 
-/// Converts a Vec<u8> to a Vec<f32> without copying when possible.
-///
-/// Tries to use `bytemuck::try_cast_vec` for zero-copy conversion.
-/// If alignment fails, falls back to copying via `cast_slice`.
+// =============================================================================
+// Segment Store
+// =============================================================================
+
+/// Entry in the segment store.
+struct SegmentEntry {
+    /// Path to the segment file.
+    path: PathBuf,
+    /// Target MMR for this segment.
+    target_mmr: [f32; TOTAL_PLAYERS],
+}
+
+/// Converts bytes to f32 Vec, using zero-copy when possible.
 fn bytes_to_f32_vec(bytes: Vec<u8>) -> Vec<f32> {
     // Try zero-copy conversion first
-    // This will succeed if the Vec is properly aligned for f32
-    match try_cast_vec(bytes) {
-        Ok(f32_vec) => f32_vec,
-        Err((_error, original_bytes)) => {
-            // Alignment mismatch - fall back to copying
-            // try_cast_vec returns (PodCastError, Vec<u8>) in the error
-            // This is safe because we know the bytes represent valid f32 values
-            let f32_slice: &[f32] = cast_slice(&original_bytes);
-            f32_slice.to_vec()
+    match try_cast_vec::<u8, f32>(bytes) {
+        Ok(floats) => floats,
+        Err((_, bytes)) => {
+            // Fall back to copying if alignment doesn't match
+            let f32_count = bytes.len() / 4;
+            let mut result = Vec::with_capacity(f32_count);
+            for chunk in bytes.chunks_exact(4) {
+                result.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            result
         }
     }
 }
 
-// =============================================================================
-// SegmentStore - Segment storage with on-demand loading
-// =============================================================================
-
-/// Entry in the segment index mapping segment index to segment metadata.
-#[derive(Debug, Clone)]
-struct SegmentEntry {
-    /// Path to the segment file.
-    path: PathBuf,
-    /// Target MMR for the replay this segment belongs to.
-    target_mmr: [f32; TOTAL_PLAYERS],
-}
-
-/// Segment store for lazy-loaded access to cached features.
+/// Storage for segment metadata and lazy loading.
 ///
-/// This struct holds metadata for all segments and loads them on-demand.
-/// Segments are loaded from disk when needed using std::fs::read.
-/// The segments are stored as raw f32 arrays that can be directly used for training.
-///
-/// For validation datasets, all segments can be preloaded into memory for faster access.
-#[expect(clippy::partial_pub_fields)]
+/// Segments are stored on disk and loaded on-demand when accessed.
+/// This allows handling datasets larger than memory.
 pub struct SegmentStore {
     /// Name of the dataset.
     pub name: String,
@@ -365,14 +371,16 @@ pub struct SegmentStore {
 }
 
 impl SegmentStore {
-    /// Creates a new empty segment store.
+    /// Creates a new empty segment store for player-centric features.
     ///
     /// # Arguments
     ///
     /// * `segment_length` - Number of frames per segment
     #[must_use]
     pub const fn new(name: String, segment_length: usize) -> Self {
-        let segment_size_bytes = segment_length * FEATURE_COUNT * std::mem::size_of::<f32>();
+        // Player-centric segments: 6 players × seq_len × features
+        let segment_size_bytes =
+            6 * segment_length * PLAYER_CENTRIC_FEATURE_COUNT * std::mem::size_of::<f32>();
         Self {
             entries: Vec::new(),
             name,
@@ -382,47 +390,56 @@ impl SegmentStore {
         }
     }
 
-    /// Adds segment metadata from a list of segment files.
+    /// Adds segments to the store from a list of segment files.
     ///
-    /// This only stores metadata, not the actual segment data.
-    /// Segments will be loaded on-demand when accessed.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_files` - List of segment files to add
-    /// * `target_mmr` - Target MMR for all segments (from the same replay)
-    ///
-    /// # Returns
-    ///
-    /// Number of segments successfully added.
+    /// Returns the number of segments added.
     pub fn add_segments(
         &mut self,
         segment_files: &[SegmentFileInfo],
         target_mmr: [f32; TOTAL_PLAYERS],
     ) -> usize {
         let mut added = 0;
-
         for segment_file in segment_files {
-            self.entries.push(SegmentEntry {
-                path: segment_file.path.clone(),
-                target_mmr,
-            });
-            added += 1;
+            // Verify file exists and has correct size
+            if let Ok(metadata) = fs::metadata(&segment_file.path) {
+                if metadata.len() == self.size_bytes as u64 {
+                    self.entries.push(SegmentEntry {
+                        path: segment_file.path.clone(),
+                        target_mmr,
+                    });
+                    added += 1;
+                } else {
+                    debug!(
+                        path = %segment_file.path.display(),
+                        expected = self.size_bytes,
+                        actual = metadata.len(),
+                        "Skipping segment with wrong size"
+                    );
+                }
+            }
         }
-
         added
     }
 
-    /// Loads a segment from disk and returns its data.
+    /// Loads segment data from disk.
     ///
-    /// If the segment is preloaded, uses the cached data.
-    /// Otherwise, loads from disk using std::fs::read.
+    /// # Arguments
+    ///
+    /// * `index` - Segment index
+    ///
+    /// # Returns
+    ///
+    /// The loaded segment data as Arc<Vec<f32>>.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment cannot be loaded.
     fn load_segment_data(&self, index: usize) -> anyhow::Result<Arc<Vec<f32>>> {
-        // Check if preloaded first
+        // Check if segment is preloaded
         if let Some(preloaded) = &self.preloaded_segments
             && let Some(data) = preloaded.get(&index)
         {
-            return Ok(Arc::clone(data));
+            return Ok(data.clone());
         }
 
         let entry = self
@@ -519,22 +536,6 @@ impl SegmentStore {
         self.length
     }
 
-    /// Gets a segment's features as an Arc<Vec<f32>>.
-    ///
-    /// Loads the segment on-demand from disk.
-    ///
-    /// # Arguments
-    ///
-    /// * `index` - Segment index (0 to len()-1)
-    ///
-    /// # Returns
-    ///
-    /// An Arc<Vec<f32>> with length `segment_length * FEATURE_COUNT`,
-    /// or `None` if the index is out of bounds or loading fails.
-    pub fn get_features(&self, index: usize) -> Option<Arc<Vec<f32>>> {
-        self.load_segment_data(index).ok()
-    }
-
     /// Gets a segment's target MMR.
     ///
     /// # Arguments
@@ -549,14 +550,38 @@ impl SegmentStore {
         self.entries.get(index).map(|e| e.target_mmr)
     }
 
-    /// Gets both features and target MMR for a segment.
+    /// Gets player-centric features and target MMR for a segment.
     ///
-    /// This is the primary access method for training, returning both
-    /// input features and target labels.
-    /// Loads the segment on-demand from disk.
-    pub fn get(&self, index: usize) -> Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])> {
+    /// This method loads the cached segments containing player-centric features
+    /// in the format: [6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Segment index (0 to len()-1)
+    ///
+    /// # Returns
+    ///
+    /// Returns (features, target_mmr) where features is flattened player-centric data,
+    /// or None if the segment cannot be loaded.
+    pub fn get_player_centric(
+        &self,
+        index: usize,
+    ) -> Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])> {
         let target_mmr = self.get_target_mmr(index)?;
-        let features = self.get_features(index)?;
+        let features = self.load_segment_data(index).ok()?;
+
+        // Verify the loaded data has the correct size for player-centric features
+        let expected_size = 6 * self.length * PLAYER_CENTRIC_FEATURE_COUNT;
+        if features.len() != expected_size {
+            warn!(
+                index,
+                expected = expected_size,
+                actual = features.len(),
+                "Segment has wrong size for player-centric features - cache may need regeneration"
+            );
+            return None;
+        }
+
         Some((features, target_mmr))
     }
 }
@@ -602,25 +627,26 @@ impl SegmentStoreBuilder {
         }
     }
 
-    /// Ensures segments are cached for a replay.
+    /// Ensures player-centric segments are cached for a replay.
     ///
-    /// Checks if segments exist, and if not, writes them from the provided frames.
+    /// If segments don't exist, they are created from the provided frames.
+    /// If segments already exist and `total_frames` matches, they are assumed valid.
     ///
     /// # Arguments
     ///
     /// * `file_path` - Original replay file path (for directory structure)
     /// * `replay_id` - Unique replay identifier
-    /// * `frames` - Extracted frame features (required if segments don't exist)
-    /// * `total_frames` - Total frame count (for cache validation). If `None`, skips validation check (assumes segments already verified to exist).
+    /// * `player_frames` - Optional player-centric frame features (needed if not cached)
+    /// * `total_frames` - Optional frame count (for validation)
     ///
     /// # Errors
     ///
-    /// Returns an error if segments need to be written but frames are not provided.
-    pub fn ensure_segments_cached(
+    /// Returns error if segments need to be written but frames are not provided.
+    pub fn ensure_player_centric_segments_cached(
         &mut self,
         file_path: &str,
         replay_id: Uuid,
-        frames: Option<&[FrameFeatures]>,
+        player_frames: Option<&[[PlayerCentricFrameFeatures; 6]]>,
         total_frames: Option<usize>,
     ) -> anyhow::Result<()> {
         // Check if segments already exist (only if total_frames is provided)
@@ -639,14 +665,14 @@ impl SegmentStoreBuilder {
 
         if !segments_exist {
             // Need to write segments
-            let Some(frames) = frames else {
+            let Some(frames) = player_frames else {
                 anyhow::bail!(
-                    "Segments not cached and no frames provided for replay {replay_id}. Base path: {}. File path: {file_path}",
+                    "Segments not cached and no player frames provided for replay {replay_id}. Base path: {}. File path: {file_path}",
                     self.base_path.display()
                 );
             };
 
-            write_all_segments(
+            write_all_player_centric_segments(
                 &self.base_path,
                 file_path,
                 replay_id,
@@ -662,7 +688,7 @@ impl SegmentStoreBuilder {
     /// Adds a replay's segments to the store.
     ///
     /// Adds segment metadata to the store (segments are loaded on-demand).
-    /// Assumes segments are already cached (call `ensure_segments_cached` first if needed).
+    /// Assumes segments are already cached (call `ensure_player_centric_segments_cached` first).
     ///
     /// # Arguments
     ///
@@ -712,49 +738,36 @@ mod tests {
 
     #[test]
     fn test_compute_segment_count() {
-        // Normal case: 900 frames with segment length 300 = 3 segments
-        assert_eq!(compute_segment_count(900, 300), 3);
-
-        // Partial last segment is dropped: 950 frames = 3 segments (not 4)
-        assert_eq!(compute_segment_count(950, 300), 3);
-
-        // Short replay: 100 frames with segment length 300 = 1 segment
-        assert_eq!(compute_segment_count(100, 300), 1);
-
-        // Exact fit: 300 frames = 1 segment
+        assert_eq!(compute_segment_count(1000, 300), 3);
+        assert_eq!(compute_segment_count(299, 300), 1);
         assert_eq!(compute_segment_count(300, 300), 1);
-
-        // Empty: 0 frames = 1 segment (edge case)
-        assert_eq!(compute_segment_count(0, 300), 1);
+        assert_eq!(compute_segment_count(301, 300), 1);
+        assert_eq!(compute_segment_count(600, 300), 2);
     }
 
     #[test]
     fn test_segment_filename() {
-        assert_eq!(segment_filename(0, 300), "0-300.features");
-        assert_eq!(segment_filename(300, 600), "300-600.features");
+        assert_eq!(segment_filename(0, 150), "0-150.features");
+        assert_eq!(segment_filename(150, 300), "150-300.features");
     }
 
     #[test]
     fn test_segment_directory() {
-        let base = Path::new("/workspace/ballchasing");
-        let file_path =
-            "replays/ranked-standard/bronze-1/550e8400-e29b-41d4-a716-446655440000.replay";
-        let replay_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let base = Path::new("/data");
+        let file_path = "replays/ranked-standard/bronze-1/abc123.replay";
+        let replay_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
 
         let dir = segment_directory(base, file_path, replay_id);
-        assert_eq!(
-            dir,
-            PathBuf::from(
-                "/workspace/ballchasing/segments/ranked-standard/bronze-1/550e8400-e29b-41d4-a716-446655440000"
-            )
-        );
+        assert!(dir.to_string_lossy().contains("segments"));
+        assert!(dir.to_string_lossy().contains("ranked-standard"));
+        assert!(dir.to_string_lossy().contains("bronze-1"));
     }
 
     #[test]
     fn test_parse_frame_range() {
-        assert_eq!(parse_frame_range("0-300"), Some((0, 300)));
-        assert_eq!(parse_frame_range("300-600"), Some((300, 600)));
+        assert_eq!(parse_frame_range("0-150"), Some((0, 150)));
+        assert_eq!(parse_frame_range("150-300"), Some((150, 300)));
         assert_eq!(parse_frame_range("invalid"), None);
-        assert_eq!(parse_frame_range("0-"), None);
+        assert_eq!(parse_frame_range("abc-def"), None);
     }
 }

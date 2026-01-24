@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 feature_extractor.workspace = true
+replay_structs.workspace = true
 
 anyhow.workspace = true
 bytemuck.workspace = true

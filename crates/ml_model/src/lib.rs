@@ -14,6 +14,12 @@
 //! - Rotation and positioning habits
 //!
 //! The model outputs one MMR prediction per player per game/segment.
+//!
+//! ## Player-Centric Architecture
+//!
+//! Each player gets their own sequence of features centered on their perspective.
+//! This enables the model to learn individual skill patterns and produce
+//! different predictions for each player.
 
 mod dataset;
 pub mod segment_cache;
@@ -27,7 +33,10 @@ use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, R
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
-use feature_extractor::{FEATURE_COUNT, FrameFeatures, TOTAL_PLAYERS};
+use feature_extractor::{
+    PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
+    extract_all_player_centric_features,
+};
 pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};
 
 /// Configuration for the sequence model.
@@ -98,9 +107,13 @@ pub struct SequenceModel<B: Backend> {
 
 impl<B: Backend> SequenceModel<B> {
     /// Creates a new sequence model with the given configuration.
+    ///
+    /// This model uses player-centric features and predicts one MMR value per forward pass.
+    /// For batch processing of all 6 players, reshape input to [batch*6, seq, features].
     pub fn new(device: &B::Device, config: &ModelConfig) -> Self {
-        // LSTM layers
-        let lstm1 = LstmConfig::new(FEATURE_COUNT, config.lstm_hidden_1, true).init(device);
+        // LSTM layers - use player-centric feature count
+        let lstm1 =
+            LstmConfig::new(PLAYER_CENTRIC_FEATURE_COUNT, config.lstm_hidden_1, true).init(device);
         let lstm2 = LstmConfig::new(config.lstm_hidden_1, config.lstm_hidden_2, true).init(device);
 
         // Dropout
@@ -109,7 +122,8 @@ impl<B: Backend> SequenceModel<B> {
         // Feedforward layers
         let linear1 =
             LinearConfig::new(config.lstm_hidden_2, config.feedforward_hidden).init(device);
-        let linear_out = LinearConfig::new(config.feedforward_hidden, TOTAL_PLAYERS).init(device);
+        // Output layer predicts 1 value (will be reshaped to [batch, 6] later)
+        let linear_out = LinearConfig::new(config.feedforward_hidden, 1).init(device);
 
         let activation = Relu::new();
 
@@ -125,28 +139,30 @@ impl<B: Backend> SequenceModel<B> {
         }
     }
 
-    /// Forward pass through the network.
+    /// Forward pass through the network with player-centric features.
     ///
     /// # Arguments
     ///
-    /// * `input` - Tensor of shape `[batch_size, seq_len, FEATURE_COUNT]`
+    /// * `input` - Tensor of shape `[batch_size * 6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
+    ///   Each of the 6 players has their own sequence of player-centric features.
     ///
     /// # Returns
     ///
-    /// Tensor of shape `[batch_size, 6]` containing predicted MMR for each player.
+    /// Tensor of shape `[batch_size * 6, 1]` containing predicted MMR.
+    /// Reshape to `[batch_size, 6]` after calling this function.
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
-        // LSTM1: [batch, seq, features] -> [batch, seq, lstm1_hidden]
+        // Input: [batch*6, seq, player_features]
+        // LSTM1: [batch*6, seq, features] -> [batch*6, seq, lstm1_hidden]
         let (lstm1_out, _state1) = self.lstm1.forward(input, None);
 
-        // LSTM2: [batch, seq, lstm1_hidden] -> [batch, seq, lstm2_hidden]
+        // LSTM2: [batch*6, seq, lstm1_hidden] -> [batch*6, seq, lstm2_hidden]
         let (lstm2_out, _state2) = self.lstm2.forward(lstm1_out, None);
 
-        // Take the last timestep's hidden state: [batch, lstm2_hidden]
-        // Use narrow to select the last timestep, then reshape to remove the seq dimension
-        let [batch_size, seq_len, hidden_size] = lstm2_out.dims();
+        // Take the last timestep's hidden state: [batch*6, lstm2_hidden]
+        let [batch_times_players, seq_len, hidden_size] = lstm2_out.dims();
         let last_hidden = lstm2_out
             .narrow(1, seq_len - 1, 1)
-            .reshape([batch_size, hidden_size]);
+            .reshape([batch_times_players, hidden_size]);
 
         // Dropout for regularization
         let x = self.dropout.forward(last_hidden);
@@ -156,7 +172,7 @@ impl<B: Backend> SequenceModel<B> {
         let x = self.activation.forward(x);
         let x = self.dropout.forward(x);
 
-        // Output: [batch, 6]
+        // Output: [batch*6, 1]
         self.linear_out.forward(x)
     }
 
@@ -164,11 +180,12 @@ impl<B: Backend> SequenceModel<B> {
     ///
     /// # Arguments
     ///
-    /// * `input` - Tensor of shape `[batch_size, seq_len, FEATURE_COUNT]`
+    /// * `input` - Tensor of shape `[batch_size * 6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
     ///
     /// # Returns
     ///
-    /// Tensor of shape `[batch_size, 6]` containing predicted MMR for each player.
+    /// Tensor of shape `[batch_size * 6, 1]` containing predicted MMR.
+    /// Reshape to `[batch_size, 6]` after calling this function.
     pub fn forward_inference(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
         // Same as forward but dropout is automatically disabled in eval mode
         // For Burn, dropout is controlled by the tensor's require_grad flag
@@ -176,24 +193,39 @@ impl<B: Backend> SequenceModel<B> {
     }
 }
 
-/// A training sample representing one game/segment.
+/// Reference to a saved model checkpoint.
 #[derive(Debug, Clone)]
-pub struct SequenceSample {
-    /// Sequence of frame features from the game.
-    pub frames: Vec<FrameFeatures>,
+pub struct ModelCheckpoint {
+    /// Path to the saved model.
+    pub path: String,
+    /// Model version.
+    pub version: u32,
+    /// Training configuration used.
+    pub training_config: TrainingConfig,
+}
+
+// ============================================================================
+// Player-Centric Data Structures
+// ============================================================================
+
+/// A training sample with player-centric sequences.
+#[derive(Debug, Clone)]
+pub struct PlayerCentricSequenceSample {
+    /// Player-centric frame sequences: [num_frames, 6_players]
+    /// Each frame contains features for all 6 players from their perspectives
+    pub player_frames: Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]>,
     /// Target MMR for each of the 6 players.
-    /// Order: blue team (3 players sorted by `actor_id`), then orange team (3 players).
     pub target_mmr: [f32; TOTAL_PLAYERS],
 }
 
-/// Training data container for sequence samples.
+/// Training data container for player-centric samples.
 #[derive(Debug, Clone, Default)]
-pub struct SequenceTrainingData {
-    /// Collection of game/segment samples.
-    pub samples: Vec<SequenceSample>,
+pub struct PlayerCentricSequenceTrainingData {
+    /// Collection of game/segment samples with player-centric features.
+    pub samples: Vec<PlayerCentricSequenceSample>,
 }
 
-impl SequenceTrainingData {
+impl PlayerCentricSequenceTrainingData {
     /// Creates a new empty training data container.
     #[must_use]
     pub const fn new() -> Self {
@@ -203,12 +235,12 @@ impl SequenceTrainingData {
     }
 
     /// Adds a sample to the training data.
-    pub fn add_sample(&mut self, sample: SequenceSample) {
+    pub fn add_sample(&mut self, sample: PlayerCentricSequenceSample) {
         self.samples.push(sample);
     }
 
     /// Adds multiple samples to the training data.
-    pub fn add_samples(&mut self, samples: Vec<SequenceSample>) {
+    pub fn add_samples(&mut self, samples: Vec<PlayerCentricSequenceSample>) {
         self.samples.extend(samples);
     }
 
@@ -230,7 +262,13 @@ impl SequenceTrainingData {
     ///
     /// * `validation_ratio` - Fraction of data to use for validation (0.0 to 1.0)
     #[must_use]
-    pub fn split(&self, validation_ratio: f64) -> (Vec<SequenceSample>, Vec<SequenceSample>) {
+    pub fn split(
+        &self,
+        validation_ratio: f64,
+    ) -> (
+        Vec<PlayerCentricSequenceSample>,
+        Vec<PlayerCentricSequenceSample>,
+    ) {
         let validation_count = (self.samples.len() as f64 * validation_ratio) as usize;
         let train_count = self.samples.len() - validation_count;
 
@@ -241,40 +279,29 @@ impl SequenceTrainingData {
     }
 }
 
-/// Reference to a saved model checkpoint.
-#[derive(Debug, Clone)]
-pub struct ModelCheckpoint {
-    /// Path to the saved model.
-    pub path: String,
-    /// Model version.
-    pub version: u32,
-    /// Training configuration used.
-    pub training_config: TrainingConfig,
-}
-
 /// Creates a new sequence model with the given configuration.
 pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> SequenceModel<B> {
     SequenceModel::new(device, config)
 }
 
-/// Predicts MMR for all players from a sequence of frames.
+/// Predicts MMR for all players using player-centric features.
 ///
-/// This function splits the game into non-overlapping segments, predicts MMR
-/// for each segment, and averages the predictions across all segments.
+/// This function extracts player-centric features, splits the game into segments,
+/// predicts MMR for each player in each segment, and averages across segments.
 ///
 /// # Arguments
 ///
 /// * `model` - The trained model.
-/// * `frames` - All frame features from a game.
+/// * `frames` - All game frames (will be converted to player-centric features).
 /// * `device` - The device to run inference on.
 /// * `segment_length` - Number of consecutive frames per segment.
 ///
 /// # Returns
 ///
 /// Array of predicted MMR values for each of the 6 players (averaged across segments).
-pub fn predict<B: Backend>(
+pub fn predict_player_centric<B: Backend>(
     model: &SequenceModel<B>,
-    frames: &[FrameFeatures],
+    frames: &[replay_structs::GameFrame],
     device: &B::Device,
     segment_length: usize,
 ) -> [f32; TOTAL_PLAYERS] {
@@ -282,67 +309,75 @@ pub fn predict<B: Backend>(
         return [1000.0; TOTAL_PLAYERS];
     }
 
-    // Calculate number of segments
-    let num_segments = if frames.len() >= segment_length {
-        frames.len() / segment_length
+    // Extract player-centric features for all frames
+    let player_centric_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
+        .iter()
+        .map(extract_all_player_centric_features)
+        .collect();
+
+    let num_segments = if player_centric_frames.len() >= segment_length {
+        player_centric_frames.len() / segment_length
     } else {
         1
     };
 
-    // Accumulate predictions across all segments
+    // Accumulate predictions per player
     let mut sum_predictions = [0.0f32; TOTAL_PLAYERS];
     let mut segment_count = 0;
 
     for seg_idx in 0..num_segments {
         let start = seg_idx * segment_length;
-        let segment_frames = get_segment_frames(frames, start, segment_length);
+        let segment_frames =
+            get_segment_player_frames(&player_centric_frames, start, segment_length);
 
-        // Build input tensor [1, seg_len, FEATURE_COUNT]
-        let mut input_data = Vec::with_capacity(segment_length * FEATURE_COUNT);
-        for frame in &segment_frames {
-            input_data.extend_from_slice(&frame.features);
+        // Build input tensor [6_players, seg_len, PLAYER_CENTRIC_FEATURE_COUNT]
+        let mut input_data = Vec::with_capacity(6 * segment_length * PLAYER_CENTRIC_FEATURE_COUNT);
+
+        for player_idx in 0..6 {
+            for frame_features in &segment_frames {
+                if let Some(player_features) = frame_features.get(player_idx) {
+                    input_data.extend_from_slice(&player_features.features);
+                }
+            }
         }
 
         let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
-            1,
+            6,
             segment_length,
-            FEATURE_COUNT,
+            PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
-        // Forward pass
+        // Forward pass - output is [6, 1]
         let output = model.forward_inference(input);
 
-        // Extract values
+        // Extract predictions
         let output_data = output.into_data();
         if let Ok(values) = output_data.to_vec::<f32>() {
-            for (i, val) in values.iter().take(TOTAL_PLAYERS).enumerate() {
-                let Some(sum_prediction) = sum_predictions.get_mut(i) else {
-                    tracing::error!("Sum predictions has less than {TOTAL_PLAYERS} players");
-                    continue;
-                };
-                *sum_prediction += *val;
+            for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
+                if let Some(pred) = sum_predictions.get_mut(i) {
+                    *pred += *val;
+                }
             }
             segment_count += 1;
         }
     }
 
-    // Average predictions
+    // Average across segments
     if segment_count > 0 {
         for pred in &mut sum_predictions {
             *pred /= segment_count as f32;
         }
-        sum_predictions
-    } else {
-        [1000.0; TOTAL_PLAYERS]
     }
+
+    sum_predictions
 }
 
-/// Gets a segment of consecutive frames, padding if necessary.
-fn get_segment_frames(
-    frames: &[FrameFeatures],
+/// Gets a segment of consecutive player-centric frames, padding if necessary.
+fn get_segment_player_frames(
+    frames: &[[PlayerCentricFrameFeatures; 6]],
     start: usize,
     segment_length: usize,
-) -> Vec<FrameFeatures> {
+) -> Vec<[PlayerCentricFrameFeatures; 6]> {
     let end = (start + segment_length).min(frames.len());
     let Some(segment) = frames.get(start..end) else {
         tracing::error!("No segment found for start: {start} and segment_length: {segment_length}");
@@ -376,14 +411,14 @@ pub fn save_checkpoint<B: Backend>(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Use MessagePack recorder for efficient serialization
+    // Save model weights
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     model
         .clone()
         .save_file(path, &recorder)
         .map_err(|e| anyhow::anyhow!("Failed to save model: {e}"))?;
 
-    // Also save the config
+    // Save config alongside the model
     let config_path = format!("{path}.config.json");
     config
         .save(&config_path)
@@ -400,12 +435,8 @@ pub fn save_checkpoint<B: Backend>(
 ///
 /// # Arguments
 ///
-/// * `path` - The path to the checkpoint.
-/// * `device` - The device to load the model on.
-///
-/// # Returns
-///
-/// The loaded model.
+/// * `path` - Path to the model checkpoint file (without extension)
+/// * `device` - The device to load the model onto
 ///
 /// # Errors
 ///
@@ -414,7 +445,7 @@ pub fn load_checkpoint<B: Backend>(
     path: &str,
     device: &B::Device,
 ) -> anyhow::Result<SequenceModel<B>> {
-    // Try to load config first, fall back to defaults
+    // Try to load config first (for model dimensions)
     let config_path = format!("{path}.config.json");
     let model_config = if Path::new(&config_path).exists() {
         let training_config = TrainingConfig::load(&config_path)
@@ -457,45 +488,110 @@ mod tests {
         let config = ModelConfig::new();
         let model: SequenceModel<TestBackend> = create_model(&device, &config);
 
-        // Create a batch of 2 sequences, each with 100 frames
+        // Create a batch of 2 games × 6 players, each with 100 frames
+        // Input shape: [batch*6, seq_len, player_features]
         let batch_size = 2;
         let seq_len = 100;
-        let input = Tensor::<TestBackend, 3>::zeros([batch_size, seq_len, FEATURE_COUNT], &device);
+        let input = Tensor::<TestBackend, 3>::zeros(
+            [batch_size * 6, seq_len, PLAYER_CENTRIC_FEATURE_COUNT],
+            &device,
+        );
         let output = model.forward(input);
 
-        // Output should be [2, 6] (6 players per game)
-        assert_eq!(output.dims(), [batch_size, TOTAL_PLAYERS]);
+        // Output should be [batch*6, 1] = [12, 1]
+        assert_eq!(output.dims(), [batch_size * 6, 1]);
+
+        // After reshaping to [batch, 6], we'd have [2, 6]
+        let reshaped = output.reshape([batch_size, TOTAL_PLAYERS]);
+        assert_eq!(reshaped.dims(), [batch_size, TOTAL_PLAYERS]);
     }
 
     #[test]
-    fn test_predict_single_game() {
+    fn test_predict_with_player_frames() {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let config = ModelConfig::new();
         let model: SequenceModel<TestBackend> = create_model(&device, &config);
 
-        // Create 500 frames of fake game data
-        let frames: Vec<FrameFeatures> = (0..500)
-            .map(|i| FrameFeatures {
-                features: [0.0; FEATURE_COUNT],
-                time: i as f32 * 0.033, // ~30fps
+        // Create 500 frames of fake player-centric data
+        let player_frames: Vec<[PlayerCentricFrameFeatures; 6]> = (0..500)
+            .map(|i| {
+                [
+                    PlayerCentricFrameFeatures {
+                        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+                        time: i as f32 * 0.033,
+                    },
+                    PlayerCentricFrameFeatures {
+                        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+                        time: i as f32 * 0.033,
+                    },
+                    PlayerCentricFrameFeatures {
+                        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+                        time: i as f32 * 0.033,
+                    },
+                    PlayerCentricFrameFeatures {
+                        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+                        time: i as f32 * 0.033,
+                    },
+                    PlayerCentricFrameFeatures {
+                        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+                        time: i as f32 * 0.033,
+                    },
+                    PlayerCentricFrameFeatures {
+                        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+                        time: i as f32 * 0.033,
+                    },
+                ]
             })
             .collect();
 
-        let scores = predict(&model, &frames, &device, 300);
+        // Test using internal get_segment_player_frames
+        let segment_frames = get_segment_player_frames(&player_frames, 0, 300);
 
-        // Should get 6 scores (one per player)
-        assert_eq!(scores.len(), TOTAL_PLAYERS);
-        assert!(scores.iter().all(|s| s.is_finite()));
+        // Build input tensor manually
+        let segment_length = 300;
+        let mut input_data = Vec::with_capacity(6 * segment_length * PLAYER_CENTRIC_FEATURE_COUNT);
+
+        for player_idx in 0..6 {
+            for frame_features in &segment_frames {
+                if let Some(player_features) = frame_features.get(player_idx) {
+                    input_data.extend_from_slice(&player_features.features);
+                }
+            }
+        }
+
+        let input = Tensor::<TestBackend, 1>::from_floats(input_data.as_slice(), &device)
+            .reshape([6, segment_length, PLAYER_CENTRIC_FEATURE_COUNT]);
+
+        let output = model.forward_inference(input);
+
+        // Should get [6, 1] output
+        assert_eq!(output.dims(), [6, 1]);
+
+        // Verify all predictions are finite
+        let values = output.into_data().to_vec::<f32>().unwrap();
+        assert_eq!(values.len(), 6);
+        assert!(values.iter().all(|s| s.is_finite()));
+    }
+
+    fn create_default_player_frame() -> [PlayerCentricFrameFeatures; 6] {
+        [
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+        ]
     }
 
     #[test]
-    fn test_sequence_training_data() {
-        let mut data = SequenceTrainingData::new();
+    fn test_player_centric_training_data() {
+        let mut data = PlayerCentricSequenceTrainingData::new();
         assert!(data.is_empty());
         assert_eq!(data.len(), 0);
 
-        data.add_sample(SequenceSample {
-            frames: vec![FrameFeatures::default()],
+        data.add_sample(PlayerCentricSequenceSample {
+            player_frames: vec![create_default_player_frame()],
             target_mmr: [1000.0; TOTAL_PLAYERS],
         });
 
@@ -505,12 +601,12 @@ mod tests {
 
     #[test]
     fn test_training_data_split() {
-        let mut data = SequenceTrainingData::new();
+        let mut data = PlayerCentricSequenceTrainingData::new();
 
         // Add 10 samples
         for i in 0..10 {
-            data.add_sample(SequenceSample {
-                frames: vec![FrameFeatures::default()],
+            data.add_sample(PlayerCentricSequenceSample {
+                player_frames: vec![create_default_player_frame()],
                 target_mmr: [i as f32 * 100.0; TOTAL_PLAYERS],
             });
         }
@@ -520,45 +616,53 @@ mod tests {
         assert_eq!(val.len(), 2);
     }
 
-    #[test]
-    fn test_get_segment_frames() {
-        let frames: Vec<FrameFeatures> = (0..100)
-            .map(|i| FrameFeatures {
-                features: [i as f32; FEATURE_COUNT],
-                time: i as f32,
-            })
-            .collect();
-
-        // Full segment
-        let segment = get_segment_frames(&frames, 0, 30);
-        assert_eq!(segment.len(), 30);
-        assert!((segment[0].time - 0.0).abs() < f32::EPSILON);
-        assert!((segment[29].time - 29.0).abs() < f32::EPSILON);
-
-        // Second segment
-        let segment = get_segment_frames(&frames, 30, 30);
-        assert_eq!(segment.len(), 30);
-        assert!((segment[0].time - 30.0).abs() < f32::EPSILON);
+    fn create_player_frame_with_time(time: f32) -> [PlayerCentricFrameFeatures; 6] {
+        [
+            PlayerCentricFrameFeatures {
+                features: [time; PLAYER_CENTRIC_FEATURE_COUNT],
+                time,
+            },
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+            PlayerCentricFrameFeatures::default(),
+        ]
     }
 
     #[test]
-    fn test_get_segment_frames_padding() {
-        let frames: Vec<FrameFeatures> = (0..50)
-            .map(|i| FrameFeatures {
-                features: [i as f32; FEATURE_COUNT],
-                time: i as f32,
-            })
+    fn test_get_segment_player_frames() {
+        let frames: Vec<[PlayerCentricFrameFeatures; 6]> = (0..100)
+            .map(|i| create_player_frame_with_time(i as f32))
+            .collect();
+
+        // Full segment
+        let segment = get_segment_player_frames(&frames, 0, 30);
+        assert_eq!(segment.len(), 30);
+        assert!((segment[0][0].time - 0.0).abs() < f32::EPSILON);
+        assert!((segment[29][0].time - 29.0).abs() < f32::EPSILON);
+
+        // Second segment
+        let segment = get_segment_player_frames(&frames, 30, 30);
+        assert_eq!(segment.len(), 30);
+        assert!((segment[0][0].time - 30.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_get_segment_player_frames_padding() {
+        let frames: Vec<[PlayerCentricFrameFeatures; 6]> = (0..50)
+            .map(|i| create_player_frame_with_time(i as f32))
             .collect();
 
         // Segment that needs padding
-        let segment = get_segment_frames(&frames, 30, 30);
+        let segment = get_segment_player_frames(&frames, 30, 30);
         assert_eq!(segment.len(), 30);
 
         // First 20 should be original frames (30-49)
-        assert!((segment[0].time - 30.0).abs() < f32::EPSILON);
-        assert!((segment[19].time - 49.0).abs() < f32::EPSILON);
+        assert!((segment[0][0].time - 30.0).abs() < f32::EPSILON);
+        assert!((segment[19][0].time - 49.0).abs() < f32::EPSILON);
 
         // Last 10 should be padded with frame 49
-        assert!((segment[29].time - 49.0).abs() < f32::EPSILON);
+        assert!((segment[29][0].time - 49.0).abs() < f32::EPSILON);
     }
 }

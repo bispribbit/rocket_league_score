@@ -23,7 +23,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use burn::backend::{Autodiff, Wgpu};
 use config::{OBJECT_STORE, get_base_path};
-use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_game_sequence};
+use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_player_centric_game_sequence};
 use ml_model::segment_cache::{SegmentStore, SegmentStoreBuilder};
 use ml_model::{
     CheckpointConfig, ModelConfig, TrainingConfig, TrainingState, create_model, load_checkpoint,
@@ -65,7 +65,7 @@ pub struct FullTrainConfig {
 impl Default for FullTrainConfig {
     fn default() -> Self {
         Self {
-            model_name: String::from("lstm_v3"),
+            model_name: String::from("lstm_v6"),
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
@@ -544,14 +544,15 @@ async fn load_training_data_cached(
                 })
                 .collect();
 
-            let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+            let game_sequence =
+                extract_player_centric_game_sequence(&parsed.frames, &player_ratings);
 
             // Ensure segments are cached, then add replay
-            if let Err(e) = builder.ensure_segments_cached(
+            if let Err(e) = builder.ensure_player_centric_segments_cached(
                 &replay.file_path,
                 replay.id,
-                Some(&game_sequence.frames),
-                Some(game_sequence.frames.len()),
+                Some(&game_sequence.player_frames),
+                Some(game_sequence.player_frames.len()),
             ) {
                 warn!(
                     replay_id = %replay.id,
@@ -713,14 +714,15 @@ async fn load_validation_data_cached(
                 })
                 .collect();
 
-            let game_sequence = extract_game_sequence(&parsed.frames, &player_ratings);
+            let game_sequence =
+                extract_player_centric_game_sequence(&parsed.frames, &player_ratings);
 
             // Ensure segments are cached, then add replay
-            if let Err(e) = builder.ensure_segments_cached(
+            if let Err(e) = builder.ensure_player_centric_segments_cached(
                 &replay.file_path,
                 replay.id,
-                Some(&game_sequence.frames),
-                Some(game_sequence.frames.len()),
+                Some(&game_sequence.player_frames),
+                Some(game_sequence.player_frames.len()),
             ) {
                 warn!(
                     replay_id = %replay.id,

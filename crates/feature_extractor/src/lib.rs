@@ -2,45 +2,34 @@
 
 //! Feature extractor crate for Rocket League ML model.
 //!
-//! This crate transforms raw replay frame data into ML-ready feature vectors
-//! that can be used for training and inference.
+//! This crate transforms raw replay frame data into player-centric ML-ready
+//! feature vectors that can be used for training and inference.
 //!
-//! See `FEATURES.md` for the complete feature specification.
+//! Each player gets their own feature vector centered on their perspective,
+//! enabling the model to learn individual skill patterns.
 
 use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
 
-/// Total number of features extracted per frame.
+/// Feature count for player-centric representation.
 ///
 /// Breakdown:
 /// - Ball state: 7
-/// - Player state: 13 × 6 = 78
-/// - Player geometry: 7 × 6 = 42
+/// - This player state: 13
+/// - This player ball relationship: 2
+/// - Teammate 1 state: 13
+/// - Teammate 2 state: 13
+/// - Teammate relationships: 4
+/// - Opponent 1 state: 12 (no boost)
+/// - Opponent 2 state: 12 (no boost)
+/// - Opponent 3 state: 12 (no boost)
+/// - Opponent relationships: 6
 /// - Game context: 1
-/// - Total: 128
-pub const FEATURE_COUNT: usize = 128;
+/// - Total: 95
+pub const PLAYER_CENTRIC_FEATURE_COUNT: usize = 95;
 
 /// Number of players expected in a 3v3 match.
 pub const PLAYERS_PER_TEAM: usize = 3;
 pub const TOTAL_PLAYERS: usize = PLAYERS_PER_TEAM * 2;
-
-/// Feature indices for named access.
-pub mod indices {
-    // Ball state (0-6)
-    pub const BALL_START: usize = 0;
-    pub const BALL_COUNT: usize = 7;
-
-    // Player state (7-84): 13 features × 6 players
-    pub const PLAYER_STATE_START: usize = 7;
-    pub const PLAYER_STATE_FEATURES: usize = 13;
-
-    // Player geometry (85-126): 7 features × 6 players
-    pub const PLAYER_GEOM_START: usize = 85;
-    pub const PLAYER_GEOM_FEATURES: usize = 7;
-
-    // Game context (127): 1 feature
-    pub const GAME_CONTEXT_START: usize = 127;
-    pub const GAME_CONTEXT_COUNT: usize = 1;
-}
 
 /// Field dimensions for normalization (Rocket League standard field).
 pub mod field {
@@ -72,74 +61,27 @@ pub struct PlayerRating {
     pub team: i16,
 }
 
-/// Feature vector extracted from a single game frame.
+/// Player-centric feature vector focused on one specific player.
 #[derive(Debug, Clone)]
-pub struct FrameFeatures {
-    /// The raw feature vector.
-    pub features: [f32; FEATURE_COUNT],
+pub struct PlayerCentricFrameFeatures {
+    /// The player-centric feature vector.
+    pub features: [f32; PLAYER_CENTRIC_FEATURE_COUNT],
     /// Timestamp of the frame.
     pub time: f32,
 }
 
-impl Default for FrameFeatures {
+impl Default for PlayerCentricFrameFeatures {
     fn default() -> Self {
         Self {
-            features: [0.0; FEATURE_COUNT],
+            features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
             time: 0.0,
         }
     }
 }
 
-/// Training sample combining features with ground truth labels.
-#[derive(Debug, Clone)]
-pub struct TrainingSample {
-    pub features: FrameFeatures,
-    /// Target MMR per player slot (6 players: blue team sorted by `actor_id`, then orange team sorted by `actor_id`).
-    /// Matches the feature order in the feature vector.
-    pub target_mmr: Vec<f32>,
-}
-
-/// Extracts ML features from a single game frame.
-///
-/// # Arguments
-///
-/// * `frame` - The game frame to extract features from.
-///
-/// # Returns
-///
-/// A `FrameFeatures` struct containing the normalized feature vector.
-pub fn extract_frame_features(frame: &GameFrame) -> FrameFeatures {
-    let mut features = FrameFeatures {
-        features: [0.0; FEATURE_COUNT],
-        time: frame.time,
-    };
-
-    // Sort players into teams
-    let (blue_players, orange_players) = sort_players_by_team(&frame.players);
-
-    // 1. Extract ball features (indices 0-6)
-    extract_ball_features(
-        &mut features.features,
-        &frame.ball.position,
-        &frame.ball.velocity,
-    );
-
-    // 2. Extract player state features (indices 7-84)
-    extract_player_state_features(&mut features.features, &blue_players, &orange_players);
-
-    // 3. Extract player geometry features (indices 85-126)
-    extract_player_geometry_features(
-        &mut features.features,
-        &blue_players,
-        &orange_players,
-        &frame.ball.position,
-    );
-
-    // 4. Extract game context features (ball distance to blue goal) (index 127)
-    extract_game_context_features(&mut features.features, &frame.ball.position);
-
-    features
-}
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 /// Sorts players into blue (team 0) and orange (team 1) teams.
 /// Pads with default players if fewer than 3 per team.
@@ -153,253 +95,6 @@ fn sort_players_by_team(players: &[PlayerState]) -> (Vec<&PlayerState>, Vec<&Pla
 
     (blue, orange)
 }
-
-/// Extracts ball state features (7 features).
-fn extract_ball_features(
-    features: &mut [f32; FEATURE_COUNT],
-    position: &Vector3,
-    velocity: &Vector3,
-) {
-    let idx = indices::BALL_START;
-
-    // Position (normalized)
-    features[idx] = normalize_x(position.x);
-    features[idx + 1] = normalize_y(position.y);
-    features[idx + 2] = normalize_z(position.z);
-
-    // Velocity (normalized)
-    // Note: ball_vel_y already indicates direction toward goals
-    // (positive = toward orange, negative = toward blue)
-    features[idx + 3] = normalize_ball_velocity(velocity.x);
-    features[idx + 4] = normalize_ball_velocity(velocity.y);
-    features[idx + 5] = normalize_ball_velocity(velocity.z);
-
-    // Speed magnitude
-    let speed = vector_magnitude(velocity);
-    features[idx + 6] = (speed / field::MAX_BALL_SPEED).min(1.0);
-}
-
-/// Extracts player state features (13 features × 6 players = 78 features).
-fn extract_player_state_features(
-    features: &mut [f32; FEATURE_COUNT],
-    blue_players: &[&PlayerState],
-    orange_players: &[&PlayerState],
-) {
-    // Process blue team (first 3 player slots)
-    for (i, player) in blue_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
-        let idx = indices::PLAYER_STATE_START + i * indices::PLAYER_STATE_FEATURES;
-        write_player_state(features, idx, player);
-    }
-    // Pad with zeros if fewer than 3 blue players
-    for i in blue_players.len()..PLAYERS_PER_TEAM {
-        let idx = indices::PLAYER_STATE_START + i * indices::PLAYER_STATE_FEATURES;
-        for j in 0..indices::PLAYER_STATE_FEATURES {
-            features[idx + j] = 0.0;
-        }
-    }
-
-    // Process orange team (next 3 player slots)
-    for (i, player) in orange_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
-        let idx =
-            indices::PLAYER_STATE_START + (PLAYERS_PER_TEAM + i) * indices::PLAYER_STATE_FEATURES;
-        write_player_state(features, idx, player);
-    }
-    // Pad with zeros if fewer than 3 orange players
-    for i in orange_players.len()..PLAYERS_PER_TEAM {
-        let idx =
-            indices::PLAYER_STATE_START + (PLAYERS_PER_TEAM + i) * indices::PLAYER_STATE_FEATURES;
-        for j in 0..indices::PLAYER_STATE_FEATURES {
-            features[idx + j] = 0.0;
-        }
-    }
-}
-
-/// Writes a single player's state features to the feature vector.
-fn write_player_state(features: &mut [f32; FEATURE_COUNT], idx: usize, player: &PlayerState) {
-    // If demolished, zero out all features except the demolished flag
-    if player.actor_state.is_demolished {
-        // Position (zeroed)
-        features[idx] = 0.0;
-        features[idx + 1] = 0.0;
-        features[idx + 2] = 0.0;
-
-        // Velocity (zeroed)
-        features[idx + 3] = 0.0;
-        features[idx + 4] = 0.0;
-        features[idx + 5] = 0.0;
-
-        // Rotation (zeroed)
-        features[idx + 6] = 0.0;
-        features[idx + 7] = 0.0;
-        features[idx + 8] = 0.0;
-        features[idx + 9] = 0.0;
-
-        // Speed (zeroed)
-        features[idx + 10] = 0.0;
-
-        // Boost (zeroed)
-        features[idx + 11] = 0.0;
-
-        // Demolished flag
-        features[idx + 12] = 1.0;
-    } else {
-        // Position
-        features[idx] = normalize_x(player.actor_state.position.x);
-        features[idx + 1] = normalize_y(player.actor_state.position.y);
-        features[idx + 2] = normalize_z(player.actor_state.position.z);
-
-        // Velocity
-        features[idx + 3] = normalize_car_velocity(player.actor_state.velocity.x);
-        features[idx + 4] = normalize_car_velocity(player.actor_state.velocity.y);
-        features[idx + 5] = normalize_car_velocity(player.actor_state.velocity.z);
-
-        // Rotation (quaternion - already in [-1, 1] range)
-        features[idx + 6] = player.actor_state.rotation.x;
-        features[idx + 7] = player.actor_state.rotation.y;
-        features[idx + 8] = player.actor_state.rotation.z;
-        features[idx + 9] = player.actor_state.rotation.w;
-
-        // Speed magnitude (normalized to supersonic = 1.0)
-        let speed = vector_magnitude(&player.actor_state.velocity);
-        features[idx + 10] = (speed / field::MAX_CAR_SPEED).min(1.0);
-
-        // Boost (already 0-1)
-        features[idx + 11] = player.actor_state.boost;
-
-        // Demolished flag
-        features[idx + 12] = 0.0;
-    }
-}
-
-/// Extracts player geometry features (7 features × 6 players = 42 features).
-fn extract_player_geometry_features(
-    features: &mut [f32; FEATURE_COUNT],
-    blue_players: &[&PlayerState],
-    orange_players: &[&PlayerState],
-    ball_pos: &Vector3,
-) {
-    // Blue team geometry
-    for (i, player) in blue_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
-        let idx = indices::PLAYER_GEOM_START + i * indices::PLAYER_GEOM_FEATURES;
-        write_player_geometry(
-            features,
-            idx,
-            player,
-            ball_pos,
-            blue_players,
-            orange_players,
-        );
-    }
-    for i in blue_players.len()..PLAYERS_PER_TEAM {
-        let idx = indices::PLAYER_GEOM_START + i * indices::PLAYER_GEOM_FEATURES;
-        for j in 0..indices::PLAYER_GEOM_FEATURES {
-            features[idx + j] = 0.0;
-        }
-    }
-
-    // Orange team geometry
-    for (i, player) in orange_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
-        let idx =
-            indices::PLAYER_GEOM_START + (PLAYERS_PER_TEAM + i) * indices::PLAYER_GEOM_FEATURES;
-        write_player_geometry(
-            features,
-            idx,
-            player,
-            ball_pos,
-            orange_players,
-            blue_players,
-        );
-    }
-    for i in orange_players.len()..PLAYERS_PER_TEAM {
-        let idx =
-            indices::PLAYER_GEOM_START + (PLAYERS_PER_TEAM + i) * indices::PLAYER_GEOM_FEATURES;
-        for j in 0..indices::PLAYER_GEOM_FEATURES {
-            features[idx + j] = 0.0;
-        }
-    }
-}
-
-/// Writes a single player's geometry features (7 features).
-fn write_player_geometry(
-    features: &mut [f32; FEATURE_COUNT],
-    idx: usize,
-    player: &PlayerState,
-    ball_pos: &Vector3,
-    teammates: &[&PlayerState],
-    opponents: &[&PlayerState],
-) {
-    // If demolished, zero out all geometry features
-    if player.actor_state.is_demolished {
-        for j in 0..indices::PLAYER_GEOM_FEATURES {
-            features[idx + j] = 0.0;
-        }
-        return;
-    }
-
-    // 0: Distance to ball (normalized by field diagonal)
-    let dist_to_ball = distance(&player.actor_state.position, ball_pos);
-    features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-
-    // 1: Facing ball (dot product of forward vector with direction to ball)
-    let forward = quaternion_forward(&player.actor_state.rotation);
-    let to_ball = direction(&player.actor_state.position, ball_pos);
-    features[idx + 1] = dot(&forward, &to_ball);
-
-    // 2-3: Distance to each teammate (2 teammates in 3v3)
-    let teammate_distances =
-        get_distances_to_others(&player.actor_state.position, player.actor_id, teammates);
-    features[idx + 2] = teammate_distances[0];
-    features[idx + 3] = teammate_distances[1];
-
-    // 4-6: Distance to each opponent (3 opponents in 3v3)
-    let opponent_distances =
-        get_distances_to_others(&player.actor_state.position, player.actor_id, opponents);
-    features[idx + 4] = opponent_distances[0];
-    features[idx + 5] = opponent_distances[1];
-    features[idx + 6] = opponent_distances[2];
-}
-
-/// Gets distances to all other players (excluding self), sorted by `actor_id`.
-/// Returns a fixed-size array with 1.0 for missing players.
-fn get_distances_to_others(
-    position: &Vector3,
-    self_id: i32,
-    players: &[&PlayerState],
-) -> [f32; PLAYERS_PER_TEAM] {
-    let mut distances = [1.0f32; PLAYERS_PER_TEAM]; // Default to max distance
-
-    // Filter out self and collect distances
-    let mut other_players: Vec<_> = players.iter().filter(|p| p.actor_id != self_id).collect();
-
-    // Sort by actor_id for consistent ordering
-    other_players.sort_by_key(|p| p.actor_id);
-
-    // Compute distances
-    for (i, other) in other_players.iter().take(PLAYERS_PER_TEAM).enumerate() {
-        let dist = distance(position, &other.actor_state.position);
-        distances[i] = (dist / field::DIAGONAL).min(1.0);
-    }
-
-    distances
-}
-
-/// Extracts game context features (1 feature).
-fn extract_game_context_features(features: &mut [f32; FEATURE_COUNT], ball_pos: &Vector3) {
-    let idx = indices::GAME_CONTEXT_START;
-
-    // Ball distance to blue goal (orange goal distance is redundant - highly correlated)
-    let blue_goal = Vector3 {
-        x: 0.0,
-        y: field::BLUE_GOAL_Y,
-        z: 0.0,
-    };
-
-    features[idx] = (distance(ball_pos, &blue_goal) / field::DIAGONAL).min(1.0);
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
 
 /// Normalizes X position to [-1, 1].
 fn normalize_x(x: f32) -> f32 {
@@ -479,45 +174,6 @@ fn quaternion_forward(q: &Quaternion) -> Vector3 {
     Vector3 { x, y, z }
 }
 
-/// A sequence sample representing an entire game/replay for LSTM training.
-#[derive(Debug, Clone)]
-pub struct GameSequenceSample {
-    /// All frame features from the game.
-    pub frames: Vec<FrameFeatures>,
-    /// Target MMR for each of the 6 players.
-    /// Order: blue team (3 players sorted by `actor_id`), then orange team (3 players).
-    pub target_mmr: [f32; TOTAL_PLAYERS],
-}
-
-/// Extracts a single game sequence sample from all frames in a replay.
-///
-/// This creates one training sample per replay, where the model learns
-/// to predict player MMR from the entire sequence of gameplay.
-///
-/// # Arguments
-///
-/// * `frames` - All frames from the replay.
-/// * `player_ratings` - Player ratings with team assignments.
-///
-/// # Returns
-///
-/// A `GameSequenceSample` containing all frame features and target MMR values.
-pub fn extract_game_sequence(
-    frames: &[GameFrame],
-    player_ratings: &[PlayerRating],
-) -> GameSequenceSample {
-    // Build target MMR array
-    let target_mmr = build_target_mmr_array(player_ratings);
-
-    // Extract features from ALL frames
-    let frame_features: Vec<FrameFeatures> = frames.iter().map(extract_frame_features).collect();
-
-    GameSequenceSample {
-        frames: frame_features,
-        target_mmr,
-    }
-}
-
 /// Builds a fixed-size target MMR array from player ratings.
 fn build_target_mmr_array(player_ratings: &[PlayerRating]) -> [f32; TOTAL_PLAYERS] {
     let mut target_mmr = [1000.0f32; TOTAL_PLAYERS];
@@ -543,6 +199,299 @@ fn build_target_mmr_array(player_ratings: &[PlayerRating]) -> [f32; TOTAL_PLAYER
     target_mmr
 }
 
+// ============================================================================
+// Player-Centric Feature Extraction
+// ============================================================================
+
+/// Extracts player-centric features for a specific player from a game frame.
+///
+/// This creates a feature vector centered on one player's perspective, including:
+/// - Ball state
+/// - This player's full state
+/// - Teammates' full states (with boost)
+/// - Opponents' states (WITHOUT boost - information leakage)
+/// - Relationships (distances)
+/// - Game context
+///
+/// # Arguments
+///
+/// * `frame` - The game frame
+/// * `player_index` - Which player (0-5: 0-2 blue, 3-5 orange)
+///
+/// # Returns
+///
+/// Features centered on this player's perspective
+pub fn extract_player_centric_frame_features(
+    frame: &GameFrame,
+    player_index: usize,
+) -> PlayerCentricFrameFeatures {
+    let mut features = PlayerCentricFrameFeatures {
+        features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
+        time: frame.time,
+    };
+
+    // Get sorted players
+    let (blue_players, orange_players) = sort_players_by_team(&frame.players);
+
+    // Determine which player we're focusing on
+    let (this_player, teammates, opponents) = if player_index < 3 {
+        // Blue team player
+        if player_index >= blue_players.len() {
+            // Player doesn't exist, return zeros
+            return features;
+        }
+        let this = blue_players[player_index];
+        let teammates: Vec<&PlayerState> = blue_players
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != player_index)
+            .map(|(_, p)| *p)
+            .collect();
+        (this, teammates, orange_players)
+    } else {
+        // Orange team player
+        let orange_idx = player_index - 3;
+        if orange_idx >= orange_players.len() {
+            // Player doesn't exist, return zeros
+            return features;
+        }
+        let this = orange_players[orange_idx];
+        let teammates: Vec<&PlayerState> = orange_players
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != orange_idx)
+            .map(|(_, p)| *p)
+            .collect();
+        (this, teammates, blue_players)
+    };
+
+    let mut idx = 0;
+
+    // 1. Ball state (7 features)
+    features.features[idx] = normalize_x(frame.ball.position.x);
+    features.features[idx + 1] = normalize_y(frame.ball.position.y);
+    features.features[idx + 2] = normalize_z(frame.ball.position.z);
+    features.features[idx + 3] = normalize_ball_velocity(frame.ball.velocity.x);
+    features.features[idx + 4] = normalize_ball_velocity(frame.ball.velocity.y);
+    features.features[idx + 5] = normalize_ball_velocity(frame.ball.velocity.z);
+    let ball_speed = vector_magnitude(&frame.ball.velocity);
+    features.features[idx + 6] = (ball_speed / field::MAX_BALL_SPEED).min(1.0);
+    idx += 7;
+
+    // 2. This player's state (13 features)
+    write_player_state_to_slice(&mut features.features[idx..idx + 13], this_player);
+    idx += 13;
+
+    // 3. This player's ball relationship (2 features)
+    if !this_player.actor_state.is_demolished {
+        let dist_to_ball = distance(&this_player.actor_state.position, &frame.ball.position);
+        features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+
+        let forward = quaternion_forward(&this_player.actor_state.rotation);
+        let to_ball = direction(&this_player.actor_state.position, &frame.ball.position);
+        features.features[idx + 1] = dot(&forward, &to_ball);
+    }
+    idx += 2;
+
+    // 4. Teammate 1 state (13 features)
+    if let Some(&teammate1) = teammates.first() {
+        write_player_state_to_slice(&mut features.features[idx..idx + 13], teammate1);
+    }
+    idx += 13;
+
+    // 5. Teammate 2 state (13 features)
+    if let Some(&teammate2) = teammates.get(1) {
+        write_player_state_to_slice(&mut features.features[idx..idx + 13], teammate2);
+    }
+    idx += 13;
+
+    // 6. Teammate relationships (4 features)
+    if let Some(&teammate1) = teammates.first()
+        && !teammate1.actor_state.is_demolished
+    {
+        let dist_to_ball = distance(&teammate1.actor_state.position, &frame.ball.position);
+        features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+        let dist_to_this = distance(
+            &teammate1.actor_state.position,
+            &this_player.actor_state.position,
+        );
+        features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
+    }
+    if let Some(&teammate2) = teammates.get(1)
+        && !teammate2.actor_state.is_demolished
+    {
+        let dist_to_ball = distance(&teammate2.actor_state.position, &frame.ball.position);
+        features.features[idx + 2] = (dist_to_ball / field::DIAGONAL).min(1.0);
+        let dist_to_this = distance(
+            &teammate2.actor_state.position,
+            &this_player.actor_state.position,
+        );
+        features.features[idx + 3] = (dist_to_this / field::DIAGONAL).min(1.0);
+    }
+    idx += 4;
+
+    // 7-9. Opponent states (12 features each, NO BOOST)
+    for i in 0..3 {
+        if let Some(&opponent) = opponents.get(i) {
+            write_opponent_state_to_slice(&mut features.features[idx..idx + 12], opponent);
+        }
+        idx += 12;
+    }
+
+    // 10. Opponent relationships (6 features)
+    for i in 0..3 {
+        if let Some(&opponent) = opponents.get(i)
+            && !opponent.actor_state.is_demolished
+        {
+            let dist_to_ball = distance(&opponent.actor_state.position, &frame.ball.position);
+            features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+            let dist_to_this = distance(
+                &opponent.actor_state.position,
+                &this_player.actor_state.position,
+            );
+            features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
+        }
+        idx += 2;
+    }
+
+    // 11. Game context (1 feature)
+    let blue_goal = Vector3 {
+        x: 0.0,
+        y: field::BLUE_GOAL_Y,
+        z: 0.0,
+    };
+    features.features[idx] =
+        (distance(&frame.ball.position, &blue_goal) / field::DIAGONAL).min(1.0);
+
+    features
+}
+
+/// Writes player state to a slice (13 features).
+fn write_player_state_to_slice(slice: &mut [f32], player: &PlayerState) {
+    if player.actor_state.is_demolished {
+        // All zeros except demolished flag
+        for val in slice.iter_mut().take(12) {
+            *val = 0.0;
+        }
+        slice[12] = 1.0;
+    } else {
+        // Position
+        slice[0] = normalize_x(player.actor_state.position.x);
+        slice[1] = normalize_y(player.actor_state.position.y);
+        slice[2] = normalize_z(player.actor_state.position.z);
+
+        // Velocity
+        slice[3] = normalize_car_velocity(player.actor_state.velocity.x);
+        slice[4] = normalize_car_velocity(player.actor_state.velocity.y);
+        slice[5] = normalize_car_velocity(player.actor_state.velocity.z);
+
+        // Rotation
+        slice[6] = player.actor_state.rotation.x;
+        slice[7] = player.actor_state.rotation.y;
+        slice[8] = player.actor_state.rotation.z;
+        slice[9] = player.actor_state.rotation.w;
+
+        // Speed
+        let speed = vector_magnitude(&player.actor_state.velocity);
+        slice[10] = (speed / field::MAX_CAR_SPEED).min(1.0);
+
+        // Boost
+        slice[11] = player.actor_state.boost;
+
+        // Demolished flag
+        slice[12] = 0.0;
+    }
+}
+
+/// Writes opponent state to a slice (12 features, NO BOOST).
+/// Same as player state but without boost feature.
+fn write_opponent_state_to_slice(slice: &mut [f32], player: &PlayerState) {
+    if player.actor_state.is_demolished {
+        // All zeros except demolished flag
+        for val in slice.iter_mut().take(11) {
+            *val = 0.0;
+        }
+        slice[11] = 1.0;
+    } else {
+        // Position
+        slice[0] = normalize_x(player.actor_state.position.x);
+        slice[1] = normalize_y(player.actor_state.position.y);
+        slice[2] = normalize_z(player.actor_state.position.z);
+
+        // Velocity
+        slice[3] = normalize_car_velocity(player.actor_state.velocity.x);
+        slice[4] = normalize_car_velocity(player.actor_state.velocity.y);
+        slice[5] = normalize_car_velocity(player.actor_state.velocity.z);
+
+        // Rotation
+        slice[6] = player.actor_state.rotation.x;
+        slice[7] = player.actor_state.rotation.y;
+        slice[8] = player.actor_state.rotation.z;
+        slice[9] = player.actor_state.rotation.w;
+
+        // Speed (NO BOOST for opponents)
+        let speed = vector_magnitude(&player.actor_state.velocity);
+        slice[10] = (speed / field::MAX_CAR_SPEED).min(1.0);
+
+        // Demolished flag
+        slice[11] = 0.0;
+    }
+}
+
+/// Extracts player-centric features for ALL 6 players from a game frame.
+///
+/// Returns array of 6 feature vectors, one per player.
+pub fn extract_all_player_centric_features(
+    frame: &GameFrame,
+) -> [PlayerCentricFrameFeatures; TOTAL_PLAYERS] {
+    [
+        extract_player_centric_frame_features(frame, 0),
+        extract_player_centric_frame_features(frame, 1),
+        extract_player_centric_frame_features(frame, 2),
+        extract_player_centric_frame_features(frame, 3),
+        extract_player_centric_frame_features(frame, 4),
+        extract_player_centric_frame_features(frame, 5),
+    ]
+}
+
+/// A sequence sample with player-centric features.
+#[derive(Debug, Clone)]
+pub struct PlayerCentricGameSequence {
+    /// Frame features for all 6 players: [num_frames, 6_players, features]
+    /// Organized as: for each frame, array of 6 player feature vectors
+    pub player_frames: Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]>,
+    /// Target MMR for each player [6]
+    pub target_mmr: [f32; TOTAL_PLAYERS],
+}
+
+/// Extracts a game sequence sample with player-centric features.
+///
+/// # Arguments
+///
+/// * `frames` - All frames from the replay
+/// * `player_ratings` - Player ratings with team assignments
+///
+/// # Returns
+///
+/// A `PlayerCentricGameSequence` with features for all 6 players across all frames
+pub fn extract_player_centric_game_sequence(
+    frames: &[GameFrame],
+    player_ratings: &[PlayerRating],
+) -> PlayerCentricGameSequence {
+    let target_mmr = build_target_mmr_array(player_ratings);
+
+    // Extract features for all frames, all players
+    let player_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
+        .iter()
+        .map(extract_all_player_centric_features)
+        .collect();
+
+    PlayerCentricGameSequence {
+        player_frames,
+        target_mmr,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -552,21 +501,219 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_feature_count() {
-        // Verify our constants add up correctly
-        let expected = indices::BALL_COUNT
-            + (indices::PLAYER_STATE_FEATURES * TOTAL_PLAYERS)
-            + (indices::PLAYER_GEOM_FEATURES * TOTAL_PLAYERS)
-            + indices::GAME_CONTEXT_COUNT;
+    fn test_player_centric_features_differ() {
+        // Create a frame with distinct players
+        let frame = GameFrame {
+            time: 100.0,
+            delta: 0.03,
+            seconds_remaining: 250,
+            ball: BallState {
+                position: Vector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 100.0,
+                },
+                velocity: Vector3 {
+                    x: 1000.0,
+                    y: 500.0,
+                    z: 0.0,
+                },
+            },
+            players: vec![
+                // Blue team
+                PlayerState {
+                    actor_id: 1,
+                    name: Arc::new("Player1".to_string()),
+                    team: Team::Blue,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: -1000.0,
+                            y: -2000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: 500.0,
+                            y: 200.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        boost: 0.3,
+                        is_demolished: false,
+                    },
+                },
+                PlayerState {
+                    actor_id: 2,
+                    name: Arc::new("Player2".to_string()),
+                    team: Team::Blue,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: -500.0,
+                            y: -1000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: 800.0,
+                            y: 400.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        boost: 0.7,
+                        is_demolished: false,
+                    },
+                },
+                PlayerState {
+                    actor_id: 3,
+                    name: Arc::new("Player3".to_string()),
+                    team: Team::Blue,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: -2000.0,
+                            y: -3000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: 200.0,
+                            y: 100.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        boost: 0.5,
+                        is_demolished: false,
+                    },
+                },
+                // Orange team
+                PlayerState {
+                    actor_id: 4,
+                    name: Arc::new("Player4".to_string()),
+                    team: Team::Orange,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: 1000.0,
+                            y: 2000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: -500.0,
+                            y: -200.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: core::f32::consts::FRAC_1_SQRT_2,
+                            w: core::f32::consts::FRAC_1_SQRT_2,
+                        },
+                        boost: 0.9,
+                        is_demolished: false,
+                    },
+                },
+                PlayerState {
+                    actor_id: 5,
+                    name: Arc::new("Player5".to_string()),
+                    team: Team::Orange,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: 500.0,
+                            y: 1000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: -800.0,
+                            y: -400.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        boost: 0.1,
+                        is_demolished: false,
+                    },
+                },
+                PlayerState {
+                    actor_id: 6,
+                    name: Arc::new("Player6".to_string()),
+                    team: Team::Orange,
+                    actor_state: ActorState {
+                        position: Vector3 {
+                            x: 2000.0,
+                            y: 3000.0,
+                            z: 17.0,
+                        },
+                        velocity: Vector3 {
+                            x: -200.0,
+                            y: -100.0,
+                            z: 0.0,
+                        },
+                        rotation: Quaternion {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        boost: 0.6,
+                        is_demolished: false,
+                    },
+                },
+            ],
+        };
 
-        assert_eq!(expected, FEATURE_COUNT);
+        // Extract player-centric features for all players
+        let all_features = extract_all_player_centric_features(&frame);
+
+        // Verify we get 6 feature vectors
+        assert_eq!(all_features.len(), 6);
+
+        // Verify each player's features are different
+        // Player 1's "this player" boost should be 0.3
+        assert!((all_features[0].features[18] - 0.3).abs() < 0.01);
+
+        // Player 2's "this player" boost should be 0.7
+        assert!((all_features[1].features[18] - 0.7).abs() < 0.01);
+
+        // Player 4's "this player" boost should be 0.9
+        assert!((all_features[3].features[18] - 0.9).abs() < 0.01);
+
+        // Verify all feature vectors have correct size
+        for player_features in &all_features {
+            assert_eq!(player_features.features.len(), PLAYER_CENTRIC_FEATURE_COUNT);
+        }
+
+        // Verify ball features are the same for all players (indices 0-6)
+        for i in 0..7 {
+            let first_ball_feature = all_features[0].features[i];
+            for player_features in &all_features {
+                assert!((player_features.features[i] - first_ball_feature).abs() < 0.0001);
+            }
+        }
     }
 
     #[test]
-    fn test_extract_empty_frame() {
-        let frame = GameFrame::default();
-        let features = extract_frame_features(&frame);
-        assert_eq!(features.features.len(), FEATURE_COUNT);
+    fn test_player_centric_feature_count() {
+        // Verify the feature count calculation
+        // Ball: 7, This player: 13, Ball relationship: 2
+        // Teammate 1: 13, Teammate 2: 13, Teammate relationships: 4
+        // Opponent 1-3: 12×3, Opponent relationships: 6
+        // Game context: 1
+        let expected = 7 + 13 + 2 + 13 + 13 + 4 + 12 + 12 + 12 + 6 + 1;
+        assert_eq!(expected, PLAYER_CENTRIC_FEATURE_COUNT);
     }
 
     #[test]
@@ -594,88 +741,5 @@ mod tests {
         assert!((forward.x - 1.0).abs() < 0.001);
         assert!(forward.y.abs() < 0.001);
         assert!(forward.z.abs() < 0.001);
-    }
-
-    #[test]
-    fn test_extract_with_players() {
-        let frame = GameFrame {
-            time: 100.0,
-            delta: 0.03,
-            seconds_remaining: 250,
-            ball: BallState {
-                position: Vector3 {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 100.0,
-                },
-                velocity: Vector3 {
-                    x: 1000.0,
-                    y: 500.0,
-                    z: 0.0,
-                },
-            },
-            players: vec![
-                PlayerState {
-                    actor_id: 1,
-                    name: Arc::new("Player1".to_string()),
-                    team: Team::Blue,
-                    actor_state: ActorState {
-                        position: Vector3 {
-                            x: -1000.0,
-                            y: -2000.0,
-                            z: 17.0,
-                        },
-                        velocity: Vector3 {
-                            x: 500.0,
-                            y: 200.0,
-                            z: 0.0,
-                        },
-                        rotation: Quaternion {
-                            x: 0.0,
-                            y: 0.0,
-                            z: 0.0,
-                            w: 1.0,
-                        },
-                        boost: 0.5,
-                        is_demolished: false,
-                    },
-                },
-                PlayerState {
-                    actor_id: 2,
-                    name: Arc::new("Player2".to_string()),
-                    team: Team::Orange,
-                    actor_state: ActorState {
-                        position: Vector3 {
-                            x: 1000.0,
-                            y: 2000.0,
-                            z: 17.0,
-                        },
-                        velocity: Vector3 {
-                            x: -500.0,
-                            y: -200.0,
-                            z: 0.0,
-                        },
-                        rotation: Quaternion {
-                            x: 0.0,
-                            y: 0.0,
-                            z: core::f32::consts::FRAC_1_SQRT_2,
-                            w: core::f32::consts::FRAC_1_SQRT_2,
-                        },
-                        boost: 1.0,
-                        is_demolished: false,
-                    },
-                },
-            ],
-        };
-
-        let features = extract_frame_features(&frame);
-
-        // Check ball features
-        assert!((features.features[0] - 0.0).abs() < 0.001); // ball_pos_x
-        assert!((features.features[2]).abs() < 0.1); // ball_pos_z (low)
-        assert!(features.features[6] > 0.0); // ball_speed > 0
-
-        // Check that player features are populated
-        assert!(features.features[indices::PLAYER_STATE_START + 11] > 0.0); // blue player 1 boost
     }
 }

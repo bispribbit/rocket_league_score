@@ -205,7 +205,12 @@ where
 
             // Time for forward pass
             let t_forward_start = Instant::now();
-            let predictions = model.forward(batch.inputs);
+            let predictions_raw = model.forward(batch.inputs); // [batch*6, 1]
+
+            // Reshape predictions: [batch*6, 1] → [batch, 6]
+            let batch_size = batch.targets.dims()[0];
+            let predictions = predictions_raw.reshape([batch_size, 6]);
+
             let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
@@ -418,7 +423,11 @@ fn compute_validation_loss<B: Backend>(
         };
 
         let num_items = batch_indices.len();
-        let predictions = model.forward(batch.inputs);
+        let predictions_raw = model.forward(batch.inputs); // [batch*6, 1]
+
+        // Reshape predictions: [batch*6, 1] → [batch, 6]
+        let batch_size = batch.targets.dims()[0];
+        let predictions = predictions_raw.reshape([batch_size, 6]);
 
         // Compute MSE manually
         let diff = predictions - batch.targets;

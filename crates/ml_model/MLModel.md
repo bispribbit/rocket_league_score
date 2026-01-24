@@ -1,53 +1,89 @@
 # ML Model Crate
 
-This crate implements the neural network for predicting Rocket League player impact scores using the [Burn](https://burn.dev) deep learning framework.
+This crate implements the neural network for predicting Rocket League player skill (MMR) using the [Burn](https://burn.dev) deep learning framework with an LSTM-based sequence model.
 
 ## Overview
 
 The `ml_model` crate provides:
 
-1. **Neural Network Architecture** - A feedforward network for impact score prediction
+1. **Player-Centric Neural Network Architecture** - LSTM sequence model for individual player skill prediction
 2. **Training Pipeline** - Complete training loop with Adam optimizer and MSE loss
-3. **Inference** - Single-frame and batch prediction functions
-4. **Checkpointing** - Model saving and loading using Burn's record system
+3. **Inference** - Player-centric batch prediction functions
+4. **Segment Caching** - Efficient storage and retrieval of player-centric features
+5. **Checkpointing** - Model saving and loading using Burn's record system
 
 ## Architecture
+
+### Player-Centric Design
+
+Unlike global feature models, this architecture gives each player their own feature sequence centered on their perspective. This enables the model to:
+
+- Predict **different MMR values** for each player
+- Learn **individual skill patterns** rather than team averages
+- Detect **smurfs** and **carries** within a match
 
 ### Network Structure
 
 ```
-Input: [batch_size, 147]  (frame features from feature_extractor)
+Input: [batch_size × 6, seq_len, 95]  (player-centric features for each of 6 players)
          │
          ▼
-┌─────────────────────────┐
-│   Linear(147 → 256)     │  First hidden layer
-│   ReLU activation       │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│   Linear(256 → 128)     │  Second hidden layer
-│   ReLU activation       │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│   Linear(128 → 1)       │  Output layer
-└───────────┬─────────────┘
-            │
-            ▼
-Output: [batch_size, 1]   (predicted MMR/impact score)
+┌─────────────────────────────────┐
+│   LSTM Layer 1 (95 → 128)       │  First LSTM layer
+│   (processes each player's      │
+│    temporal sequence)           │
+└─────────────┬───────────────────┘
+              │
+              ▼
+┌─────────────────────────────────┐
+│   LSTM Layer 2 (128 → 64)       │  Second LSTM layer
+│   (deeper temporal patterns)    │
+└─────────────┬───────────────────┘
+              │
+              ▼
+        [Last hidden state]
+              │
+              ▼
+┌─────────────────────────────────┐
+│   Dropout (0.5)                 │
+│   Linear (64 → 32) + ReLU       │  Feedforward layers
+│   Dropout (0.5)                 │
+│   Linear (32 → 1)               │  Output per player
+└─────────────┬───────────────────┘
+              │
+              ▼
+Output: [batch_size × 6, 1] → reshape to [batch_size, 6]
+        (predicted MMR for each of 6 players)
 ```
+
+### Feature Layout (95 per player)
+
+| Feature Group | Count | Description |
+|--------------|-------|-------------|
+| Ball state | 7 | Position, velocity, speed |
+| This player | 13 | Position, velocity, rotation, speed, boost, demolished |
+| Ball relationship | 2 | Distance to ball, facing ball |
+| Teammate 1 | 13 | Full state with boost |
+| Teammate 2 | 13 | Full state with boost |
+| Teammate relationships | 4 | Distances to ball and this player |
+| Opponent 1 | 12 | Full state WITHOUT boost |
+| Opponent 2 | 12 | Full state WITHOUT boost |
+| Opponent 3 | 12 | Full state WITHOUT boost |
+| Opponent relationships | 6 | Distances to ball and this player |
+| Game context | 1 | Ball distance to blue goal |
+
+**Note:** Opponent boost is excluded to prevent information leakage (you can't see opponent boost in-game).
 
 ### Key Types
 
 | Type | Description |
 |------|-------------|
-| `ImpactModel<B>` | The neural network model, generic over Burn backend |
-| `ModelConfig` | Architecture configuration (hidden layer sizes, dropout) |
+| `SequenceModel<B>` | The LSTM neural network model, generic over Burn backend |
+| `ModelConfig` | Architecture configuration (LSTM sizes, dropout) |
 | `TrainingConfig` | Training hyperparameters (learning rate, epochs, batch size) |
-| `TrainingData` | Container for training samples |
+| `PlayerCentricSequenceTrainingData` | Container for player-centric training samples |
 | `TrainingOutput` | Results from training (final loss, epochs completed) |
+| `SegmentStore` | Storage for cached player-centric features |
 
 ## Usage
 
@@ -61,46 +97,23 @@ use ml_model::{create_model, ModelConfig};
 type Backend = Wgpu;
 
 let device = WgpuDevice::default();
-let config = ModelConfig::new();  // Uses defaults: 256 → 128 hidden layers
+let config = ModelConfig::new();  // Uses defaults: 128 → 64 LSTM hidden layers
 let model = create_model::<Backend>(&device, &config);
-```
-
-### Training
-
-```rust
-use ml_model::{train, TrainingConfig, TrainingData, ModelConfig};
-use feature_extractor::TrainingSample;
-
-// Prepare training data
-let mut data = TrainingData::new();
-data.add_samples(samples);  // Vec<TrainingSample> from feature_extractor
-
-// Configure training
-let config = TrainingConfig::new(ModelConfig::new())
-    .with_epochs(100)
-    .with_batch_size(64)
-    .with_learning_rate(1e-4);
-
-// Train (model is modified in-place)
-let output = train(&mut model, &data, &config)?;
-info!("Final loss: {}", output.final_train_loss);
 ```
 
 ### Inference
 
 ```rust
-use ml_model::predict;
-use feature_extractor::extract_frame_features;
+use ml_model::predict_player_centric;
 
-// Single frame prediction
-let features = extract_frame_features(&frame);
-let score = predict(&model, &features, &device);
-info!("Predicted MMR: {}", score);
+// Predict MMR for all 6 players from raw game frames
+let mmr_predictions = predict_player_centric(&model, &game_frames, &device, sequence_length);
 
-// Batch prediction (more efficient for multiple frames)
-use ml_model::predict_batch;
-let features: Vec<_> = frames.iter().map(extract_frame_features).collect();
-let scores = predict_batch(&model, &features, &device);
+// mmr_predictions is [f32; 6] with individual predictions per player
+println!("Blue team: {:.0}, {:.0}, {:.0}", 
+    mmr_predictions[0], mmr_predictions[1], mmr_predictions[2]);
+println!("Orange team: {:.0}, {:.0}, {:.0}", 
+    mmr_predictions[3], mmr_predictions[4], mmr_predictions[5]);
 ```
 
 ### Saving and Loading
@@ -109,37 +122,36 @@ let scores = predict_batch(&model, &features, &device);
 use ml_model::{save_checkpoint, load_checkpoint};
 
 // Save model
-save_checkpoint(&model, "models/impact_v1", &training_config)?;
+save_checkpoint(&model, "models/player_centric_v1", &training_config)?;
 
 // Load model
-let loaded_model = load_checkpoint::<Backend>("models/impact_v1", &device)?;
+let loaded_model = load_checkpoint::<Backend>("models/player_centric_v1", &device)?;
 ```
 
 ## Training Details
 
 ### Loss Function
 
-The model uses **Mean Squared Error (MSE)** loss between predicted and target MMR values:
+**Mean Squared Error (MSE)** between predicted and target MMR values for all 6 players:
 
 ```
 Loss = mean((predicted_mmr - target_mmr)²)
 ```
 
-This is appropriate for regression tasks where we want to minimize the average squared difference between predictions and ground truth.
-
 ### Optimizer
 
-**Adam optimizer** with configurable learning rate (default: 1e-4). Adam adapts learning rates per-parameter, which works well for this regression task.
+**Adam optimizer** with configurable learning rate (default: 1e-4).
 
-### Data Handling
+### Segment Caching
 
-1. **Validation Split**: 10% of data held out for validation by default
-2. **Shuffling**: Training data is shuffled each epoch using a deterministic seed
-3. **Batching**: Samples are grouped into configurable batch sizes (default: 64)
+For efficient training, game replays are pre-processed into cached segments:
 
-### Early Stopping
+```
+Format: [6_players × seq_len × 95_features] per segment
+Size: 6 × 150 × 95 × 4 bytes = ~342KB per segment
+```
 
-Training automatically stops if validation loss doesn't improve for 10 consecutive epochs, preventing overfitting.
+This allows loading training data much faster than parsing replays each epoch.
 
 ## Configuration
 
@@ -147,9 +159,10 @@ Training automatically stops if validation loss doesn't improve for 10 consecuti
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `hidden_size_1` | 256 | Neurons in first hidden layer |
-| `hidden_size_2` | 128 | Neurons in second hidden layer |
-| `dropout` | 0.1 | Dropout rate (not currently used) |
+| `lstm_hidden_1` | 128 | Hidden size of first LSTM layer |
+| `lstm_hidden_2` | 64 | Hidden size of second LSTM layer |
+| `feedforward_hidden` | 32 | Size of feedforward layer |
+| `dropout` | 0.5 | Dropout rate for regularization |
 
 ### TrainingConfig
 
@@ -157,38 +170,42 @@ Training automatically stops if validation loss doesn't improve for 10 consecuti
 |-----------|---------|-------------|
 | `learning_rate` | 1e-4 | Adam optimizer learning rate |
 | `epochs` | 100 | Maximum training epochs |
-| `batch_size` | 64 | Samples per training batch |
+| `batch_size` | 2048 | Samples per training batch |
 | `validation_split` | 0.1 | Fraction held for validation |
-| `model` | ModelConfig | Nested model architecture config |
+| `sequence_length` | 150 | Frames per segment (~5 seconds at 30fps) |
 
 ## File Format
 
-Models are saved using Burn's **MessagePack** format with full precision:
+Models are saved using Burn's **MessagePack** format:
 
 ```
-models/impact_v1.mpk          # Model weights (binary)
-models/impact_v1.config.json  # Training configuration (JSON)
+models/player_centric_v1.mpk          # Model weights (binary)
+models/player_centric_v1.config.json  # Training configuration (JSON)
 ```
 
-The config file allows the model architecture to be reconstructed when loading.
+Cached segments are stored as raw binary files:
+
+```
+segments/{rank}/{replay_id}/{start_frame}-{end_frame}.features
+```
 
 ## Backend Support
-
-The model is generic over Burn backends. Common choices:
 
 | Backend | Use Case |
 |---------|----------|
 | `Wgpu` | GPU acceleration (cross-platform) |
 | `NdArray` | CPU-only, good for testing |
-| `Autodiff<B>` | Wraps any backend for training (automatic differentiation) |
+| `Autodiff<B>` | Wraps any backend for training |
 
-Training requires an `AutodiffBackend` (e.g., `Autodiff<Wgpu>`), while inference works with any backend.
+Training requires `Autodiff<Wgpu>`, while inference works with `Wgpu` directly.
 
 ## Dependencies
 
 - **burn** - Core deep learning framework
-- **feature_extractor** - Provides `TrainingSample` and `FrameFeatures` types
+- **feature_extractor** - Provides player-centric feature extraction
+- **replay_structs** - Game frame data structures
 - **anyhow** - Error handling
+- **bytemuck** - Zero-copy byte casting
 
 ## Testing
 
@@ -200,7 +217,7 @@ cargo test -p ml_model
 
 Tests cover:
 - Model creation and forward pass
-- Single and batch prediction
-- Training loop execution
-- Data splitting and shuffling
-
+- Player-centric prediction
+- Training data structures
+- Segment frame padding
+- Segment store operations
