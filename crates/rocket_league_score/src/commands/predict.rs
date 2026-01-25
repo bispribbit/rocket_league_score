@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use burn::backend::Cuda;
+use burn::backend::Wgpu;
 use ml_model::{SequenceModel, load_checkpoint, predict_player_centric};
 use replay_parser::parse_replay;
 use replay_structs::RankDivision;
@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use super::init_device;
 
-type Backend = Cuda;
+type Backend = Wgpu;
 
 /// Default sequence length for inference (should match training config).
 const DEFAULT_SEQUENCE_LENGTH: usize = 300;

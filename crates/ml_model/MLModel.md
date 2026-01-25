@@ -90,13 +90,13 @@ Output: [batch_size × 6, 1] → reshape to [batch_size, 6]
 ### Creating a Model
 
 ```rust
-use burn::backend::Cuda;
-use burn::backend::cuda::CudaDevice;
+use burn::backend::Wgpu;
+use burn::backend::wgpu::WgpuDevice;
 use ml_model::{create_model, ModelConfig};
 
-type Backend = Cuda;
+type Backend = Wgpu;
 
-let device = CudaDevice::default();
+let device = WgpuDevice::default();
 let config = ModelConfig::new();  // Uses defaults: 128 → 64 LSTM hidden layers
 let model = create_model::<Backend>(&device, &config);
 ```
@@ -197,7 +197,7 @@ segments/{rank}/{replay_id}/{start_frame}-{end_frame}.features
 | `NdArray` | CPU-only, good for testing |
 | `Autodiff<B>` | Wraps any backend for training |
 
-Training requires `Autodiff<Cuda>`, while inference works with `Cuda` directly.
+Training requires `Autodiff<Wgpu>`, while inference works with `Wgpu` directly.
 
 ## Dependencies
 

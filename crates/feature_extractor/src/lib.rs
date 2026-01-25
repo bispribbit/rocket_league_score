@@ -306,27 +306,27 @@ pub fn extract_player_centric_frame_features(
     idx += 13;
 
     // 6. Teammate relationships (4 features)
-    if let Some(&teammate1) = teammates.first() {
-        if !teammate1.actor_state.is_demolished {
-            let dist_to_ball = distance(&teammate1.actor_state.position, &frame.ball.position);
-            features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-            let dist_to_this = distance(
-                &teammate1.actor_state.position,
-                &this_player.actor_state.position,
-            );
-            features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
-        }
+    if let Some(&teammate1) = teammates.first()
+        && !teammate1.actor_state.is_demolished
+    {
+        let dist_to_ball = distance(&teammate1.actor_state.position, &frame.ball.position);
+        features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+        let dist_to_this = distance(
+            &teammate1.actor_state.position,
+            &this_player.actor_state.position,
+        );
+        features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
     }
-    if let Some(&teammate2) = teammates.get(1) {
-        if !teammate2.actor_state.is_demolished {
-            let dist_to_ball = distance(&teammate2.actor_state.position, &frame.ball.position);
-            features.features[idx + 2] = (dist_to_ball / field::DIAGONAL).min(1.0);
-            let dist_to_this = distance(
-                &teammate2.actor_state.position,
-                &this_player.actor_state.position,
-            );
-            features.features[idx + 3] = (dist_to_this / field::DIAGONAL).min(1.0);
-        }
+    if let Some(&teammate2) = teammates.get(1)
+        && !teammate2.actor_state.is_demolished
+    {
+        let dist_to_ball = distance(&teammate2.actor_state.position, &frame.ball.position);
+        features.features[idx + 2] = (dist_to_ball / field::DIAGONAL).min(1.0);
+        let dist_to_this = distance(
+            &teammate2.actor_state.position,
+            &this_player.actor_state.position,
+        );
+        features.features[idx + 3] = (dist_to_this / field::DIAGONAL).min(1.0);
     }
     idx += 4;
 
@@ -340,16 +340,16 @@ pub fn extract_player_centric_frame_features(
 
     // 10. Opponent relationships (6 features)
     for i in 0..3 {
-        if let Some(&opponent) = opponents.get(i) {
-            if !opponent.actor_state.is_demolished {
-                let dist_to_ball = distance(&opponent.actor_state.position, &frame.ball.position);
-                features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-                let dist_to_this = distance(
-                    &opponent.actor_state.position,
-                    &this_player.actor_state.position,
-                );
-                features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
-            }
+        if let Some(&opponent) = opponents.get(i)
+            && !opponent.actor_state.is_demolished
+        {
+            let dist_to_ball = distance(&opponent.actor_state.position, &frame.ball.position);
+            features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
+            let dist_to_this = distance(
+                &opponent.actor_state.position,
+                &this_player.actor_state.position,
+            );
+            features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
         }
         idx += 2;
     }
