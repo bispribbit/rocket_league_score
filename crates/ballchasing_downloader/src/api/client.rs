@@ -1,12 +1,10 @@
 //! Rate-limited HTTP client for ballchasing.com API.
 
 use core::num::NonZeroU32;
-use core::str::FromStr;
 use core::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use config::CONFIG;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
@@ -86,9 +84,7 @@ impl BallchasingClient {
     ///
     /// * `playlist` - Playlist filter (e.g., "ranked-standard")
     /// * `min_rank` - Minimum rank filter (e.g., "bronze-1")
-    /// * `max_rank` - Maximum rank filter (same as min for exact rank)
     /// * `count` - Number of results (max 200)
-    /// * `before` - Date filter for pagination (only include replays created before this date)
     ///
     /// # Errors
     ///
@@ -97,43 +93,38 @@ impl BallchasingClient {
         &self,
         playlist: GameMode,
         min_rank: Rank,
-        max_rank: Rank,
         count: usize,
-        before: Option<DateTime<Utc>>,
     ) -> Result<ReplayListResponse> {
-        self.wait_for_rate_limit().await;
-
         let playlist_str = playlist.as_api_string();
         let min_rank_str = min_rank.as_api_string();
+        let max_rank = min_rank.saturating_add(4);
         let max_rank_str = max_rank.as_api_string();
-
-        info!(
-            playlist = playlist_str,
-            min_rank = min_rank_str,
-            max_rank = max_rank_str,
-            count = count,
-            before = ?before,
-            "Listing replays",
-        );
-
         let count = count.min(200); // API max is 200
 
-        let mut url = format!(
+        let url = format!(
             "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank_str}&max-rank={max_rank_str}&count={count}&sort-by=created&sort-dir=desc"
         );
 
-        if let Some(before_date) = before {
-            // Format DateTime as RFC3339 with Z suffix (API requires this format)
-            let rfc3339_date = before_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            use core::fmt::Write;
-            let _ = write!(url, "&created-before={rfc3339_date}");
-        }
+        self.fetch_replay_list(&url).await
+    }
+
+    /// Fetches a replay list from a URL (used for initial request and pagination).
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The full URL to fetch
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
+    async fn fetch_replay_list(&self, url: &str) -> Result<ReplayListResponse> {
+        self.wait_for_rate_limit().await;
 
         info!("Fetching replays: {url}");
 
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .header("Authorization", &CONFIG.ballchasing_api_key)
             .send()
             .await
@@ -222,7 +213,7 @@ impl BallchasingClient {
     /// Fetches replays for a specific rank, handling pagination.
     ///
     /// This method will fetch up to `target_count` replays, handling
-    /// pagination automatically.
+    /// pagination automatically using the API's native `next` pagination.
     ///
     /// # Arguments
     ///
@@ -239,14 +230,13 @@ impl BallchasingClient {
     /// Returns an error if any API request fails.
     pub async fn fetch_replays_for_rank(
         &self,
-        rank: &str,
+        rank: Rank,
         target_count: usize,
         existing_ids: &std::collections::HashSet<Uuid>,
     ) -> Result<Vec<ReplaySummary>> {
         let mut all_replays = Vec::new();
         let mut seen_ids = existing_ids.clone();
-        let mut before_date: Option<DateTime<Utc>> = None;
-        let mut consecutive_duplicates = 0;
+        let mut next_url: Option<String> = None;
 
         info!(
             "Fetching replays for rank {rank}, target count: {target_count}",
@@ -255,22 +245,14 @@ impl BallchasingClient {
         );
 
         while all_replays.len() < target_count {
-            // Always request at least 50 replays to have a good chance of finding new ones,
-            // even if we only need 1 more. We'll stop adding once we have enough.
-            let batch_size = 200;
-
-            let ballchasing_rank =
-                Rank::from_str(rank).with_context(|| format!("Invalid rank: {rank}"))?;
-
-            let response = self
-                .list_replays(
-                    GameMode::RankedStandard,
-                    ballchasing_rank,
-                    ballchasing_rank,
-                    batch_size,
-                    before_date,
-                )
-                .await?;
+            // Fetch either the next page or the initial request
+            let response = match &next_url {
+                Some(url) => self.fetch_replay_list(url).await?,
+                None => {
+                    self.list_replays(GameMode::RankedStandard, rank, 200)
+                        .await?
+                }
+            };
 
             if response.list.is_empty() {
                 info!("No more replays available for rank {rank}");
@@ -284,6 +266,12 @@ impl BallchasingClient {
                     break;
                 }
 
+                if let Some(min_rank) = &replay.min_rank
+                    && min_rank.id != rank.as_api_string()
+                {
+                    continue;
+                }
+
                 if let Ok(id) = replay.id.parse::<Uuid>() {
                     // Skip if already in database or already seen in this fetch
                     if seen_ids.contains(&id) {
@@ -295,70 +283,25 @@ impl BallchasingClient {
                 }
             }
 
-            if new_count == 0 {
-                consecutive_duplicates += 1;
-                if consecutive_duplicates >= 10 {
-                    warn!(
-                        "Too many consecutive duplicate batches for rank {rank}, going back one day"
-                    );
-                    consecutive_duplicates = 0;
-                    // Subtract one day from before_date to look for older replays
-                    before_date = Some(
-                        before_date
-                            .unwrap_or_else(Utc::now)
-                            .checked_sub_signed(chrono::Duration::weeks(1))
-                            .unwrap_or_else(Utc::now),
-                    );
-                    continue;
-                }
+            info!(
+                "Rank {rank}: found {new_count} new replays in batch, total: {}",
+                all_replays.len()
+            );
+
+            // Use API's native pagination
+            if let Some(url) = response.next {
+                let max_rank = rank.saturating_add(4);
+                next_url = Some(format!("{url}&max-rank={}", max_rank.as_api_string()));
             } else {
-                consecutive_duplicates = 0;
-            }
-
-            // Get the created date of the last replay for pagination
-            // Parse the created field (when replay was uploaded) for created-before filter
-            // With created-before and descending sort, we use the exact date to get older replays
-            if let Some(last) = response.list.last() {
-                // Parse the created field (when the replay was uploaded)
-                let parsed_datetime = chrono::DateTime::parse_from_rfc3339(&last.created)
-                    .map_or_else(
-                        |_| {
-                            if let Ok(dt) = chrono::DateTime::parse_from_str(
-                                &last.created,
-                                "%Y-%m-%dT%H:%M:%S%z",
-                            ) {
-                                Some(dt.with_timezone(&Utc))
-                            } else {
-                                warn!(
-                                    replay_id = %last.id,
-                                    created = last.created,
-                                    "Failed to parse replay created date"
-                                );
-                                None
-                            }
-                        },
-                        |dt| Some(dt.with_timezone(&Utc)),
-                    );
-
-                if let Some(dt) = parsed_datetime {
-                    // Use the exact created date - created-before will exclude this date and get older replays
-                    before_date = Some(dt);
-                } else {
-                    // Fallback: use yesterday to ensure we don't get stuck
-                    warn!(
-                        replay_id = %last.id,
-                        "Failed to parse created date, using current date minus 1 week"
-                    );
-                    before_date = Some(Utc::now() - chrono::Duration::weeks(1));
-                }
-            }
-
-            // Check if there are more pages
-            if response.next.is_none() {
-                info!("No more pages for rank {rank}");
+                info!("No more pages available for rank {rank}");
                 break;
             }
         }
+
+        info!(
+            "Finished fetching for rank {rank}: {} new replays found",
+            all_replays.len()
+        );
 
         Ok(all_replays)
     }

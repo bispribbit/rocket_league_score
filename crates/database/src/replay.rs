@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use replay_structs::{DatasetSplit, DownloadStatus, GameMode, Rank, Replay};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::get_pool;
@@ -32,6 +33,8 @@ pub async fn insert_replays(
     if ids.is_empty() {
         return Ok(0);
     }
+
+    info!("Inserting {} replays {:?}", ids.len(), ids);
 
     // Construct file paths for all replays
     let file_paths: Vec<String> = ids
@@ -106,46 +109,22 @@ pub async fn find_replay_by_path(file_path: &Path) -> Result<Option<Replay>, sql
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn list_replays_by_rank(
-    rank: Rank,
-    status: Option<DownloadStatus>,
-) -> Result<Vec<Replay>, sqlx::Error> {
+pub async fn list_replays_by_rank(rank: Rank) -> Result<Vec<Replay>, sqlx::Error> {
     let pool = get_pool();
-    match status {
-        Some(status) => {
-            sqlx::query_as!(
-                Replay,
-                r#"
-                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
-                       download_status as "download_status: DownloadStatus", file_path, error_message,
-                       dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
-                FROM replays
-                WHERE rank = $1 AND download_status = $2
-                ORDER BY created_at
-                "#,
-                rank as Rank,
-                status as DownloadStatus
-            )
-            .fetch_all(pool)
-            .await
-        }
-        None => {
-            sqlx::query_as!(
-                Replay,
-                r#"
-                SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
-                       download_status as "download_status: DownloadStatus", file_path, error_message,
-                       dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
-                FROM replays
-                WHERE rank = $1
-                ORDER BY created_at
-                "#,
-                rank as Rank
-            )
-            .fetch_all(pool)
-            .await
-        }
-    }
+    sqlx::query_as!(
+        Replay,
+        r#"
+            SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+                    download_status as "download_status: DownloadStatus", file_path, error_message,
+                    dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
+            FROM replays
+            WHERE rank = $1
+            ORDER BY created_at
+            "#,
+        rank as Rank
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// Samples replays evenly across all ranks in a deterministic way.

@@ -1,0 +1,429 @@
+//! Bundle importer for local replay files with metadata.
+//!
+//! Imports replays from a local directory with a JSONL metadata file,
+//! copying them to the object store organized by rank.
+
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use chrono::Utc;
+use config::OBJECT_STORE;
+use object_store::ObjectStoreExt;
+use object_store::path::Path as ObjectStorePath;
+use replay_structs::{GameMode, Rank, RankDivision, ReplayPlayer, ReplaySummary};
+use serde::Deserialize;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+/// Metadata format from the bundle JSONL file.
+///
+/// Each line in the JSONL file contains this structure.
+#[derive(Debug, Deserialize)]
+pub struct BundleMetadata {
+    /// Replay ID
+    pub id: String,
+
+    /// Score (present in the JSON but not used directly)
+    pub score: Option<f64>,
+
+    /// The actual replay metadata matching ReplaySummary format
+    pub data: ReplaySummary,
+}
+
+/// Result of rank calculation for a replay.
+pub struct RankCalculationResult {
+    /// Average rank division for the game
+    pub average_rank_division: RankDivision,
+
+    /// Simplified rank for folder organization
+    pub folder_rank: Rank,
+
+    /// Extracted players with their ranks (ready for database insertion)
+    pub players: Vec<ReplayPlayer>,
+}
+
+/// Calculates the average rank from a list of known rank divisions.
+///
+/// Returns None if the list is empty.
+fn calculate_average_rank_division(known_ranks: &[RankDivision]) -> Option<RankDivision> {
+    if known_ranks.is_empty() {
+        return None;
+    }
+
+    let sum: usize = known_ranks.iter().map(|r| r.as_index()).sum();
+    let average_index = sum / known_ranks.len();
+
+    let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
+    all_divisions.get(average_index).copied()
+}
+
+/// Extracts players from replay metadata and calculates ranks.
+///
+/// For players with known ranks, uses their actual rank.
+/// For players with null ranks, assigns the average rank of known players.
+/// If no players have known ranks, falls back to min_rank/max_rank midpoint.
+///
+/// # Errors
+///
+/// Returns an error if no valid rank can be determined.
+pub fn extract_players_with_average_rank(
+    replay_id: Uuid,
+    summary: &ReplaySummary,
+) -> Result<RankCalculationResult> {
+    let mut known_ranks: Vec<RankDivision> = Vec::new();
+    let mut players_with_ranks: Vec<(String, i16, Option<RankDivision>)> = Vec::new();
+
+    // Helper to process a team
+    let process_team =
+        |players: &[replay_structs::PlayerSummary],
+         team: i16,
+         known_ranks: &mut Vec<RankDivision>,
+         players_with_ranks: &mut Vec<(String, i16, Option<RankDivision>)>| {
+            for player in players {
+                let Some(name) = player.name.as_ref() else {
+                    continue;
+                };
+
+                let rank_division = player.rank.as_ref().map(|r| {
+                    let division: RankDivision = r.clone().into();
+                    known_ranks.push(division);
+                    division
+                });
+
+                players_with_ranks.push((name.clone(), team, rank_division));
+            }
+        };
+
+    // Process blue team (team 0)
+    if let Some(blue_team) = &summary.blue
+        && let Some(team_players) = &blue_team.players
+    {
+        process_team(team_players, 0, &mut known_ranks, &mut players_with_ranks);
+    }
+
+    // Process orange team (team 1)
+    if let Some(orange_team) = &summary.orange
+        && let Some(team_players) = &orange_team.players
+    {
+        process_team(team_players, 1, &mut known_ranks, &mut players_with_ranks);
+    }
+
+    // Calculate average rank
+    let average_rank_division = if let Some(avg) = calculate_average_rank_division(&known_ranks) {
+        avg
+    } else {
+        // Fallback to min_rank/max_rank midpoint
+        let min_rank = summary
+            .min_rank
+            .as_ref()
+            .context("No min_rank available for fallback")?;
+        let max_rank = summary
+            .max_rank
+            .as_ref()
+            .context("No max_rank available for fallback")?;
+
+        let min_division: RankDivision = min_rank.clone().into();
+        let max_division: RankDivision = max_rank.clone().into();
+
+        let min_idx = min_division.as_index();
+        let max_idx = max_division.as_index();
+        let mid_idx = usize::midpoint(min_idx, max_idx);
+
+        let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
+        all_divisions
+            .get(mid_idx)
+            .copied()
+            .context("Failed to get midpoint rank division")?
+    };
+
+    // Convert to folder rank
+    let folder_rank: Rank = average_rank_division.into();
+
+    // Build ReplayPlayer instances directly
+    let players: Vec<ReplayPlayer> = players_with_ranks
+        .into_iter()
+        .map(|(name, team, rank)| ReplayPlayer {
+            id: 0, // Auto-generated by database
+            replay_id,
+            player_name: name,
+            team,
+            rank_division: rank.unwrap_or(average_rank_division),
+            created_at: Utc::now(),
+        })
+        .collect();
+
+    Ok(RankCalculationResult {
+        average_rank_division,
+        folder_rank,
+        players,
+    })
+}
+
+/// Progress information for the import process.
+struct ImportProgress {
+    total_lines: usize,
+    processed: usize,
+    imported: usize,
+    skipped_exists: usize,
+    skipped_error: usize,
+    skipped_no_file: usize,
+}
+
+impl ImportProgress {
+    const fn new(total_lines: usize) -> Self {
+        Self {
+            total_lines,
+            processed: 0,
+            imported: 0,
+            skipped_exists: 0,
+            skipped_error: 0,
+            skipped_no_file: 0,
+        }
+    }
+
+    fn log_progress(&self) {
+        let percentage = if self.total_lines > 0 {
+            (self.processed as f64 / self.total_lines as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        info!(
+            "Progress: {}/{} ({:.1}%) - Imported: {}, Exists: {}, No file: {}, Errors: {}",
+            self.processed,
+            self.total_lines,
+            percentage,
+            self.imported,
+            self.skipped_exists,
+            self.skipped_no_file,
+            self.skipped_error
+        );
+    }
+}
+
+/// Imports replays from a bundle directory.
+///
+/// Reads the metadata.jsonl file line by line and imports each replay
+/// to the object store and database.
+///
+/// # Arguments
+///
+/// * `bundle_dir` - Path to the bundle directory containing metadata.jsonl and .replay files
+///
+/// # Errors
+///
+/// Returns an error if the import process fails.
+pub async fn import_bundle(bundle_dir: &Path) -> Result<()> {
+    let metadata_path = bundle_dir.join("metadata.jsonl");
+    let file = std::fs::File::open(&metadata_path)
+        .with_context(|| format!("Failed to open {}", metadata_path.display()))?;
+
+    // Count total lines for progress
+    let total_lines = BufReader::new(
+        std::fs::File::open(&metadata_path).context("Failed to open metadata file for counting")?,
+    )
+    .lines()
+    .count();
+
+    info!("Starting bundle import from {}", bundle_dir.display());
+    info!("Total replays to process: {total_lines}");
+
+    let reader = BufReader::new(file);
+    let mut progress = ImportProgress::new(total_lines);
+    let log_interval = 1000;
+
+    // Batch processing for database inserts
+    let batch_size = 100;
+    let mut batch_ids: Vec<Uuid> = Vec::with_capacity(batch_size);
+    let mut batch_game_modes: Vec<GameMode> = Vec::with_capacity(batch_size);
+    let mut batch_ranks: Vec<Rank> = Vec::with_capacity(batch_size);
+    let mut batch_metadata: Vec<serde_json::Value> = Vec::with_capacity(batch_size);
+    let mut batch_players: Vec<ReplayPlayer> = Vec::with_capacity(batch_size * 6);
+
+    for line_result in reader.lines() {
+        progress.processed += 1;
+
+        let line = match line_result {
+            Ok(l) => l,
+            Err(error) => {
+                warn!("Failed to read line {}: {error}", progress.processed);
+                progress.skipped_error += 1;
+                continue;
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Parse the metadata
+        let bundle_metadata: BundleMetadata = match serde_json::from_str(&line) {
+            Ok(m) => m,
+            Err(error) => {
+                warn!(
+                    "Failed to parse JSON at line {}: {error}",
+                    progress.processed
+                );
+                progress.skipped_error += 1;
+                continue;
+            }
+        };
+
+        // Parse the replay ID
+        let replay_id: Uuid = match bundle_metadata.id.parse() {
+            Ok(id) => id,
+            Err(error) => {
+                warn!(
+                    "Invalid replay ID '{}' at line {}: {error}",
+                    bundle_metadata.id, progress.processed
+                );
+                progress.skipped_error += 1;
+                continue;
+            }
+        };
+
+        // Check if replay already exists in database
+        match database::replay_exists(replay_id).await {
+            Ok(true) => {
+                progress.skipped_exists += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!("Failed to check if replay exists: {error}");
+                progress.skipped_error += 1;
+                continue;
+            }
+        }
+
+        // Calculate average rank and extract players
+        let rank_result = match extract_players_with_average_rank(replay_id, &bundle_metadata.data)
+        {
+            Ok(r) => r,
+            Err(error) => {
+                warn!("Failed to calculate rank for replay {}: {error}", replay_id);
+                progress.skipped_error += 1;
+                continue;
+            }
+        };
+
+        // Check if the replay file exists
+        let replay_file_path = bundle_dir.join(format!("{replay_id}.replay"));
+        if !replay_file_path.exists() {
+            warn!("Replay file not found: {}", replay_file_path.display());
+            progress.skipped_no_file += 1;
+            continue;
+        }
+
+        // Read the replay file
+        let replay_data = match std::fs::read(&replay_file_path) {
+            Ok(data) => Bytes::from(data),
+            Err(error) => {
+                warn!(
+                    "Failed to read replay file {}: {error}",
+                    replay_file_path.display()
+                );
+                progress.skipped_error += 1;
+                continue;
+            }
+        };
+
+        // Determine game mode from playlist_id
+        let game_mode = bundle_metadata
+            .data
+            .playlist_id
+            .as_ref()
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or(GameMode::RankedStandard);
+
+        // Write to object store
+        let object_path = format!(
+            "replays/{}/{}/{replay_id}.replay",
+            game_mode.as_api_string(),
+            rank_result.folder_rank.as_folder_name()
+        );
+        let object_store_path = ObjectStorePath::from(object_path.as_str());
+
+        if let Err(error) = OBJECT_STORE
+            .put(&object_store_path, replay_data.into())
+            .await
+        {
+            warn!("Failed to write replay to object store: {error}");
+            progress.skipped_error += 1;
+            continue;
+        }
+
+        // Add to batch
+        batch_ids.push(replay_id);
+        batch_game_modes.push(game_mode);
+        batch_ranks.push(rank_result.folder_rank);
+        batch_metadata.push(serde_json::to_value(&bundle_metadata.data)?);
+        batch_players.extend(rank_result.players);
+
+        progress.imported += 1;
+
+        // Flush batch if full
+        if batch_ids.len() >= batch_size {
+            flush_batch(
+                &mut batch_ids,
+                &mut batch_game_modes,
+                &mut batch_ranks,
+                &mut batch_metadata,
+                &mut batch_players,
+            )
+            .await?;
+        }
+
+        // Log progress periodically
+        if progress.processed.is_multiple_of(log_interval) {
+            progress.log_progress();
+        }
+    }
+
+    // Flush remaining batch
+    if !batch_ids.is_empty() {
+        flush_batch(
+            &mut batch_ids,
+            &mut batch_game_modes,
+            &mut batch_ranks,
+            &mut batch_metadata,
+            &mut batch_players,
+        )
+        .await?;
+    }
+
+    progress.log_progress();
+    info!("Bundle import complete!");
+
+    Ok(())
+}
+
+/// Flushes a batch of replays to the database.
+async fn flush_batch(
+    ids: &mut Vec<Uuid>,
+    game_modes: &mut Vec<GameMode>,
+    ranks: &mut Vec<Rank>,
+    metadata: &mut Vec<serde_json::Value>,
+    players: &mut Vec<ReplayPlayer>,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let inserted = database::insert_replays(ids, game_modes, ranks, metadata).await?;
+    info!("Inserted {inserted} replays into database");
+
+    if !players.is_empty() {
+        database::insert_replay_players(players).await?;
+    }
+
+    ids.clear();
+    game_modes.clear();
+    ranks.clear();
+    metadata.clear();
+    players.clear();
+
+    Ok(())
+}

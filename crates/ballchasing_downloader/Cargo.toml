@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "bundle_importer"
+path = "src/bin/bundle_importer.rs"
+
 [lints]
 workspace = true
 

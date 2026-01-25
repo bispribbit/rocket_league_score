@@ -762,7 +762,7 @@ async fn load_validation_data_cached(
     // Preload all segments into memory for faster validation access
     let mut store = builder.build();
     info!(
-        store_name = %store.name,
+        store_name = %store.name(),
         "Preloading all segments into memory"
     );
     store.preload_all_segments()?;

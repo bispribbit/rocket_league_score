@@ -23,7 +23,7 @@ use crate::api::client::{BallchasingClient, RateLimitedError};
 use crate::players::extract_players_from_metadata;
 
 /// Target number of replays per rank.
-const TARGET_REPLAYS_PER_RANK: usize = 1100;
+const TARGET_REPLAYS_PER_RANK: usize = 1200;
 
 /// How often to log progress (in seconds).
 const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
@@ -90,12 +90,12 @@ async fn fetch_all_metadata(client: Arc<BallchasingClient>) -> Result<()> {
             info!("Rank {rank}: have {current}, fetching up to {needed} more");
 
             // Get existing IDs
-            let existing = database::list_replays_by_rank(rank, None).await?;
+            let existing = database::list_replays_by_rank(rank).await?;
             let existing_ids: HashSet<Uuid> = existing.iter().map(|replay| replay.id).collect();
 
             // Fetch from API
             let replays: Vec<ReplaySummary> = client
-                .fetch_replays_for_rank(rank.as_api_string(), needed, &existing_ids)
+                .fetch_replays_for_rank(rank, needed, &existing_ids)
                 .await?;
 
             // Store new replays

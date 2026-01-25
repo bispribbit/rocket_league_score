@@ -4,10 +4,11 @@
 //! with their corresponding MMR (Match Making Rating) values.
 
 use core::fmt;
+use core::ops::{Add, Sub};
 use core::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use strum::IntoEnumIterator;
+use strum::{EnumCount, IntoEnumIterator};
 
 /// Represents a Rocket League competitive rank with division.
 ///
@@ -1050,7 +1051,9 @@ fn parse_short_form(s: &str) -> Option<RankDivision> {
 /// Rank enum for Rocket League competitive ranks.
 ///
 /// These correspond to rank filter values used by external replay APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, strum::EnumIter, strum::EnumCount,
+)]
 #[sqlx(type_name = "rank", rename_all = "snake_case")]
 pub enum Rank {
     Unranked,
@@ -1195,6 +1198,118 @@ impl FromStr for Rank {
             "grand-champion" => Ok(Self::GrandChampion),
             _ => Err(anyhow::anyhow!("Invalid rank: {s}")),
         }
+    }
+}
+
+impl Rank {
+    /// Maximum valid index for ranks.
+    const MAX_INDEX: usize = Self::COUNT - 1;
+
+    /// Returns the numeric index of this rank (0 = Unranked, 1 = Bronze1, ..., 19 = GrandChampion).
+    #[must_use]
+    pub const fn as_numeric_index(self) -> i32 {
+        self as i32
+    }
+
+    /// Creates a `Rank` from a numeric index, saturating at boundaries.
+    ///
+    /// Index 0 = Unranked, 1 = Bronze1, ..., 19 = GrandChampion.
+    /// Values below 0 return Unranked, values above 19 return GrandChampion.
+    #[must_use]
+    pub fn from_numeric_index_saturating(index: i32) -> Self {
+        if index <= 0 {
+            return Self::Unranked;
+        }
+        let clamped = (index as usize).min(Self::MAX_INDEX);
+        Self::iter().nth(clamped).unwrap_or(Self::GrandChampion)
+    }
+
+    /// Adds an offset to this rank, saturating at Unranked (min) and GrandChampion (max).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use replay_structs::Rank;
+    ///
+    /// assert_eq!(Rank::Bronze1.saturating_add(3), Rank::Silver1);
+    /// assert_eq!(Rank::GrandChampion.saturating_add(5), Rank::GrandChampion);
+    /// assert_eq!(Rank::Bronze1.saturating_add(-5), Rank::Unranked);
+    /// ```
+    #[must_use]
+    pub fn saturating_add(self, offset: i32) -> Self {
+        let new_index = self.as_numeric_index().saturating_add(offset);
+        Self::from_numeric_index_saturating(new_index)
+    }
+
+    /// Subtracts an offset from this rank, saturating at Unranked (min) and GrandChampion (max).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use replay_structs::Rank;
+    ///
+    /// assert_eq!(Rank::Silver1.saturating_sub(3), Rank::Bronze1);
+    /// assert_eq!(Rank::Bronze1.saturating_sub(5), Rank::Unranked);
+    /// assert_eq!(Rank::Unranked.saturating_sub(1), Rank::Unranked);
+    /// ```
+    #[must_use]
+    pub fn saturating_sub(self, offset: i32) -> Self {
+        let new_index = self.as_numeric_index().saturating_sub(offset);
+        Self::from_numeric_index_saturating(new_index)
+    }
+}
+
+impl Add<i32> for Rank {
+    type Output = Self;
+
+    /// Adds an offset to this rank, saturating at boundaries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use replay_structs::Rank;
+    ///
+    /// assert_eq!(Rank::Bronze1 + 3, Rank::Silver1);
+    /// assert_eq!(Rank::GrandChampion + 1, Rank::GrandChampion);
+    /// ```
+    fn add(self, offset: i32) -> Self::Output {
+        self.saturating_add(offset)
+    }
+}
+
+impl Sub<i32> for Rank {
+    type Output = Self;
+
+    /// Subtracts an offset from this rank, saturating at boundaries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use replay_structs::Rank;
+    ///
+    /// assert_eq!(Rank::Silver1 - 3, Rank::Bronze1);
+    /// assert_eq!(Rank::Bronze1 - 5, Rank::Unranked);
+    /// ```
+    fn sub(self, offset: i32) -> Self::Output {
+        self.saturating_sub(offset)
+    }
+}
+
+impl Sub<Self> for Rank {
+    type Output = i32;
+
+    /// Returns the difference in rank levels between two ranks.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use replay_structs::Rank;
+    ///
+    /// assert_eq!(Rank::Silver1 - Rank::Bronze1, 3);
+    /// assert_eq!(Rank::Bronze1 - Rank::Silver1, -3);
+    /// ```
+    fn sub(self, other: Self) -> Self::Output {
+        self.as_numeric_index() - other.as_numeric_index()
     }
 }
 
@@ -1547,6 +1662,77 @@ mod tests {
         assert_eq!(
             RankDivision::from(1500),
             RankDivision::GrandChampionIDivision3
+        );
+    }
+
+    #[test]
+    fn test_rank_add() {
+        // Basic addition (Bronze1 has index 1)
+        assert_eq!(Rank::Bronze1 + 3, Rank::Silver1); // 1 + 3 = 4 = Silver1
+        assert_eq!(Rank::Bronze1 + 1, Rank::Bronze2); // 1 + 1 = 2 = Bronze2
+        assert_eq!(Rank::Bronze1 + 5, Rank::Silver3); // 1 + 5 = 6 = Silver3
+        assert_eq!(Rank::Bronze1 + 6, Rank::Gold1); // 1 + 6 = 7 = Gold1
+
+        // Saturation at max
+        assert_eq!(Rank::GrandChampion + 1, Rank::GrandChampion);
+        assert_eq!(Rank::Champion3 + 5, Rank::GrandChampion);
+
+        // Adding zero
+        assert_eq!(Rank::Gold1 + 0, Rank::Gold1);
+
+        // Adding negative (same as subtraction)
+        assert_eq!(Rank::Silver1 + (-3), Rank::Bronze1); // 4 - 3 = 1 = Bronze1
+    }
+
+    #[test]
+    fn test_rank_sub() {
+        // Basic subtraction
+        assert_eq!(Rank::Silver1 - 3, Rank::Bronze1);
+        assert_eq!(Rank::Silver1 - 1, Rank::Bronze3);
+
+        // Saturation at min
+        assert_eq!(Rank::Bronze1 - 5, Rank::Unranked);
+        assert_eq!(Rank::Unranked - 1, Rank::Unranked);
+
+        // Subtracting zero
+        assert_eq!(Rank::Gold1 - 0, Rank::Gold1);
+
+        // Subtracting negative (same as addition)
+        assert_eq!(Rank::Bronze1 - (-3), Rank::Silver1);
+    }
+
+    #[test]
+    fn test_rank_difference() {
+        // Difference between ranks
+        assert_eq!(Rank::Silver1 - Rank::Bronze1, 3);
+        assert_eq!(Rank::Bronze1 - Rank::Silver1, -3);
+        assert_eq!(Rank::GrandChampion - Rank::Bronze1, 18);
+        assert_eq!(Rank::Bronze1 - Rank::Bronze1, 0);
+        assert_eq!(Rank::GrandChampion - Rank::Unranked, 19);
+    }
+
+    #[test]
+    fn test_rank_numeric_index() {
+        assert_eq!(Rank::Unranked.as_numeric_index(), 0);
+        assert_eq!(Rank::Bronze1.as_numeric_index(), 1);
+        assert_eq!(Rank::Bronze2.as_numeric_index(), 2);
+        assert_eq!(Rank::Bronze3.as_numeric_index(), 3);
+        assert_eq!(Rank::Silver1.as_numeric_index(), 4);
+        assert_eq!(Rank::GrandChampion.as_numeric_index(), 19);
+    }
+
+    #[test]
+    fn test_rank_from_numeric_index() {
+        assert_eq!(Rank::from_numeric_index_saturating(0), Rank::Unranked);
+        assert_eq!(Rank::from_numeric_index_saturating(1), Rank::Bronze1);
+        assert_eq!(Rank::from_numeric_index_saturating(4), Rank::Silver1);
+        assert_eq!(Rank::from_numeric_index_saturating(19), Rank::GrandChampion);
+
+        // Saturation
+        assert_eq!(Rank::from_numeric_index_saturating(-5), Rank::Unranked);
+        assert_eq!(
+            Rank::from_numeric_index_saturating(100),
+            Rank::GrandChampion
         );
     }
 }

@@ -356,7 +356,7 @@ fn bytes_to_f32_vec(bytes: Vec<u8>) -> Vec<f32> {
 /// This allows handling datasets larger than memory.
 pub struct SegmentStore {
     /// Name of the dataset.
-    pub name: String,
+    name: String,
 
     /// Maps segment index to segment metadata.
     entries: Vec<SegmentEntry>,
@@ -388,6 +388,10 @@ impl SegmentStore {
             size_bytes: segment_size_bytes,
             preloaded_segments: None,
         }
+    }
+
+    pub const fn name(&self) -> &str {
+        self.name.as_str()
     }
 
     /// Adds segments to the store from a list of segment files.
