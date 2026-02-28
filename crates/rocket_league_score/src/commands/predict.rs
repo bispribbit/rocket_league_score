@@ -4,7 +4,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use burn::backend::Wgpu;
-use ml_model::{SequenceModel, load_checkpoint, predict_player_centric};
+use ml_model::{SequenceModel, predict_player_centric};
+use ml_model_training::load_checkpoint;
 use replay_parser::parse_replay;
 use replay_structs::RankDivision;
 use tracing::{info, warn};

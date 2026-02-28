@@ -28,7 +28,7 @@ RUN rustup component add rustfmt clippy rust-src llvm-tools
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
 
 # Install cargo tools using cargo-binstall
-RUN cargo binstall cargo-make cargo-edit sqlx-cli -y
+RUN cargo binstall cargo-make cargo-edit sqlx-cli dioxus-cli -y
 
 # Set the working directory
 WORKDIR /workspace

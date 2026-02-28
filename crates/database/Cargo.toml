@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-replay_structs.workspace = true
+replay_structs = { workspace = true, features = ["database"] }
 
 anyhow.workspace = true
 bytes.workspace = true

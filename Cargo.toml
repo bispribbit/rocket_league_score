@@ -16,27 +16,32 @@ config = { path = "crates/config" }
 database = { path = "crates/database" }
 replay_parser = { path = "crates/replay_parser" }
 feature_extractor = { path = "crates/feature_extractor" }
-ml_model = { path = "crates/ml_model" }
+ml_model = { path = "crates/ml_model", default-features = false }
+ml_model_training = { path = "crates/ml_model_training" }
 replay_structs = { path = "crates/replay_structs" }
 
 # External workspace dependencies
-anyhow = { version = "1.0.100" }
+anyhow = { version = "1.0.101" }
 backon = { version = "1.6.0" }
-boxcars = { version = "0.10.9" }
-bytemuck = { version = "1.24.0" }
-burn = { version = "0.20.1", default-features = false, features = ["train", "wgpu", "ndarray", "std", "autodiff"] }
-bytes = { version = "1.11.0" }
+base64 = { version = "0.22" }
+boxcars = { version = "0.10.10" }
+burn = { version = "0.20.1", default-features = false, features = ["wgpu", "ndarray", "std", "autodiff"] }
+bytemuck = { version = "1.25.0" }
+bytes = { version = "1.11.1" }
 chrono = { version = "0.4.43", features = ["serde"] }
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.57", features = ["derive"] }
 csv = { version = "1.4" }
+dioxus = { version = "0.7" }
 dotenvy = { version = "0.15" }
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
 governor = { version = "0.10.4" }
+js-sys = { version = "0.3" }
 memmap2 = { version = "0.9.9" }
 mimalloc = { version = "0.1.48" }
 object_store = { version = "0.13.1" }
 parking_lot = { version = "0.12.5" }
 rayon = { version = "1.11.0" }
-reqwest = { version = "0.13.1", features = ["json"] }
+reqwest = { version = "0.13.2", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "migrate", "uuid", "chrono", "json"] }
@@ -45,7 +50,10 @@ thiserror = { version = "2.0.18" }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
 tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-uuid = { version = "1.19.0", features = ["v4"] }
+uuid = { version = "1.20.0", features = ["v4", "js"] }
+wasm-bindgen = { version = "0.2" }
+wasm-bindgen-futures = { version = "0.4" }
+web-sys = { version = "0.3.85" }
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

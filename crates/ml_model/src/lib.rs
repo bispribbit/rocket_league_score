@@ -21,24 +21,15 @@
 //! This enables the model to learn individual skill patterns and produce
 //! different predictions for each player.
 
-mod dataset;
-pub mod segment_cache;
-mod training;
-
-use std::path::Path;
-
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
+use burn::record::FullPrecisionSettings;
 use feature_extractor::{
     PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
     extract_all_player_centric_features,
 };
-pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};
-
 /// Configuration for the sequence model.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
@@ -191,17 +182,12 @@ impl<B: Backend> SequenceModel<B> {
         // For Burn, dropout is controlled by the tensor's require_grad flag
         self.forward(input)
     }
-}
 
-/// Reference to a saved model checkpoint.
-#[derive(Debug, Clone)]
-pub struct ModelCheckpoint {
-    /// Path to the saved model.
-    pub path: String,
-    /// Model version.
-    pub version: u32,
-    /// Training configuration used.
-    pub training_config: TrainingConfig,
+    /// Returns the device this model is on.
+    #[must_use]
+    pub fn device(&self) -> B::Device {
+        self.linear1.weight.device()
+    }
 }
 
 // ============================================================================
@@ -284,10 +270,101 @@ pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> Seq
     SequenceModel::new(device, config)
 }
 
-/// Predicts MMR for all players using player-centric features.
+/// Result of a single segment prediction.
+#[derive(Debug, Clone)]
+pub struct SegmentPrediction {
+    /// Zero-based segment index.
+    pub segment_index: usize,
+    /// Start frame index in the original frame list.
+    pub start_frame: usize,
+    /// End frame index (exclusive) in the original frame list.
+    pub end_frame: usize,
+    /// Predicted MMR for each of the 6 players in this segment.
+    pub player_predictions: [f32; TOTAL_PLAYERS],
+}
+
+/// Extracted player-centric features for all frames, used for incremental segment prediction.
+#[derive(Clone)]
+pub struct ExtractedSegmentFeatures {
+    /// One entry per frame.
+    pub(crate) player_centric_frames: Vec<[PlayerCentricFrameFeatures; 6]>,
+}
+
+impl ExtractedSegmentFeatures {
+    /// Builds features from game frames (call once, then use for all segments).
+    pub fn from_frames(frames: &[replay_structs::GameFrame]) -> Self {
+        let player_centric_frames = frames
+            .iter()
+            .map(extract_all_player_centric_features)
+            .collect();
+        Self {
+            player_centric_frames,
+        }
+    }
+
+    /// Number of segments for the given segment length.
+    pub const fn segment_count(&self, segment_length: usize) -> usize {
+        if self.player_centric_frames.len() >= segment_length {
+            self.player_centric_frames.len() / segment_length
+        } else {
+            1
+        }
+    }
+
+    /// Predicts a single segment by index. Returns `None` if index is out of range.
+    pub fn predict_single_segment<B: Backend>(
+        &self,
+        model: &SequenceModel<B>,
+        device: &B::Device,
+        segment_length: usize,
+        segment_index: usize,
+    ) -> Option<SegmentPrediction> {
+        let num_segments = self.segment_count(segment_length);
+        if segment_index >= num_segments {
+            return None;
+        }
+        let start = segment_index * segment_length;
+        let end = (start + segment_length).min(self.player_centric_frames.len());
+        let segment_frames =
+            get_segment_player_frames(&self.player_centric_frames, start, segment_length);
+
+        let mut input_data = Vec::with_capacity(6 * segment_length * PLAYER_CENTRIC_FEATURE_COUNT);
+        for player_idx in 0..6 {
+            for frame_features in &segment_frames {
+                if let Some(player_features) = frame_features.get(player_idx) {
+                    input_data.extend_from_slice(&player_features.features);
+                }
+            }
+        }
+
+        let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
+            6,
+            segment_length,
+            PLAYER_CENTRIC_FEATURE_COUNT,
+        ]);
+
+        let output = model.forward_inference(input);
+        let output_data = output.into_data();
+        let values = output_data.to_vec::<f32>().ok()?;
+        let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
+        for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
+            if let Some(pred) = player_predictions.get_mut(i) {
+                *pred = *val;
+            }
+        }
+        Some(SegmentPrediction {
+            segment_index,
+            start_frame: start,
+            end_frame: end,
+            player_predictions,
+        })
+    }
+}
+
+/// Predicts MMR for all players per segment using player-centric features.
 ///
-/// This function extracts player-centric features, splits the game into segments,
-/// predicts MMR for each player in each segment, and averages across segments.
+/// Returns a list of per-segment predictions. Use [`predict_player_centric`] if you
+/// only need the averaged result.
 ///
 /// # Arguments
 ///
@@ -298,15 +375,15 @@ pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> Seq
 ///
 /// # Returns
 ///
-/// Array of predicted MMR values for each of the 6 players (averaged across segments).
-pub fn predict_player_centric<B: Backend>(
+/// A vector of per-segment predictions.
+pub fn predict_player_centric_per_segment<B: Backend>(
     model: &SequenceModel<B>,
     frames: &[replay_structs::GameFrame],
     device: &B::Device,
     segment_length: usize,
-) -> [f32; TOTAL_PLAYERS] {
+) -> Vec<SegmentPrediction> {
     if frames.is_empty() {
-        return [1000.0; TOTAL_PLAYERS];
+        return vec![];
     }
 
     // Extract player-centric features for all frames
@@ -321,12 +398,11 @@ pub fn predict_player_centric<B: Backend>(
         1
     };
 
-    // Accumulate predictions per player
-    let mut sum_predictions = [0.0f32; TOTAL_PLAYERS];
-    let mut segment_count = 0;
+    let mut results = Vec::with_capacity(num_segments);
 
     for seg_idx in 0..num_segments {
         let start = seg_idx * segment_length;
+        let end = (start + segment_length).min(player_centric_frames.len());
         let segment_frames =
             get_segment_player_frames(&player_centric_frames, start, segment_length);
 
@@ -353,20 +429,63 @@ pub fn predict_player_centric<B: Backend>(
         // Extract predictions
         let output_data = output.into_data();
         if let Ok(values) = output_data.to_vec::<f32>() {
+            let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
             for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
-                if let Some(pred) = sum_predictions.get_mut(i) {
-                    *pred += *val;
+                if let Some(pred) = player_predictions.get_mut(i) {
+                    *pred = *val;
                 }
             }
-            segment_count += 1;
+            results.push(SegmentPrediction {
+                segment_index: seg_idx,
+                start_frame: start,
+                end_frame: end,
+                player_predictions,
+            });
         }
     }
 
-    // Average across segments
-    if segment_count > 0 {
-        for pred in &mut sum_predictions {
-            *pred /= segment_count as f32;
+    results
+}
+
+/// Predicts MMR for all players using player-centric features.
+///
+/// This function extracts player-centric features, splits the game into segments,
+/// predicts MMR for each player in each segment, and averages across segments.
+///
+/// # Arguments
+///
+/// * `model` - The trained model.
+/// * `frames` - All game frames (will be converted to player-centric features).
+/// * `device` - The device to run inference on.
+/// * `segment_length` - Number of consecutive frames per segment.
+///
+/// # Returns
+///
+/// Array of predicted MMR values for each of the 6 players (averaged across segments).
+pub fn predict_player_centric<B: Backend>(
+    model: &SequenceModel<B>,
+    frames: &[replay_structs::GameFrame],
+    device: &B::Device,
+    segment_length: usize,
+) -> [f32; TOTAL_PLAYERS] {
+    let segments = predict_player_centric_per_segment(model, frames, device, segment_length);
+
+    if segments.is_empty() {
+        return [1000.0; TOTAL_PLAYERS];
+    }
+
+    let mut sum_predictions = [0.0f32; TOTAL_PLAYERS];
+    for segment in &segments {
+        for (i, pred) in segment.player_predictions.iter().enumerate() {
+            if let Some(sum) = sum_predictions.get_mut(i) {
+                *sum += *pred;
+            }
         }
+    }
+
+    let count = segments.len() as f32;
+    for pred in &mut sum_predictions {
+        *pred /= count;
     }
 
     sum_predictions
@@ -396,75 +515,58 @@ fn get_segment_player_frames(
     segment
 }
 
-/// Saves the model checkpoint to disk.
+/// Loads a model checkpoint from in-memory bytes (binary format).
 ///
-/// # Errors
+/// This function is designed for WASM / embedded model use cases where the model
+/// weights are included via `include_bytes!`.
 ///
-/// Returns an error if the checkpoint cannot be saved.
-pub fn save_checkpoint<B: Backend>(
-    model: &SequenceModel<B>,
-    path: &str,
-    config: &TrainingConfig,
-) -> anyhow::Result<ModelCheckpoint> {
-    // Create parent directory if needed
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Save model weights
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    model
-        .clone()
-        .save_file(path, &recorder)
-        .map_err(|e| anyhow::anyhow!("Failed to save model: {e}"))?;
-
-    // Save config alongside the model
-    let config_path = format!("{path}.config.json");
-    config
-        .save(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to save config: {e}"))?;
-
-    Ok(ModelCheckpoint {
-        path: path.to_string(),
-        version: 1,
-        training_config: config.clone(),
-    })
-}
-
-/// Loads a model checkpoint from disk.
+/// It tries **NamedMpk** format first (the default training format produced by
+/// `save_checkpoint`), then falls back to **Bin** format (produced by
+/// `save_checkpoint_bin`).
 ///
 /// # Arguments
 ///
-/// * `path` - Path to the model checkpoint file (without extension)
+/// * `model_bytes` - Raw bytes of the model file
+/// * `config_json` - JSON string of the training config (can be empty for defaults)
 /// * `device` - The device to load the model onto
 ///
 /// # Errors
 ///
-/// Returns an error if the checkpoint cannot be loaded.
-pub fn load_checkpoint<B: Backend>(
-    path: &str,
+/// Returns an error if the model cannot be loaded from bytes.
+pub fn load_checkpoint_from_bytes<B: Backend>(
+    model_bytes: &[u8],
+    config_json: &str,
     device: &B::Device,
 ) -> anyhow::Result<SequenceModel<B>> {
-    // Try to load config first (for model dimensions)
-    let config_path = format!("{path}.config.json");
-    let model_config = if Path::new(&config_path).exists() {
-        let training_config = TrainingConfig::load(&config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-        training_config.model
-    } else {
+    use burn::record::{BinBytesRecorder, NamedMpkBytesRecorder, Recorder};
+
+    let model_config = if config_json.is_empty() {
         ModelConfig::new()
+    } else {
+        let training_config: TrainingConfig = serde_json::from_str(config_json)
+            .map_err(|error| anyhow::anyhow!("Failed to parse model config: {error}"))?;
+        training_config.model
     };
 
     // Create model with config
     let model = SequenceModel::new(device, &model_config);
 
-    // Load weights
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    let model = model
-        .load_file(path, &recorder, device)
-        .map_err(|e| anyhow::anyhow!("Failed to load model weights: {e}"))?;
+    // Try NamedMpk format first (default training checkpoint format), then Bin format.
+    let mpk_recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+    if let Ok(record) = mpk_recorder.load(model_bytes.to_vec(), device) {
+        return Ok(model.load_record(record));
+    }
 
-    Ok(model)
+    let bin_recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
+    let record = bin_recorder
+        .load(model_bytes.to_vec(), device)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to load model from bytes (tried NamedMpk and Bin formats): {error}"
+            )
+        })?;
+
+    Ok(model.load_record(record))
 }
 
 #[cfg(test)]

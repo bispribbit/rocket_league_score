@@ -8,11 +8,12 @@ use burn::nn::loss::MseLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
+use ml_model::{SequenceModel, TrainingConfig};
 use tracing::info;
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
+use crate::save_checkpoint;
 use crate::segment_cache::SegmentStore;
-use crate::{SequenceModel, TrainingConfig, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
 #[derive(Debug, Clone, Default)]
@@ -128,7 +129,7 @@ where
         return Err(anyhow::anyhow!("No training data provided"));
     }
 
-    let device = model.linear1.weight.device();
+    let device = model.device();
 
     // Create optimizer
     let mut optimizer = AdamConfig::new().init();
@@ -298,7 +299,7 @@ where
         if let Some(valid_ds) = valid_dataset {
             let valid_start = Instant::now();
             let inner_model = model.valid();
-            let inner_device = inner_model.linear1.weight.device();
+            let inner_device = inner_model.device();
             let valid_batcher =
                 SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length);
 

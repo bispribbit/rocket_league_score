@@ -1,3 +1,5 @@
+Always write code and speak to me in english.
+
 # Rust coding convention
 - Do not use abbreviation
 - Use "Cargo clippy --all-features --all-targets" to check for compilation instead of "Cargo check". Run it on the whole workspace, not just on a crate.

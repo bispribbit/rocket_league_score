@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// ML model metadata stored in the database.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "database", derive(sqlx::FromRow))]
 pub struct Model {
     pub id: Uuid,
     pub name: String,

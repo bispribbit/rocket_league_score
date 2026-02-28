@@ -15,211 +15,202 @@ use strum::{EnumCount, IntoEnumIterator};
 /// Each rank (except Supersonic Legend) has 4 divisions.
 /// MMR values are based on the 3v3 ranked playlist.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    sqlx::Type,
-    strum::EnumIter,
-    strum::EnumCount,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, strum::EnumIter, strum::EnumCount,
 )]
-#[sqlx(type_name = "rank_division")]
+#[cfg_attr(feature = "database", derive(sqlx::Type))]
+#[cfg_attr(feature = "database", sqlx(type_name = "rank_division"))]
 pub enum RankDivision {
     // Bronze I
-    #[sqlx(rename = "bronze1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze1_division1"))]
     BronzeIDivision1,
-    #[sqlx(rename = "bronze1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze1_division2"))]
     BronzeIDivision2,
-    #[sqlx(rename = "bronze1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze1_division3"))]
     BronzeIDivision3,
-    #[sqlx(rename = "bronze1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze1_division4"))]
     BronzeIDivision4,
     // Bronze II
-    #[sqlx(rename = "bronze2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze2_division1"))]
     BronzeIIDivision1,
-    #[sqlx(rename = "bronze2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze2_division2"))]
     BronzeIIDivision2,
-    #[sqlx(rename = "bronze2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze2_division3"))]
     BronzeIIDivision3,
-    #[sqlx(rename = "bronze2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze2_division4"))]
     BronzeIIDivision4,
     // Bronze III
-    #[sqlx(rename = "bronze3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze3_division1"))]
     BronzeIIIDivision1,
-    #[sqlx(rename = "bronze3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze3_division2"))]
     BronzeIIIDivision2,
-    #[sqlx(rename = "bronze3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze3_division3"))]
     BronzeIIIDivision3,
-    #[sqlx(rename = "bronze3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "bronze3_division4"))]
     BronzeIIIDivision4,
     // Silver I
-    #[sqlx(rename = "silver1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver1_division1"))]
     SilverIDivision1,
-    #[sqlx(rename = "silver1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver1_division2"))]
     SilverIDivision2,
-    #[sqlx(rename = "silver1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver1_division3"))]
     SilverIDivision3,
-    #[sqlx(rename = "silver1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver1_division4"))]
     SilverIDivision4,
     // Silver II
-    #[sqlx(rename = "silver2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver2_division1"))]
     SilverIIDivision1,
-    #[sqlx(rename = "silver2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver2_division2"))]
     SilverIIDivision2,
-    #[sqlx(rename = "silver2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver2_division3"))]
     SilverIIDivision3,
-    #[sqlx(rename = "silver2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver2_division4"))]
     SilverIIDivision4,
     // Silver III
-    #[sqlx(rename = "silver3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver3_division1"))]
     SilverIIIDivision1,
-    #[sqlx(rename = "silver3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver3_division2"))]
     SilverIIIDivision2,
-    #[sqlx(rename = "silver3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver3_division3"))]
     SilverIIIDivision3,
-    #[sqlx(rename = "silver3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "silver3_division4"))]
     SilverIIIDivision4,
     // Gold I
-    #[sqlx(rename = "gold1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold1_division1"))]
     GoldIDivision1,
-    #[sqlx(rename = "gold1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold1_division2"))]
     GoldIDivision2,
-    #[sqlx(rename = "gold1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold1_division3"))]
     GoldIDivision3,
-    #[sqlx(rename = "gold1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold1_division4"))]
     GoldIDivision4,
     // Gold II
-    #[sqlx(rename = "gold2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold2_division1"))]
     GoldIIDivision1,
-    #[sqlx(rename = "gold2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold2_division2"))]
     GoldIIDivision2,
-    #[sqlx(rename = "gold2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold2_division3"))]
     GoldIIDivision3,
-    #[sqlx(rename = "gold2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold2_division4"))]
     GoldIIDivision4,
     // Gold III
-    #[sqlx(rename = "gold3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold3_division1"))]
     GoldIIIDivision1,
-    #[sqlx(rename = "gold3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold3_division2"))]
     GoldIIIDivision2,
-    #[sqlx(rename = "gold3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold3_division3"))]
     GoldIIIDivision3,
-    #[sqlx(rename = "gold3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "gold3_division4"))]
     GoldIIIDivision4,
     // Platinum I
-    #[sqlx(rename = "platinum1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum1_division1"))]
     PlatinumIDivision1,
-    #[sqlx(rename = "platinum1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum1_division2"))]
     PlatinumIDivision2,
-    #[sqlx(rename = "platinum1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum1_division3"))]
     PlatinumIDivision3,
-    #[sqlx(rename = "platinum1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum1_division4"))]
     PlatinumIDivision4,
     // Platinum II
-    #[sqlx(rename = "platinum2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum2_division1"))]
     PlatinumIIDivision1,
-    #[sqlx(rename = "platinum2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum2_division2"))]
     PlatinumIIDivision2,
-    #[sqlx(rename = "platinum2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum2_division3"))]
     PlatinumIIDivision3,
-    #[sqlx(rename = "platinum2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum2_division4"))]
     PlatinumIIDivision4,
     // Platinum III
-    #[sqlx(rename = "platinum3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum3_division1"))]
     PlatinumIIIDivision1,
-    #[sqlx(rename = "platinum3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum3_division2"))]
     PlatinumIIIDivision2,
-    #[sqlx(rename = "platinum3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum3_division3"))]
     PlatinumIIIDivision3,
-    #[sqlx(rename = "platinum3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "platinum3_division4"))]
     PlatinumIIIDivision4,
     // Diamond I
-    #[sqlx(rename = "diamond1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond1_division1"))]
     DiamondIDivision1,
-    #[sqlx(rename = "diamond1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond1_division2"))]
     DiamondIDivision2,
-    #[sqlx(rename = "diamond1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond1_division3"))]
     DiamondIDivision3,
-    #[sqlx(rename = "diamond1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond1_division4"))]
     DiamondIDivision4,
     // Diamond II
-    #[sqlx(rename = "diamond2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond2_division1"))]
     DiamondIIDivision1,
-    #[sqlx(rename = "diamond2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond2_division2"))]
     DiamondIIDivision2,
-    #[sqlx(rename = "diamond2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond2_division3"))]
     DiamondIIDivision3,
-    #[sqlx(rename = "diamond2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond2_division4"))]
     DiamondIIDivision4,
     // Diamond III
-    #[sqlx(rename = "diamond3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond3_division1"))]
     DiamondIIIDivision1,
-    #[sqlx(rename = "diamond3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond3_division2"))]
     DiamondIIIDivision2,
-    #[sqlx(rename = "diamond3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond3_division3"))]
     DiamondIIIDivision3,
-    #[sqlx(rename = "diamond3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "diamond3_division4"))]
     DiamondIIIDivision4,
     // Champion I
-    #[sqlx(rename = "champion1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion1_division1"))]
     ChampionIDivision1,
-    #[sqlx(rename = "champion1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion1_division2"))]
     ChampionIDivision2,
-    #[sqlx(rename = "champion1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion1_division3"))]
     ChampionIDivision3,
-    #[sqlx(rename = "champion1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion1_division4"))]
     ChampionIDivision4,
     // Champion II
-    #[sqlx(rename = "champion2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion2_division1"))]
     ChampionIIDivision1,
-    #[sqlx(rename = "champion2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion2_division2"))]
     ChampionIIDivision2,
-    #[sqlx(rename = "champion2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion2_division3"))]
     ChampionIIDivision3,
-    #[sqlx(rename = "champion2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion2_division4"))]
     ChampionIIDivision4,
     // Champion III
-    #[sqlx(rename = "champion3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion3_division1"))]
     ChampionIIIDivision1,
-    #[sqlx(rename = "champion3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion3_division2"))]
     ChampionIIIDivision2,
-    #[sqlx(rename = "champion3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion3_division3"))]
     ChampionIIIDivision3,
-    #[sqlx(rename = "champion3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "champion3_division4"))]
     ChampionIIIDivision4,
     // Grand Champion I
-    #[sqlx(rename = "grand_champion1_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion1_division1"))]
     GrandChampionIDivision1,
-    #[sqlx(rename = "grand_champion1_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion1_division2"))]
     GrandChampionIDivision2,
-    #[sqlx(rename = "grand_champion1_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion1_division3"))]
     GrandChampionIDivision3,
-    #[sqlx(rename = "grand_champion1_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion1_division4"))]
     GrandChampionIDivision4,
     // Grand Champion II
-    #[sqlx(rename = "grand_champion2_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion2_division1"))]
     GrandChampionIIDivision1,
-    #[sqlx(rename = "grand_champion2_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion2_division2"))]
     GrandChampionIIDivision2,
-    #[sqlx(rename = "grand_champion2_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion2_division3"))]
     GrandChampionIIDivision3,
-    #[sqlx(rename = "grand_champion2_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion2_division4"))]
     GrandChampionIIDivision4,
     // Grand Champion III
-    #[sqlx(rename = "grand_champion3_division1")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion3_division1"))]
     GrandChampionIIIDivision1,
-    #[sqlx(rename = "grand_champion3_division2")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion3_division2"))]
     GrandChampionIIIDivision2,
-    #[sqlx(rename = "grand_champion3_division3")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion3_division3"))]
     GrandChampionIIIDivision3,
-    #[sqlx(rename = "grand_champion3_division4")]
+    #[cfg_attr(feature = "database", sqlx(rename = "grand_champion3_division4"))]
     GrandChampionIIIDivision4,
     // Supersonic Legend
-    #[sqlx(rename = "supersonic_legend")]
+    #[cfg_attr(feature = "database", sqlx(rename = "supersonic_legend"))]
     SupersonicLegend,
 }
 
@@ -1051,10 +1042,12 @@ fn parse_short_form(s: &str) -> Option<RankDivision> {
 /// Rank enum for Rocket League competitive ranks.
 ///
 /// These correspond to rank filter values used by external replay APIs.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, strum::EnumIter, strum::EnumCount,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter, strum::EnumCount)]
+#[cfg_attr(feature = "database", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "database",
+    sqlx(type_name = "rank", rename_all = "snake_case")
 )]
-#[sqlx(type_name = "rank", rename_all = "snake_case")]
 pub enum Rank {
     Unranked,
     Bronze1,

@@ -1,0 +1,30 @@
+[package]
+name = "web_predictor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom.workspace = true
+ml_model.workspace = true
+replay_parser.workspace = true
+replay_structs.workspace = true
+feature_extractor.workspace = true
+
+anyhow.workspace = true
+burn.workspace = true
+dioxus = { workspace = true, features = ["web"] }
+serde_json.workspace = true
+tracing.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = [
+    "Blob",
+    "File",
+    "FileList",
+    "HtmlInputElement",
+] }

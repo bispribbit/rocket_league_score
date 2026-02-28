@@ -1,0 +1,9 @@
+[application]
+name = "web_predictor"
+default_platform = "web"
+
+[web.app]
+title = "RL Replay MMR Predictor"
+
+[web.watcher]
+watch_path = ["src", "assets"]

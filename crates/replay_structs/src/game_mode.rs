@@ -1,8 +1,12 @@
 use core::str::FromStr;
 
 /// Game mode enum matching the `PostgreSQL` type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
-#[sqlx(type_name = "game_mode", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "database", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "database",
+    sqlx(type_name = "game_mode", rename_all = "snake_case")
+)]
 pub enum GameMode {
     UnrankedDuels,
     UnrankedDoubles,

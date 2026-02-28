@@ -17,7 +17,7 @@ bytes.workspace = true
 chrono.workspace = true
 config.workspace = true
 database.workspace = true
-replay_structs.workspace = true
+replay_structs = { workspace = true, features = ["database"] }
 
 # External dependencies
 anyhow.workspace = true

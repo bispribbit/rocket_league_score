@@ -5,7 +5,8 @@ use crate::rank::RankDivision;
 use crate::{GameMode, Rank};
 
 /// Player data for a specific replay.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "database", derive(sqlx::FromRow))]
 pub struct ReplayPlayer {
     pub id: i32,
     pub replay_id: Uuid,
@@ -16,8 +17,12 @@ pub struct ReplayPlayer {
 }
 
 /// Download status for tracking replay file downloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
-#[sqlx(type_name = "download_status", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "database", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "database",
+    sqlx(type_name = "download_status", rename_all = "snake_case")
+)]
 pub enum DownloadStatus {
     NotDownloaded,
     InProgress,
@@ -27,8 +32,12 @@ pub enum DownloadStatus {
 
 /// Dataset split assignment for machine learning.
 /// Used to ensure training and evaluation sets remain separate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
-#[sqlx(type_name = "dataset_split", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "database", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "database",
+    sqlx(type_name = "dataset_split", rename_all = "snake_case")
+)]
 pub enum DatasetSplit {
     /// Replay is used for training the model.
     Training,
@@ -48,7 +57,8 @@ impl core::fmt::Display for DownloadStatus {
 }
 
 /// Replay metadata and download tracking.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "database", derive(sqlx::FromRow))]
 pub struct Replay {
     pub id: Uuid,
     pub game_mode: GameMode,

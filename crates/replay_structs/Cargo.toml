@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+database = ["dep:sqlx", "dep:object_store"]
+
 [lints]
 workspace = true
 
@@ -11,9 +15,9 @@ workspace = true
 anyhow.workspace = true
 boxcars.workspace = true
 chrono.workspace = true
-object_store.workspace = true
+object_store = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 strum.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, optional = true }
 uuid.workspace = true
