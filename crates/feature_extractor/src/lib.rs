@@ -8,6 +8,8 @@
 //! Each player gets their own feature vector centered on their perspective,
 //! enabling the model to learn individual skill patterns.
 
+use std::collections::{BTreeSet, HashMap};
+
 use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
 
 /// Feature count for player-centric representation.
@@ -79,22 +81,94 @@ impl Default for PlayerCentricFrameFeatures {
     }
 }
 
+/// Canonical ordered roster for a 3v3 match.
+///
+/// Slots 0–2 hold the blue team sorted alphabetically by player name;
+/// slots 3–5 hold the orange team sorted alphabetically by player name.
+///
+/// This ordering is identical to the one produced by `build_target_mmr_array`,
+/// so slot `i` in the feature vector always maps to slot `i` in the target
+/// MMR array.  The roster is built **once per game** and then used for every
+/// frame, which means the slot assignment stays stable even after a player
+/// disconnects mid-match: the disconnected slot emits all-zero features while
+/// all remaining slots keep their canonical positions.
+#[derive(Debug, Clone)]
+pub struct PlayerRoster {
+    /// Six canonical player names: [blue_0, blue_1, blue_2, orange_0, orange_1, orange_2].
+    pub names: [String; TOTAL_PLAYERS],
+}
+
+impl PlayerRoster {
+    /// Builds the roster from player ratings (training path).
+    ///
+    /// The sort order mirrors `build_target_mmr_array` so that every feature
+    /// slot corresponds to the correct target MMR entry.
+    #[must_use]
+    pub fn from_player_ratings(player_ratings: &[PlayerRating]) -> Self {
+        let mut blue: Vec<&PlayerRating> = player_ratings.iter().filter(|r| r.team == 0).collect();
+        let mut orange: Vec<&PlayerRating> =
+            player_ratings.iter().filter(|r| r.team == 1).collect();
+
+        blue.sort_by(|a, b| a.player_name.cmp(&b.player_name));
+        orange.sort_by(|a, b| a.player_name.cmp(&b.player_name));
+
+        let names = core::array::from_fn(|i| {
+            if i < PLAYERS_PER_TEAM {
+                blue.get(i)
+                    .map_or_else(String::new, |r| r.player_name.clone())
+            } else {
+                orange
+                    .get(i - PLAYERS_PER_TEAM)
+                    .map_or_else(String::new, |r| r.player_name.clone())
+            }
+        });
+
+        Self { names }
+    }
+
+    /// Builds the roster by scanning all frames in a replay (inference path).
+    ///
+    /// Collects every unique player name per team observed across all frames,
+    /// then sorts them alphabetically — reproducing the same canonical order as
+    /// the training path without requiring external metadata.
+    #[must_use]
+    pub fn from_frames(frames: &[GameFrame]) -> Self {
+        let mut blue: BTreeSet<String> = BTreeSet::new();
+        let mut orange: BTreeSet<String> = BTreeSet::new();
+
+        for frame in frames {
+            for player in &frame.players {
+                let name = (*player.name).clone();
+                match player.team {
+                    Team::Blue => {
+                        blue.insert(name);
+                    }
+                    Team::Orange => {
+                        orange.insert(name);
+                    }
+                }
+            }
+        }
+
+        let names = core::array::from_fn(|i| {
+            if i < PLAYERS_PER_TEAM {
+                blue.iter().nth(i).cloned().unwrap_or_default()
+            } else {
+                orange
+                    .iter()
+                    .nth(i - PLAYERS_PER_TEAM)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        });
+
+        Self { names }
+    }
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Sorts players into blue (team 0) and orange (team 1) teams.
-/// Pads with default players if fewer than 3 per team.
-fn sort_players_by_team(players: &[PlayerState]) -> (Vec<&PlayerState>, Vec<&PlayerState>) {
-    let mut blue: Vec<&PlayerState> = players.iter().filter(|p| p.team == Team::Blue).collect();
-    let mut orange: Vec<&PlayerState> = players.iter().filter(|p| p.team == Team::Orange).collect();
-
-    // Sort by actor_id for consistent ordering
-    blue.sort_by_key(|p| p.actor_id);
-    orange.sort_by_key(|p| p.actor_id);
-
-    (blue, orange)
-}
 
 /// Normalizes X position to [-1, 1].
 fn normalize_x(x: f32) -> f32 {
@@ -203,67 +277,67 @@ fn build_target_mmr_array(player_ratings: &[PlayerRating]) -> [f32; TOTAL_PLAYER
 // Player-Centric Feature Extraction
 // ============================================================================
 
-/// Extracts player-centric features for a specific player from a game frame.
+/// Extracts player-centric features for one canonical player slot from a frame.
 ///
-/// This creates a feature vector centered on one player's perspective, including:
-/// - Ball state
-/// - This player's full state
-/// - Teammates' full states (with boost)
-/// - Opponents' states (WITHOUT boost - information leakage)
-/// - Relationships (distances)
-/// - Game context
+/// Uses a pre-built name → state map so that each slot is looked up by the
+/// player's canonical name rather than by their current position in the frame's
+/// player list.  This makes slot assignments stable across car respawns and
+/// disconnects: if the player named by `roster.names[player_index]` is absent
+/// from this frame, an all-zero feature vector is returned for that slot while
+/// all other slots keep their canonical positions.
 ///
 /// # Arguments
 ///
-/// * `frame` - The game frame
-/// * `player_index` - Which player (0-5: 0-2 blue, 3-5 orange)
-///
-/// # Returns
-///
-/// Features centered on this player's perspective
-pub fn extract_player_centric_frame_features(
+/// * `frame` - The game frame to extract features from.
+/// * `player_index` - Canonical slot (0-2 blue, 3-5 orange).
+/// * `roster` - The fixed canonical name list for this match.
+/// * `player_map` - Pre-built `name → &PlayerState` map for the current frame.
+pub(crate) fn extract_player_centric_frame_features(
     frame: &GameFrame,
     player_index: usize,
+    roster: &PlayerRoster,
+    player_map: &HashMap<&str, &PlayerState>,
 ) -> PlayerCentricFrameFeatures {
     let mut features = PlayerCentricFrameFeatures {
         features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
         time: frame.time,
     };
 
-    // Get sorted players
-    let (blue_players, orange_players) = sort_players_by_team(&frame.players);
-
-    // Determine which player we're focusing on
-    let (this_player, teammates, opponents) = if player_index < 3 {
-        // Blue team player
-        if player_index >= blue_players.len() {
-            // Player doesn't exist, return zeros
-            return features;
-        }
-        let this = blue_players[player_index];
-        let teammates: Vec<&PlayerState> = blue_players
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != player_index)
-            .map(|(_, p)| *p)
-            .collect();
-        (this, teammates, orange_players)
-    } else {
-        // Orange team player
-        let orange_idx = player_index - 3;
-        if orange_idx >= orange_players.len() {
-            // Player doesn't exist, return zeros
-            return features;
-        }
-        let this = orange_players[orange_idx];
-        let teammates: Vec<&PlayerState> = orange_players
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != orange_idx)
-            .map(|(_, p)| *p)
-            .collect();
-        (this, teammates, blue_players)
+    let canonical_name = match roster.names.get(player_index) {
+        Some(name) => name.as_str(),
+        None => return features,
     };
+
+    let Some(&this_player) = player_map.get(canonical_name) else {
+        return features;
+    };
+
+    let (team_start, opp_start) = if player_index < PLAYERS_PER_TEAM {
+        (0, PLAYERS_PER_TEAM)
+    } else {
+        (PLAYERS_PER_TEAM, 0)
+    };
+
+    // Canonical teammate slots (excluding self), each may be None if disconnected.
+    let teammates: Vec<Option<&PlayerState>> = (team_start..team_start + PLAYERS_PER_TEAM)
+        .filter(|&i| i != player_index)
+        .map(|i| {
+            roster
+                .names
+                .get(i)
+                .and_then(|name| player_map.get(name.as_str()).copied())
+        })
+        .collect();
+
+    // Canonical opponent slots in alphabetical order, each may be None if disconnected.
+    let opponents: Vec<Option<&PlayerState>> = (opp_start..opp_start + PLAYERS_PER_TEAM)
+        .map(|i| {
+            roster
+                .names
+                .get(i)
+                .and_then(|name| player_map.get(name.as_str()).copied())
+        })
+        .collect();
 
     let mut idx = 0;
 
@@ -286,69 +360,60 @@ pub fn extract_player_centric_frame_features(
     if !this_player.actor_state.is_demolished {
         let dist_to_ball = distance(&this_player.actor_state.position, &frame.ball.position);
         features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-
         let forward = quaternion_forward(&this_player.actor_state.rotation);
         let to_ball = direction(&this_player.actor_state.position, &frame.ball.position);
         features.features[idx + 1] = dot(&forward, &to_ball);
     }
     idx += 2;
 
-    // 4. Teammate 1 state (13 features)
-    if let Some(&teammate1) = teammates.first() {
-        write_player_state_to_slice(&mut features.features[idx..idx + 13], teammate1);
+    // 4. Teammate 1 state (13 features) — zeros if absent
+    if let Some(t1) = teammates.first().and_then(|t| *t) {
+        write_player_state_to_slice(&mut features.features[idx..idx + 13], t1);
     }
     idx += 13;
 
-    // 5. Teammate 2 state (13 features)
-    if let Some(&teammate2) = teammates.get(1) {
-        write_player_state_to_slice(&mut features.features[idx..idx + 13], teammate2);
+    // 5. Teammate 2 state (13 features) — zeros if absent
+    if let Some(t2) = teammates.get(1).and_then(|t| *t) {
+        write_player_state_to_slice(&mut features.features[idx..idx + 13], t2);
     }
     idx += 13;
 
     // 6. Teammate relationships (4 features)
-    if let Some(&teammate1) = teammates.first()
-        && !teammate1.actor_state.is_demolished
+    if let Some(t1) = teammates.first().and_then(|t| *t)
+        && !t1.actor_state.is_demolished
     {
-        let dist_to_ball = distance(&teammate1.actor_state.position, &frame.ball.position);
+        let dist_to_ball = distance(&t1.actor_state.position, &frame.ball.position);
         features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-        let dist_to_this = distance(
-            &teammate1.actor_state.position,
-            &this_player.actor_state.position,
-        );
+        let dist_to_this = distance(&t1.actor_state.position, &this_player.actor_state.position);
         features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
     }
-    if let Some(&teammate2) = teammates.get(1)
-        && !teammate2.actor_state.is_demolished
+    if let Some(t2) = teammates.get(1).and_then(|t| *t)
+        && !t2.actor_state.is_demolished
     {
-        let dist_to_ball = distance(&teammate2.actor_state.position, &frame.ball.position);
+        let dist_to_ball = distance(&t2.actor_state.position, &frame.ball.position);
         features.features[idx + 2] = (dist_to_ball / field::DIAGONAL).min(1.0);
-        let dist_to_this = distance(
-            &teammate2.actor_state.position,
-            &this_player.actor_state.position,
-        );
+        let dist_to_this = distance(&t2.actor_state.position, &this_player.actor_state.position);
         features.features[idx + 3] = (dist_to_this / field::DIAGONAL).min(1.0);
     }
     idx += 4;
 
-    // 7-9. Opponent states (12 features each, NO BOOST)
+    // 7–9. Opponent states (12 features each, NO BOOST)
     for i in 0..3 {
-        if let Some(&opponent) = opponents.get(i) {
-            write_opponent_state_to_slice(&mut features.features[idx..idx + 12], opponent);
+        if let Some(opp) = opponents.get(i).and_then(|t| *t) {
+            write_opponent_state_to_slice(&mut features.features[idx..idx + 12], opp);
         }
         idx += 12;
     }
 
     // 10. Opponent relationships (6 features)
     for i in 0..3 {
-        if let Some(&opponent) = opponents.get(i)
-            && !opponent.actor_state.is_demolished
+        if let Some(opp) = opponents.get(i).and_then(|t| *t)
+            && !opp.actor_state.is_demolished
         {
-            let dist_to_ball = distance(&opponent.actor_state.position, &frame.ball.position);
+            let dist_to_ball = distance(&opp.actor_state.position, &frame.ball.position);
             features.features[idx] = (dist_to_ball / field::DIAGONAL).min(1.0);
-            let dist_to_this = distance(
-                &opponent.actor_state.position,
-                &this_player.actor_state.position,
-            );
+            let dist_to_this =
+                distance(&opp.actor_state.position, &this_player.actor_state.position);
             features.features[idx + 1] = (dist_to_this / field::DIAGONAL).min(1.0);
         }
         idx += 2;
@@ -438,20 +503,19 @@ fn write_opponent_state_to_slice(slice: &mut [f32], player: &PlayerState) {
     }
 }
 
-/// Extracts player-centric features for ALL 6 players from a game frame.
+/// Extracts player-centric features for all 6 canonical player slots from a frame.
 ///
-/// Returns array of 6 feature vectors, one per player.
+/// Builds the name → state map once, then extracts each slot using roster-based
+/// lookup.  Players absent from the frame (disconnected) produce all-zero feature
+/// vectors; all other slots keep their canonical positions unchanged.
 pub fn extract_all_player_centric_features(
     frame: &GameFrame,
+    roster: &PlayerRoster,
 ) -> [PlayerCentricFrameFeatures; TOTAL_PLAYERS] {
-    [
-        extract_player_centric_frame_features(frame, 0),
-        extract_player_centric_frame_features(frame, 1),
-        extract_player_centric_frame_features(frame, 2),
-        extract_player_centric_frame_features(frame, 3),
-        extract_player_centric_frame_features(frame, 4),
-        extract_player_centric_frame_features(frame, 5),
-    ]
+    let player_map: HashMap<&str, &PlayerState> =
+        frame.players.iter().map(|p| (&**p.name, p)).collect();
+
+    core::array::from_fn(|i| extract_player_centric_frame_features(frame, i, roster, &player_map))
 }
 
 /// A sequence sample with player-centric features.
@@ -488,11 +552,15 @@ pub fn extract_player_centric_game_sequence(
 ) -> PlayerCentricGameSequence {
     let target_mmr = build_target_mmr_array(player_ratings);
 
+    // Build the canonical roster once from ratings; the same roster is reused
+    // for every frame so that slot assignments never shift mid-game.
+    let roster = PlayerRoster::from_player_ratings(player_ratings);
+
     // Extract features for subsampled frames (1 out of every FRAME_SUBSAMPLE_RATE), all players
     let player_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
         .iter()
         .step_by(FRAME_SUBSAMPLE_RATE)
-        .map(extract_all_player_centric_features)
+        .map(|frame| extract_all_player_centric_features(frame, &roster))
         .collect();
 
     PlayerCentricGameSequence {
@@ -684,8 +752,9 @@ mod tests {
             ],
         };
 
-        // Extract player-centric features for all players
-        let all_features = extract_all_player_centric_features(&frame);
+        // Build roster from the single test frame, then extract features.
+        let roster = PlayerRoster::from_frames(std::slice::from_ref(&frame));
+        let all_features = extract_all_player_centric_features(&frame, &roster);
 
         // Verify we get 6 feature vectors
         assert_eq!(all_features.len(), 6);

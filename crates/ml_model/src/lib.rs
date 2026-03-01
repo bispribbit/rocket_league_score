@@ -27,23 +27,33 @@ use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, R
 use burn::prelude::*;
 use burn::record::FullPrecisionSettings;
 use feature_extractor::{
-    PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
+    PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, PlayerRoster, TOTAL_PLAYERS,
     extract_all_player_centric_features,
 };
+
+/// Scale factor to normalise MMR values to [0, 1] range.
+/// Raw MMR range is approximately 0 – 2000, so dividing by this constant
+/// produces normalised values suitable for the model output layer.
+pub const MMR_SCALE: f32 = 2000.0;
 /// Configuration for the sequence model.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
     /// Hidden size for the first LSTM layer.
-    #[config(default = 128)]
+    #[config(default = 256)]
     pub lstm_hidden_1: usize,
     /// Hidden size for the second LSTM layer.
-    #[config(default = 64)]
+    #[config(default = 128)]
     pub lstm_hidden_2: usize,
-    /// Hidden size for the feedforward layer after LSTM.
-    #[config(default = 32)]
+    /// Hidden size for the per-player feedforward layer.
+    /// Input to this layer is `lstm_hidden_2 * 2` (last hidden + mean pooling concatenated).
+    #[config(default = 128)]
     pub feedforward_hidden: usize,
+    /// Hidden size for the cross-player interaction MLP.
+    /// This layer sees all 6 players at once and produces the final 6 MMR predictions.
+    #[config(default = 128)]
+    pub cross_player_hidden: usize,
     /// Dropout rate for regularization.
-    #[config(default = 0.5)]
+    #[config(default = 0.2)]
     pub dropout: f64,
 }
 
@@ -71,11 +81,17 @@ pub struct TrainingConfig {
     pub sequence_length: usize,
 }
 
-/// LSTM-based sequence model for player skill prediction.
+/// LSTM-based sequence model with temporal pooling and cross-player interaction.
 ///
-/// This model processes sequences of game frames to predict player MMR.
-/// It uses stacked LSTM layers to capture temporal patterns in gameplay,
-/// then projects the final hidden state to per-player MMR predictions.
+/// Architecture:
+/// 1. Per-player LSTM stack processes each player's sequence independently.
+/// 2. Temporal pooling: concatenates last hidden state + mean over sequence.
+/// 3. Per-player feedforward reduces the pooled representation.
+/// 4. Cross-player MLP: sees all 6 players at once, enabling the model to
+///    learn relative skill differences within a match.
+///
+/// The final output is `[batch_size, 6]` MMR predictions in MMR-normalised
+/// space (0–1, where 1 = 2000 MMR).  De-normalise by multiplying by `MMR_SCALE`.
 #[derive(Module, Debug)]
 pub struct SequenceModel<B: Backend> {
     /// First LSTM layer processes raw frame features.
@@ -84,49 +100,53 @@ pub struct SequenceModel<B: Backend> {
     lstm2: Lstm<B>,
     /// Dropout for regularization.
     dropout: Dropout,
-    /// First feedforward layer after LSTM.
-    linear1: Linear<B>,
-    /// Output layer predicting MMR for each player.
-    linear_out: Linear<B>,
+    /// Per-player feedforward: maps temporal pooling output to player representation.
+    /// Input size: `lstm2_hidden * 2` (last + mean concatenated).
+    player_fc1: Linear<B>,
+    /// Cross-player MLP layer 1: sees all 6 players simultaneously.
+    /// Input size: `TOTAL_PLAYERS * feedforward_hidden`.
+    cross_fc1: Linear<B>,
+    /// Cross-player MLP layer 2: produces final per-player MMR predictions.
+    cross_fc2: Linear<B>,
     /// `ReLU` activation.
     activation: Relu,
-    /// Hidden size of first LSTM (needed for inference).
-    lstm1_hidden: usize,
-    /// Hidden size of second LSTM (needed for inference).
+    /// Hidden size of second LSTM (used for dimension tracking in forward).
     lstm2_hidden: usize,
+    /// Per-player feedforward output size.
+    ff_hidden: usize,
 }
 
 impl<B: Backend> SequenceModel<B> {
     /// Creates a new sequence model with the given configuration.
-    ///
-    /// This model uses player-centric features and predicts one MMR value per forward pass.
-    /// For batch processing of all 6 players, reshape input to [batch*6, seq, features].
     pub fn new(device: &B::Device, config: &ModelConfig) -> Self {
-        // LSTM layers - use player-centric feature count
         let lstm1 =
             LstmConfig::new(PLAYER_CENTRIC_FEATURE_COUNT, config.lstm_hidden_1, true).init(device);
         let lstm2 = LstmConfig::new(config.lstm_hidden_1, config.lstm_hidden_2, true).init(device);
 
-        // Dropout
         let dropout = DropoutConfig::new(config.dropout).init();
 
-        // Feedforward layers
-        let linear1 =
-            LinearConfig::new(config.lstm_hidden_2, config.feedforward_hidden).init(device);
-        // Output layer predicts 1 value (will be reshaped to [batch, 6] later)
-        let linear_out = LinearConfig::new(config.feedforward_hidden, 1).init(device);
+        // Temporal pooling concatenates last hidden state + mean → 2 * lstm2_hidden input.
+        let player_fc1 =
+            LinearConfig::new(config.lstm_hidden_2 * 2, config.feedforward_hidden).init(device);
 
-        let activation = Relu::new();
+        // Cross-player layers: input is all 6 players' representations flattened.
+        let cross_fc1 = LinearConfig::new(
+            TOTAL_PLAYERS * config.feedforward_hidden,
+            config.cross_player_hidden,
+        )
+        .init(device);
+        let cross_fc2 = LinearConfig::new(config.cross_player_hidden, TOTAL_PLAYERS).init(device);
 
         Self {
             lstm1,
             lstm2,
             dropout,
-            linear1,
-            linear_out,
-            activation,
-            lstm1_hidden: config.lstm_hidden_1,
+            player_fc1,
+            cross_fc1,
+            cross_fc2,
+            activation: Relu::new(),
             lstm2_hidden: config.lstm_hidden_2,
+            ff_hidden: config.feedforward_hidden,
         }
     }
 
@@ -134,59 +154,65 @@ impl<B: Backend> SequenceModel<B> {
     ///
     /// # Arguments
     ///
-    /// * `input` - Tensor of shape `[batch_size * 6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
-    ///   Each of the 6 players has their own sequence of player-centric features.
+    /// * `input` - Tensor of shape `[batch_size * 6, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`.
+    ///   Players from the same game must be contiguous in the batch dimension
+    ///   (i.e. indices `[game*6 .. game*6+6]` belong to the same game).
     ///
     /// # Returns
     ///
-    /// Tensor of shape `[batch_size * 6, 1]` containing predicted MMR.
-    /// Reshape to `[batch_size, 6]` after calling this function.
+    /// Tensor of shape `[batch_size, 6]` with one normalised MMR prediction per player.
+    /// Multiply by `MMR_SCALE` to convert back to raw MMR units.
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
-        // Input: [batch*6, seq, player_features]
-        // LSTM1: [batch*6, seq, features] -> [batch*6, seq, lstm1_hidden]
-        let (lstm1_out, _state1) = self.lstm1.forward(input, None);
+        let [batch_times_players, seq_len, _] = input.dims();
+        let batch_size = batch_times_players / TOTAL_PLAYERS;
 
-        // LSTM2: [batch*6, seq, lstm1_hidden] -> [batch*6, seq, lstm2_hidden]
-        let (lstm2_out, _state2) = self.lstm2.forward(lstm1_out, None);
+        // LSTM stack: each player's sequence is processed independently.
+        // [batch*6, seq, features] → [batch*6, seq, lstm1_hidden]
+        let (lstm1_out, _) = self.lstm1.forward(input, None);
+        // [batch*6, seq, lstm1_hidden] → [batch*6, seq, lstm2_hidden]
+        let (lstm2_out, _) = self.lstm2.forward(lstm1_out, None);
 
-        // Take the last timestep's hidden state: [batch*6, lstm2_hidden]
-        let [batch_times_players, seq_len, hidden_size] = lstm2_out.dims();
+        // Temporal pooling: concat last timestep + mean over the whole sequence.
+        // Both carry different signal: last captures the final game state,
+        // mean captures the average behaviour across the segment.
         let last_hidden = lstm2_out
+            .clone()
             .narrow(1, seq_len - 1, 1)
-            .reshape([batch_times_players, hidden_size]);
+            .reshape([batch_times_players, self.lstm2_hidden]);
+        let mean_hidden = lstm2_out
+            .mean_dim(1)
+            .reshape([batch_times_players, self.lstm2_hidden]);
+        // [batch*6, lstm2_hidden*2]
+        let pooled = Tensor::cat(vec![last_hidden, mean_hidden], 1);
 
-        // Dropout for regularization
-        let x = self.dropout.forward(last_hidden);
-
-        // Feedforward layers
-        let x = self.linear1.forward(x);
+        // Per-player feedforward: compress pooled representation.
+        let x = self.dropout.forward(pooled);
+        let x = self.player_fc1.forward(x);
         let x = self.activation.forward(x);
         let x = self.dropout.forward(x);
+        // x: [batch*6, ff_hidden]
 
-        // Output: [batch*6, 1]
-        self.linear_out.forward(x)
+        // Cross-player interaction: reshape so that all 6 players from the same
+        // game are in the same row.  This allows the MLP to learn relative skill
+        // differences within a match (e.g., a smurf stands out even in a high-MMR
+        // lobby because their stats contrast with their team-mates).
+        let x = x.reshape([batch_size, TOTAL_PLAYERS * self.ff_hidden]);
+        // [batch, 6*ff_hidden] → [batch, cross_hidden]
+        let x = self.cross_fc1.forward(x);
+        let x = self.activation.forward(x);
+        // [batch, cross_hidden] → [batch, 6]
+        self.cross_fc2.forward(x)
     }
 
-    /// Forward pass for inference (without dropout).
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - Tensor of shape `[batch_size * 6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
-    ///
-    /// # Returns
-    ///
-    /// Tensor of shape `[batch_size * 6, 1]` containing predicted MMR.
-    /// Reshape to `[batch_size, 6]` after calling this function.
+    /// Forward pass for inference (dropout disabled in eval mode).
     pub fn forward_inference(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
-        // Same as forward but dropout is automatically disabled in eval mode
-        // For Burn, dropout is controlled by the tensor's require_grad flag
         self.forward(input)
     }
 
     /// Returns the device this model is on.
     #[must_use]
     pub fn device(&self) -> B::Device {
-        self.linear1.weight.device()
+        self.player_fc1.weight.device()
     }
 }
 
@@ -292,10 +318,14 @@ pub struct ExtractedSegmentFeatures {
 
 impl ExtractedSegmentFeatures {
     /// Builds features from game frames (call once, then use for all segments).
+    ///
+    /// The roster is derived from all frames so that canonical slot assignments
+    /// remain stable even when a player disconnects mid-game.
     pub fn from_frames(frames: &[replay_structs::GameFrame]) -> Self {
+        let roster = PlayerRoster::from_frames(frames);
         let player_centric_frames = frames
             .iter()
-            .map(extract_all_player_centric_features)
+            .map(|frame| extract_all_player_centric_features(frame, &roster))
             .collect();
         Self {
             player_centric_frames,
@@ -343,13 +373,15 @@ impl ExtractedSegmentFeatures {
             PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
+        // output: [1, 6] (batch_size=1, 6 players) — values are normalised [0,1].
+        // Flatten to [v0..v5] and de-normalise to MMR units.
         let output = model.forward_inference(input);
         let output_data = output.into_data();
         let values = output_data.to_vec::<f32>().ok()?;
         let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
         for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
             if let Some(pred) = player_predictions.get_mut(i) {
-                *pred = *val;
+                *pred = val * MMR_SCALE;
             }
         }
         Some(SegmentPrediction {
@@ -386,10 +418,13 @@ pub fn predict_player_centric_per_segment<B: Backend>(
         return vec![];
     }
 
-    // Extract player-centric features for all frames
+    // Build the canonical roster once from all frames, then extract features.
+    // Using a single roster for the whole game prevents slot shifting when a
+    // player disconnects mid-match.
+    let roster = PlayerRoster::from_frames(frames);
     let player_centric_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
         .iter()
-        .map(extract_all_player_centric_features)
+        .map(|frame| extract_all_player_centric_features(frame, &roster))
         .collect();
 
     let num_segments = if player_centric_frames.len() >= segment_length {
@@ -423,7 +458,8 @@ pub fn predict_player_centric_per_segment<B: Backend>(
             PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
-        // Forward pass - output is [6, 1]
+        // Forward pass - output is [1, 6] (batch_size=1, 6 players).
+        // Values are normalised [0,1]; de-normalise to MMR units.
         let output = model.forward_inference(input);
 
         // Extract predictions
@@ -432,7 +468,7 @@ pub fn predict_player_centric_per_segment<B: Backend>(
             let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
             for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
                 if let Some(pred) = player_predictions.get_mut(i) {
-                    *pred = *val;
+                    *pred = val * MMR_SCALE;
                 }
             }
             results.push(SegmentPrediction {
@@ -590,7 +626,7 @@ mod tests {
         let config = ModelConfig::new();
         let model: SequenceModel<TestBackend> = create_model(&device, &config);
 
-        // Create a batch of 2 games × 6 players, each with 100 frames
+        // Create a batch of 2 games × 6 players, each with 100 frames.
         // Input shape: [batch*6, seq_len, player_features]
         let batch_size = 2;
         let seq_len = 100;
@@ -600,12 +636,8 @@ mod tests {
         );
         let output = model.forward(input);
 
-        // Output should be [batch*6, 1] = [12, 1]
-        assert_eq!(output.dims(), [batch_size * 6, 1]);
-
-        // After reshaping to [batch, 6], we'd have [2, 6]
-        let reshaped = output.reshape([batch_size, TOTAL_PLAYERS]);
-        assert_eq!(reshaped.dims(), [batch_size, TOTAL_PLAYERS]);
+        // New model outputs [batch_size, 6] directly (cross-player layer).
+        assert_eq!(output.dims(), [batch_size, TOTAL_PLAYERS]);
     }
 
     #[test]
@@ -666,8 +698,8 @@ mod tests {
 
         let output = model.forward_inference(input);
 
-        // Should get [6, 1] output
-        assert_eq!(output.dims(), [6, 1]);
+        // Input [6, seq, 95] → batch_size=1 → output [1, 6]
+        assert_eq!(output.dims(), [1, TOTAL_PLAYERS]);
 
         // Verify all predictions are finite
         let values = output.into_data().to_vec::<f32>().unwrap();

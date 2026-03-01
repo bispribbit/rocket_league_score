@@ -56,9 +56,13 @@ pub const fn compute_segment_count(total_frames: usize, segment_length: usize) -
     }
 }
 
+/// Cache format version. Bump this when the player ordering or feature layout changes
+/// to force automatic regeneration of all cached segments.
+const CACHE_VERSION: &str = "v3";
+
 /// Generates the directory path for a replay's segments.
 ///
-/// Format: `{base_path}/segments/{rank_category}/{rank}/{replay_id}/`
+/// Format: `{base_path}/segments/{CACHE_VERSION}/{rank_category}/{rank}/{replay_id}/`
 #[must_use]
 pub fn segment_directory(base_path: &Path, file_path: &str, replay_id: Uuid) -> PathBuf {
     // file_path is like "replays/ranked-standard/bronze-1/uuid.replay"
@@ -80,6 +84,7 @@ pub fn segment_directory(base_path: &Path, file_path: &str, replay_id: Uuid) -> 
 
     base_path
         .join("segments")
+        .join(CACHE_VERSION)
         .join(rank_path)
         .join(replay_id.to_string())
 }
@@ -313,8 +318,8 @@ pub fn list_segment_files(
 fn parse_frame_range(filename: &str) -> Option<(usize, usize)> {
     let parts: Vec<&str> = filename.split('-').collect();
     if parts.len() == 2 {
-        let start = parts[0].parse().ok()?;
-        let end = parts[1].parse().ok()?;
+        let start = parts.first()?.parse().ok()?;
+        let end = parts.get(1)?.parse().ok()?;
         Some((start, end))
     } else {
         None
@@ -343,7 +348,8 @@ fn bytes_to_f32_vec(bytes: Vec<u8>) -> Vec<f32> {
             let f32_count = bytes.len() / 4;
             let mut result = Vec::with_capacity(f32_count);
             for chunk in bytes.chunks_exact(4) {
-                result.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                let bytes_array: [u8; 4] = chunk.try_into().expect("chunk has exactly 4 bytes");
+                result.push(f32::from_le_bytes(bytes_array));
             }
             result
         }

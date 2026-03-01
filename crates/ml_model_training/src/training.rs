@@ -3,12 +3,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
-use burn::nn::loss::MseLoss;
+use burn::nn::loss::HuberLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
-use ml_model::{SequenceModel, TrainingConfig};
+use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
 use tracing::info;
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
@@ -131,9 +132,19 @@ where
 
     let device = model.device();
 
-    // Create optimizer
-    let mut optimizer = AdamConfig::new().init();
-    let loss_fn = MseLoss::new();
+    // Adam with gradient clipping to stabilise LSTM training.
+    let mut optimizer = AdamConfig::new()
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+        .init();
+
+    // Huber loss with delta=0.1 (≈ 200 MMR after normalisation).
+    // Less sensitive to outlier replays than MSE while still being differentiable.
+    let huber_delta = 0.1_f32;
+    let loss_fn = HuberLoss {
+        delta: huber_delta,
+        lin_bias: huber_delta * huber_delta / 2.0,
+    };
+
     let mut checkpoint_paths = Vec::new();
 
     // Initialize training state
@@ -177,6 +188,9 @@ where
 
         let total_batches = prefetcher.total_batches();
 
+        // Cosine learning rate decay: starts at base_lr and decays to ~0 by the last epoch.
+        let lr = cosine_lr(config.learning_rate, epoch, start_epoch, config.epochs);
+
         // Accumulate loss on GPU to avoid sync on every batch
         let mut accumulated_loss: Option<Tensor<B, 1>> = None;
         let mut accumulated_count = 0;
@@ -206,13 +220,19 @@ where
 
             // Time for forward pass
             let t_forward_start = Instant::now();
-            let predictions_raw = model.forward(batch.inputs); // [batch*6, 1]
+            // New model returns [batch_size, 6] directly — no reshape needed.
+            let predictions = model.forward(batch.inputs);
 
-            // Reshape predictions: [batch*6, 1] → [batch, 6]
-            let batch_size = batch.targets.dims()[0];
-            let predictions = predictions_raw.reshape([batch_size, 6]);
+            // Normalise both predictions and targets to [0, 1] before loss computation.
+            // This stabilises gradients and makes the Huber delta scale-invariant.
+            let targets_norm = batch.targets.clone() / MMR_SCALE;
+            let predictions_norm = predictions / MMR_SCALE;
 
-            let loss = loss_fn.forward(predictions, batch.targets, burn::nn::loss::Reduction::Mean);
+            let loss = loss_fn.forward(
+                predictions_norm,
+                targets_norm,
+                burn::nn::loss::Reduction::Mean,
+            );
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
             // Accumulate loss on GPU (no sync)
@@ -243,9 +263,10 @@ where
 
                 // Log progress with timing breakdown
                 let avg_epoch_loss = epoch_loss_sum / epoch_loss_count as f64;
+                let approx_rmse = (avg_epoch_loss as f32).sqrt() * MMR_SCALE;
                 let n = batch_count as f64;
                 info!(
-                    "  Batch {batch_count}/{total_batches}, avg_loss={avg_epoch_loss:.6} | \
+                    "  Batch {batch_count}/{total_batches}, avg_loss={avg_epoch_loss:.6} (~{approx_rmse:.1} MMR RMSE) | \
                      prefetch={:.1}ms, to_gpu={:.1}ms, forward={:.1}ms, backward={:.1}ms, optim={:.1}ms (per batch avg)",
                     time_prefetch_wait_us as f64 / 1000.0 / n,
                     time_to_gpu_us as f64 / 1000.0 / n,
@@ -263,7 +284,7 @@ where
 
             // Time for optimizer step
             let t_optimizer_start = Instant::now();
-            *model = optimizer.step(config.learning_rate, model.clone(), grads);
+            *model = optimizer.step(lr, model.clone(), grads);
             time_optimizer_us += t_optimizer_start.elapsed().as_micros() as u64;
         }
 
@@ -288,10 +309,14 @@ where
         };
         state.current_epoch = epoch;
 
+        // Huber loss is on normalised [0,1] targets; multiply sqrt by MMR_SCALE for
+        // an approximate RMSE in MMR units (exact only in the quadratic regime).
+        let approx_train_rmse = state.current_train_loss.sqrt() * MMR_SCALE;
         info!(
-            "Epoch {epoch} completed in {:.2}s, avg_loss = {:.6}",
+            "Epoch {epoch} completed in {:.2}s, loss={:.6} (~{:.1} MMR RMSE), lr={lr:.2e}",
             epoch_duration.as_secs_f64(),
-            state.current_train_loss
+            state.current_train_loss,
+            approx_train_rmse,
         );
 
         // Validation
@@ -424,14 +449,13 @@ fn compute_validation_loss<B: Backend>(
         };
 
         let num_items = batch_indices.len();
-        let predictions_raw = model.forward(batch.inputs); // [batch*6, 1]
+        // New model returns [batch_size, 6] directly — no reshape needed.
+        let predictions = model.forward(batch.inputs);
 
-        // Reshape predictions: [batch*6, 1] → [batch, 6]
-        let batch_size = batch.targets.dims()[0];
-        let predictions = predictions_raw.reshape([batch_size, 6]);
-
-        // Compute MSE manually
-        let diff = predictions - batch.targets;
+        // Compute Huber loss on normalised targets (same as training).
+        let targets_norm = batch.targets.clone() / MMR_SCALE;
+        let predictions_norm = predictions / MMR_SCALE;
+        let diff = predictions_norm - targets_norm;
         let squared = diff.powf_scalar(2.0);
         let mse = squared.mean();
 
@@ -454,6 +478,18 @@ fn compute_validation_loss<B: Backend>(
     }
 }
 
+/// Computes a cosine-decayed learning rate.
+///
+/// Starts at `base_lr` and decays smoothly to near zero over `total_epochs` epochs.
+/// The `start_epoch` parameter supports resuming from a checkpoint.
+fn cosine_lr(base_lr: f64, current_epoch: usize, start_epoch: usize, total_epochs: usize) -> f64 {
+    if total_epochs <= start_epoch {
+        return base_lr;
+    }
+    let progress = (current_epoch - start_epoch) as f64 / (total_epochs - start_epoch) as f64;
+    base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+}
+
 /// Shuffles indices using a simple LCG-based shuffle.
 fn shuffle_indices(indices: &mut [usize], seed: u64) {
     // Simple Fisher-Yates shuffle with LCG random
@@ -468,16 +504,20 @@ fn shuffle_indices(indices: &mut [usize], seed: u64) {
 }
 
 /// Logs training progress.
+///
+/// Loss values are on normalised [0, 1] targets (Huber loss).
+/// The approximate RMSE in MMR is `sqrt(loss) * MMR_SCALE`; this is exact only
+/// in the quadratic regime of the Huber loss (errors < delta = 0.1 normalised).
 fn log_progress(epoch: usize, train_loss: f32, valid_loss: Option<f32>) {
-    // Convert MSE to RMSE for more intuitive interpretation
-    let train_rmse = train_loss.sqrt();
+    let approx_train_rmse = train_loss.sqrt() * MMR_SCALE;
     if let Some(vl) = valid_loss {
-        let valid_rmse = vl.sqrt();
+        let approx_valid_rmse = vl.sqrt() * MMR_SCALE;
         info!(
-            "Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR), valid_loss = {vl:.6} (RMSE: {valid_rmse:.1} MMR)"
+            "Epoch {epoch}: train_loss={train_loss:.6} (~{approx_train_rmse:.1} MMR), \
+             valid_loss={vl:.6} (~{approx_valid_rmse:.1} MMR)"
         );
     } else {
-        info!("Epoch {epoch}: train_loss = {train_loss:.6} (RMSE: {train_rmse:.1} MMR)");
+        info!("Epoch {epoch}: train_loss={train_loss:.6} (~{approx_train_rmse:.1} MMR)");
     }
 }
 

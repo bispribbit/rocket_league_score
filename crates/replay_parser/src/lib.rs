@@ -506,8 +506,10 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             })
             .collect();
 
-        // Sort players by team then actor_id for consistent ordering
-        players.sort_by(|a, b| a.team.cmp(&b.team).then(a.actor_id.cmp(&b.actor_id)));
+        // Sort players by team then name for consistent ordering.
+        // Name is stable across respawns (a player keeps their name even when a new car
+        // spawns after a demolish or goal reset, which changes the actor_id).
+        players.sort_by(|a, b| a.team.cmp(&b.team).then(a.name.cmp(&b.name)));
 
         // Reset demolished state after capturing it
         for car in car_actors.values_mut() {

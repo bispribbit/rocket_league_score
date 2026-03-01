@@ -82,7 +82,7 @@ struct PlayerAverage {
 // ---------------------------------------------------------------------------
 
 /// Yields to the browser event loop so the UI can repaint.
-#[allow(clippy::future_not_send, clippy::let_underscore_untyped)]
+#[expect(clippy::future_not_send, clippy::let_underscore_untyped)]
 async fn yield_to_ui() {
     let _ = document::eval("new Promise(r => setTimeout(r, 0))").await;
 }
@@ -248,6 +248,7 @@ fn main() {
 
 /// Root application component.
 #[component]
+#[expect(clippy::volatile_composites)] // from dioxus asset! macro
 fn App() -> Element {
     let state = use_signal(|| AppState::WaitingForUpload);
 
