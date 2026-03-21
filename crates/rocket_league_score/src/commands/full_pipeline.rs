@@ -67,7 +67,8 @@ impl Default for FullTrainConfig {
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
-            learning_rate: 0.001,
+            // See TrainingConfig::learning_rate doc for overfit sweep results.
+            learning_rate: 0.01,
             resume: false,
             checkpoint_every_n_epochs: 5,
             max_replays: None,

@@ -8,6 +8,10 @@ license.workspace = true
 name = "convert_model_to_bin"
 path = "src/bin/convert_model_to_bin.rs"
 
+[[bin]]
+name = "overfit_test"
+path = "src/bin/overfit_test.rs"
+
 [lints]
 workspace = true
 
@@ -17,6 +21,7 @@ feature_extractor = { path = "../feature_extractor" }
 burn = { workspace = true, features = ["train"] }
 anyhow.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true
 uuid.workspace = true

@@ -61,7 +61,14 @@ pub struct ModelConfig {
 #[derive(Config, Debug)]
 pub struct TrainingConfig {
     /// Learning rate for the optimizer.
-    #[config(default = 1e-4)]
+    ///
+    /// Overfit sweep (100 segments, 30 epochs, MSE + Huber grid):
+    ///   lr=1e-4 → FLAT (0.8% improvement)
+    ///   lr=1e-3 → FLAT (0.8%)
+    ///   lr=1e-2 → OK   (64.9%, 1226→430 MMR RMSE)  <-- chosen
+    ///   lr=5e-2 → OK   (64.7%, similar final RMSE but less stable)
+    ///   lr=1e-1 → OK   (64.6%, oscillates more)
+    #[config(default = 1e-2)]
     pub learning_rate: f64,
     /// Number of training epochs.
     #[config(default = 100)]

@@ -137,9 +137,18 @@ where
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
-    // Huber loss with delta=0.1 (≈ 200 MMR after normalisation).
-    // Less sensitive to outlier replays than MSE while still being differentiable.
-    let huber_delta = 0.1_f32;
+    // Huber loss on normalised [0,1] targets (raw MMR / 2000).
+    //
+    // Overfit sweep (100 segments, 30 epochs, lr=1e-2, no clip):
+    //   delta=0.1 → FLAT  (+1.7 MMR, gradient ±0.1 too weak for 1.25M params)
+    //   delta=0.5 → OK    (820→309 MMR RMSE)
+    //   delta=1.0 → BEST  (867→307 MMR RMSE, fastest convergence)   <-- chosen
+    //
+    // delta=1.0 in normalised space = 2000 MMR, so virtually all errors stay in
+    // the quadratic regime.  This makes the loss behave like MSE for typical
+    // predictions while still capping the gradient for extreme outliers (e.g.
+    // corrupt replays with wildly wrong MMR labels).
+    let huber_delta = 1.0_f32;
     let loss_fn = HuberLoss {
         delta: huber_delta,
         lin_bias: huber_delta * huber_delta / 2.0,
