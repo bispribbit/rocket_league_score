@@ -1,11 +1,11 @@
 #![allow(clippy::same_name_method)]
 #![allow(clippy::redundant_pub_crate)]
-//! Dioxus web application for Rocket League replay MMR prediction.
+//! Dioxus web application: tongue-in-cheek smurf detection from Rocket League replays.
 //!
-//! Upload a `.replay` file and get per-player MMR predictions displayed
-//! in per-segment and summary tables.
+//! Upload a `.replay` file and get per-player MMR estimates in segment and summary views.
 
 mod app_state;
+mod branding;
 mod browser_async;
 mod embedded_model;
 mod prediction;

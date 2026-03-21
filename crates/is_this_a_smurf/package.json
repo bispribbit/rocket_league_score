@@ -1,5 +1,5 @@
 {
-  "name": "web_predictor",
+  "name": "is_this_a_smurf",
   "private": true,
   "scripts": {
     "tailwind:watch": "npx @tailwindcss/cli -i ./input.css -o ./assets/tailwind.css --watch",

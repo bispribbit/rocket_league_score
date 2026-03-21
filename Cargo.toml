@@ -34,7 +34,7 @@ csv = { version = "1.4" }
 dioxus = { version = "0.7" }
 dotenvy = { version = "0.15" }
 getrandom = { version = "0.4.2", features = ["wasm_js"] }
-# Transitive getrandom 0.3 from rand/burn: enable wasm_js when building web_predictor for wasm32-unknown-unknown
+# Transitive getrandom 0.3 from rand/burn: enable wasm_js when building is_this_a_smurf for wasm32-unknown-unknown
 getrandom_for_transitive_rand = { package = "getrandom", version = "0.3.4", default-features = false, features = [
     "wasm_js",
 ] }

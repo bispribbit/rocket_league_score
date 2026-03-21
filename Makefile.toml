@@ -25,6 +25,6 @@ command = "cargo"
 args = ["update"]
 
 [tasks.start-web]
-cwd = "crates/web_predictor"
+cwd = "crates/is_this_a_smurf"
 command = "dx"
 args = ["serve"]

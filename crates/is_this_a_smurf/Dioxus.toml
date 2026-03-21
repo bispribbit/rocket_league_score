@@ -1,9 +1,9 @@
 [application]
-name = "web_predictor"
+name = "is_this_a_smurf"
 default_platform = "web"
 
 [web.app]
-title = "RL Replay MMR Predictor"
+title = "Is this a smurf?"
 
 [web.watcher]
 watch_path = ["src", "assets"]

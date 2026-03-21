@@ -16,20 +16,6 @@
 //! steps. Moving compute to a worker would be a larger architectural change (model + tensors in the
 //! worker, progress messages back to the main thread).
 
-use dioxus::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-
-use crate::app_state::{
-    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, StepStatus, TimelineTrackState,
-};
-use crate::browser_async::{sleep_milliseconds, yield_to_ui};
-use crate::embedded_model::{DEFAULT_SEQUENCE_LENGTH, MODEL_BYTES, MODEL_CONFIG};
-use crate::prediction::{
-    build_goal_markers, build_prediction_results, compute_segment_boundary_times,
-    global_ranks_from_predictions, prepare_players_for_timeline, ranks_from_player_predictions,
-    segment_step_infos,
-};
 #[cfg(target_arch = "wasm32")]
 use burn::backend::NdArray;
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,10 +24,24 @@ use burn::backend::Wgpu;
 use burn::backend::ndarray::NdArrayDevice;
 #[cfg(not(target_arch = "wasm32"))]
 use burn::backend::wgpu::WgpuDevice;
+use dioxus::prelude::*;
 use ml_model::{ExtractedSegmentFeatures, SequenceModel, load_checkpoint_from_bytes};
 use replay_parser::parse_replay_from_bytes;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 
 use super::processing::ProcessingPage;
+use crate::app_state::{
+    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, StepStatus, TimelineTrackState,
+};
+use crate::branding::IS_THIS_A_SMURF_HERO;
+use crate::browser_async::{sleep_milliseconds, yield_to_ui};
+use crate::embedded_model::{DEFAULT_SEQUENCE_LENGTH, MODEL_BYTES, MODEL_CONFIG};
+use crate::prediction::{
+    build_goal_markers, build_prediction_results, compute_segment_boundary_times,
+    global_ranks_from_predictions, prepare_players_for_timeline, ranks_from_player_predictions,
+    segment_step_infos,
+};
 
 /// Burn backend for inference: WGPU on native hosts, pure CPU ndarray on WASM (WGPU checkpoint
 /// load and sync tensor reads panic on WASM — see cubecl-common `reader`).
@@ -76,13 +76,22 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
     }
 
     rsx! {
-        div { class: "flex flex-col items-center justify-center min-h-screen px-4",
-            // Title
-            h1 { class: "text-4xl font-bold mb-2 text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-orange-400",
-                "RL Replay Predictor"
+        div { class: "flex flex-col items-center justify-center min-h-screen px-4 py-10 gap-6",
+            h1 { class: "w-full max-w-lg text-center text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-orange-400",
+                "Is this a smurf?"
             }
-            p { class: "text-gray-400 mb-10 text-lg",
-                "Predict each player's MMR from a Rocket League replay"
+            // Hero art + blurb share the same width and surface treatment as the upload zone below.
+            div { class: "w-full max-w-lg rounded-2xl border border-gray-700/60 bg-gradient-to-b from-gray-900/80 to-gray-950/90 p-6 shadow-xl shadow-black/40",
+                div { class: "flex justify-center rounded-xl bg-gray-950/50 p-3 ring-1 ring-inset ring-gray-800/80",
+                    img {
+                        src: IS_THIS_A_SMURF_HERO,
+                        alt: "Cartoon Rocket League cars and rainbow banner art",
+                        class: "max-h-[min(42vh,28rem)] w-auto max-w-full object-contain rounded-lg",
+                    }
+                }
+                p { class: "mt-4 text-center text-base leading-relaxed text-gray-400",
+                    "Upload a Rocket League replay. We guess everyone's MMR — and flag anyone who looks a little too strong for the lobby."
+                }
             }
 
             // Upload zone
@@ -105,7 +114,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                     span { class: "text-blue-400", ".replay" }
                 }
                 p { class: "text-gray-500 text-sm mt-1",
-                    "Rocket League replay file"
+                    "Ranked 3v3 Rocket League replay file"
                 }
 
                 input {

@@ -5,7 +5,34 @@ use feature_extractor::TOTAL_PLAYERS;
 use replay_structs::{RankDivision, Team};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, SegmentDisplayData};
+use crate::branding::SMURF_SUSPECT_BADGE;
 use crate::rank_icon::rank_division_icon_asset;
+
+/// MMR above the lobby median before we show the playful smurf badge (predictions are approximate).
+const SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN: f32 = 200.0;
+
+fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
+    let mut values: Vec<f32> = player_averages
+        .iter()
+        .map(|player| player.average_mmr)
+        .collect();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values.get(mid).copied().unwrap_or(0.0)
+    } else {
+        let lower = values.get(mid.saturating_sub(1)).copied().unwrap_or(0.0);
+        let upper = values.get(mid).copied().unwrap_or(0.0);
+        f32::midpoint(lower, upper)
+    }
+}
+
+fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
+    player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
+}
 
 /// Results page with per-segment and summary tables.
 #[component]
@@ -29,13 +56,20 @@ pub(crate) fn ResultsPage(
         .cloned()
         .collect();
 
+    let lobby_median_mmr = lobby_median_average_mmr(&results.player_averages);
+    let player_average_mmrs: Vec<f32> = results
+        .player_averages
+        .iter()
+        .map(|player| player.average_mmr)
+        .collect();
+
     rsx! {
         div { class: "max-w-6xl mx-auto px-4 py-8",
             // Header
             div { class: "flex items-center justify-between mb-8",
                 div {
                     h1 { class: "text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-orange-400",
-                        "Prediction results"
+                        "Replay estimates"
                     }
                     p { class: "text-gray-400 mt-1",
                         "{filename} — {results.segments.len()} segment(s)"
@@ -53,15 +87,27 @@ pub(crate) fn ResultsPage(
             // Summary tables - Blue and Orange side by side
             div { class: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-10",
                 // Blue team summary
-                TeamSummaryCard { team_name: "Blue Team", team_color: "blue", players: blue_players }
+                TeamSummaryCard {
+                    team_name: "Blue Team",
+                    team_color: "blue",
+                    players: blue_players,
+                    lobby_median_mmr,
+                }
                 // Orange team summary
-                TeamSummaryCard { team_name: "Orange Team", team_color: "orange", players: orange_players }
+                TeamSummaryCard {
+                    team_name: "Orange Team",
+                    team_color: "orange",
+                    players: orange_players,
+                    lobby_median_mmr,
+                }
             }
 
             // Per-segment table
             SegmentTable {
                 segments: results.segments.clone(),
                 player_names: results.player_names,
+                lobby_median_mmr,
+                player_average_mmrs,
             }
         }
     }
@@ -69,7 +115,12 @@ pub(crate) fn ResultsPage(
 
 /// Card showing team summary with player rank icons and rank names.
 #[component]
-fn TeamSummaryCard(team_name: String, team_color: String, players: Vec<PlayerAverage>) -> Element {
+fn TeamSummaryCard(
+    team_name: String,
+    team_color: String,
+    players: Vec<PlayerAverage>,
+    lobby_median_mmr: f32,
+) -> Element {
     let border_color = if team_color == "blue" {
         "border-blue-500/50"
     } else {
@@ -110,7 +161,17 @@ fn TeamSummaryCard(team_name: String, team_color: String, players: Vec<PlayerAve
                 for player in &players {
                     div { class: "px-6 py-4 flex items-center justify-between",
                         div {
-                            p { class: "font-semibold text-gray-100", "{player.name}" }
+                            div { class: "flex items-center gap-2 flex-wrap",
+                                p { class: "font-semibold text-gray-100", "{player.name}" }
+                                if player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr) {
+                                    img {
+                                        src: SMURF_SUSPECT_BADGE,
+                                        alt: "Predicted MMR much higher than lobby median",
+                                        title: "Predicted MMR is more than 200 above the lobby median (approximate)",
+                                        class: "w-9 h-9 object-contain shrink-0",
+                                    }
+                                }
+                            }
                             p { class: "text-sm text-gray-500", "{player.rank}" }
                         }
                         div { class: "text-right flex flex-col items-end gap-1",
@@ -135,7 +196,12 @@ fn TeamSummaryCard(team_name: String, team_color: String, players: Vec<PlayerAve
 
 /// Table showing per-segment predictions for all players.
 #[component]
-fn SegmentTable(segments: Vec<SegmentDisplayData>, player_names: Vec<String>) -> Element {
+fn SegmentTable(
+    segments: Vec<SegmentDisplayData>,
+    player_names: Vec<String>,
+    lobby_median_mmr: f32,
+    player_average_mmrs: Vec<f32>,
+) -> Element {
     if segments.is_empty() {
         return rsx! {
             p { class: "text-gray-500 text-center py-8", "No segments available." }
@@ -159,18 +225,58 @@ fn SegmentTable(segments: Vec<SegmentDisplayData>, player_names: Vec<String>) ->
                             th { class: "px-4 py-3 text-left text-gray-400 font-medium", "Time" }
                             // Blue team headers
                             for (player_index, name) in player_names.iter().enumerate().take(3) {
-                                th {
-                                    key: "header-blue-{player_index}",
-                                    class: "px-4 py-3 text-right text-blue-400 font-medium",
-                                    "{name}"
+                                {
+                                    let average_mmr = player_average_mmrs
+                                        .get(player_index)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let show_smurf =
+                                        player_looks_high_for_lobby(average_mmr, lobby_median_mmr);
+                                    rsx! {
+                                        th {
+                                            key: "header-blue-{player_index}",
+                                            class: "px-4 py-3 text-right text-blue-400 font-medium",
+                                            div { class: "flex items-center justify-end gap-2",
+                                                if show_smurf {
+                                                    img {
+                                                        src: SMURF_SUSPECT_BADGE,
+                                                        alt: "Smurf suspect",
+                                                        title: "Average predicted MMR is more than 200 above the lobby median",
+                                                        class: "w-7 h-7 object-contain shrink-0",
+                                                    }
+                                                }
+                                                span { "{name}" }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             // Orange team headers
                             for (player_index, name) in player_names.iter().enumerate().skip(3).take(3) {
-                                th {
-                                    key: "header-orange-{player_index}",
-                                    class: "px-4 py-3 text-right text-orange-400 font-medium",
-                                    "{name}"
+                                {
+                                    let average_mmr = player_average_mmrs
+                                        .get(player_index)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let show_smurf =
+                                        player_looks_high_for_lobby(average_mmr, lobby_median_mmr);
+                                    rsx! {
+                                        th {
+                                            key: "header-orange-{player_index}",
+                                            class: "px-4 py-3 text-right text-orange-400 font-medium",
+                                            div { class: "flex items-center justify-end gap-2",
+                                                if show_smurf {
+                                                    img {
+                                                        src: SMURF_SUSPECT_BADGE,
+                                                        alt: "Smurf suspect",
+                                                        title: "Average predicted MMR is more than 200 above the lobby median",
+                                                        class: "w-7 h-7 object-contain shrink-0",
+                                                    }
+                                                }
+                                                span { "{name}" }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
