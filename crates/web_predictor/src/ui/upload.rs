@@ -1,4 +1,20 @@
 //! Upload drop zone and full inference pipeline (keeps the future alive on this scope).
+//!
+//! ## Threading and WASM
+//!
+//! The default browser target `wasm32-unknown-unknown` does **not** support Rust `std::thread`.
+//! True parallel threads in WASM need either:
+//! - **Web Workers**: a separate JS worker loading another WASM module (or the same bundle with
+//!   careful setup), with all inputs and outputs passed through `postMessage` (often large copies),
+//!   or
+//! - **Atomics + `wasm-bindgen-rayon`**: rebuild with `+atomics,+bulk-memory`, and serve the page
+//!   with cross-origin isolation (`Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy`)
+//!   so `SharedArrayBuffer` is available.
+//!
+//! This crate therefore runs inference on the **same thread** as the UI, but the async loop calls
+//! [`crate::browser_async::yield_to_ui`] after each segment so the browser can repaint between
+//! steps. Moving compute to a worker would be a larger architectural change (model + tensors in the
+//! worker, progress messages back to the main thread).
 
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
@@ -14,10 +30,30 @@ use crate::prediction::{
     global_ranks_from_predictions, prepare_players_for_timeline, ranks_from_player_predictions,
     segment_step_infos,
 };
+#[cfg(target_arch = "wasm32")]
+use burn::backend::NdArray;
+#[cfg(not(target_arch = "wasm32"))]
+use burn::backend::Wgpu;
+#[cfg(target_arch = "wasm32")]
+use burn::backend::ndarray::NdArrayDevice;
+#[cfg(not(target_arch = "wasm32"))]
+use burn::backend::wgpu::WgpuDevice;
 use ml_model::{ExtractedSegmentFeatures, SequenceModel, load_checkpoint_from_bytes};
 use replay_parser::parse_replay_from_bytes;
 
 use super::processing::ProcessingPage;
+
+/// Burn backend for inference: WGPU on native hosts, pure CPU ndarray on WASM (WGPU checkpoint
+/// load and sync tensor reads panic on WASM — see cubecl-common `reader`).
+#[cfg(target_arch = "wasm32")]
+type InferenceBackend = NdArray;
+#[cfg(target_arch = "wasm32")]
+type InferenceDevice = NdArrayDevice;
+
+#[cfg(not(target_arch = "wasm32"))]
+type InferenceBackend = Wgpu;
+#[cfg(not(target_arch = "wasm32"))]
+type InferenceDevice = WgpuDevice;
 
 /// Upload page with a centered drag-and-drop area.
 ///
@@ -155,10 +191,16 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             yield_to_ui().await;
 
                             // ---- Step 4: load model --------------------------------------------
-                            tracing::info!("[replay] load_checkpoint_from_bytes starting");
-                            let device = burn::backend::wgpu::WgpuDevice::default();
-                            type Backend = burn::backend::Wgpu;
-                            let model: SequenceModel<Backend> = match load_checkpoint_from_bytes(
+                            tracing::info!(
+                                "[replay] load_checkpoint_from_bytes starting (backend = {})",
+                                if cfg!(target_arch = "wasm32") {
+                                    "NdArray"
+                                } else {
+                                    "Wgpu"
+                                }
+                            );
+                            let device = InferenceDevice::default();
+                            let model: SequenceModel<InferenceBackend> = match load_checkpoint_from_bytes(
                                 MODEL_BYTES, MODEL_CONFIG, &device,
                             ) {
                                 Ok(model) => {
@@ -233,12 +275,15 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
 
                             let mut segment_predictions = Vec::with_capacity(num_segments);
                             for seg_idx in 0..num_segments {
-                                let Some(prediction) = extracted.predict_single_segment(
-                                    &model,
-                                    &device,
-                                    sequence_length,
-                                    seg_idx,
-                                ) else {
+                                let Some(prediction) = extracted
+                                    .predict_single_segment(
+                                        &model,
+                                        &device,
+                                        sequence_length,
+                                        seg_idx,
+                                    )
+                                    .await
+                                else {
                                     break;
                                 };
                                 let segment_player_ranks =

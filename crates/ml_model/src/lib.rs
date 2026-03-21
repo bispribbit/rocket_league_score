@@ -27,8 +27,8 @@ use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, R
 use burn::prelude::*;
 use burn::record::FullPrecisionSettings;
 use feature_extractor::{
-    PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, PlayerRoster, TOTAL_PLAYERS,
-    extract_all_player_centric_features,
+    FRAME_SUBSAMPLE_RATE, PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, PlayerRoster,
+    TOTAL_PLAYERS, extract_all_player_centric_features,
 };
 
 /// Scale factor to normalise MMR values to [0, 1] range.
@@ -104,8 +104,9 @@ pub struct TrainingConfig {
 /// 4. Cross-player MLP: sees all 6 players at once, enabling the model to
 ///    learn relative skill differences within a match.
 ///
-/// The final output is `[batch_size, 6]` MMR predictions in MMR-normalised
-/// space (0–1, where 1 = 2000 MMR).  De-normalise by multiplying by `MMR_SCALE`.
+/// The final output is `[batch_size, 6]` with one value per player in **raw MMR units**
+/// (same scale as training targets). Training divides predictions and targets by
+/// [`MMR_SCALE`] only inside the loss; do **not** multiply outputs by `MMR_SCALE` at inference.
 #[derive(Module, Debug)]
 pub struct SequenceModel<B: Backend> {
     /// First LSTM layer processes raw frame features.
@@ -174,8 +175,7 @@ impl<B: Backend> SequenceModel<B> {
     ///
     /// # Returns
     ///
-    /// Tensor of shape `[batch_size, 6]` with one normalised MMR prediction per player.
-    /// Multiply by `MMR_SCALE` to convert back to raw MMR units.
+    /// Tensor of shape `[batch_size, 6]` with one MMR prediction per player (raw units).
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
         let [batch_times_players, seq_len, _] = input.dims();
         let batch_size = batch_times_players / TOTAL_PLAYERS;
@@ -310,28 +310,56 @@ pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> Seq
     SequenceModel::new(device, config)
 }
 
+/// Maps half-open subsampled feature indices to half-open indices in the original replay.
+///
+/// Training segments are built from frames taken with [`FRAME_SUBSAMPLE_RATE`] (see
+/// [`feature_extractor::extract_player_centric_game_sequence`]).
+fn subsampled_bounds_to_original_frames(
+    start_subsampled: usize,
+    end_subsampled_exclusive: usize,
+    original_frame_count: usize,
+) -> (usize, usize) {
+    if original_frame_count == 0 {
+        return (0, 0);
+    }
+    let step = FRAME_SUBSAMPLE_RATE;
+    let start_original = (start_subsampled.saturating_mul(step)).min(original_frame_count - 1);
+    let mut end_original_exclusive = end_subsampled_exclusive
+        .saturating_mul(step)
+        .min(original_frame_count);
+    if end_original_exclusive <= start_original {
+        end_original_exclusive = (start_original + 1).min(original_frame_count);
+    }
+    (start_original, end_original_exclusive)
+}
+
 /// Result of a single segment prediction.
 #[derive(Debug, Clone)]
 pub struct SegmentPrediction {
     /// Zero-based segment index.
     pub segment_index: usize,
-    /// Start frame index in the original frame list.
+    /// Start index in the **original** replay frame list (same convention as training cache).
     pub start_frame: usize,
-    /// End frame index (exclusive) in the original frame list.
+    /// Exclusive end index in the **original** replay frame list.
     pub end_frame: usize,
     /// Predicted MMR for each of the 6 players in this segment.
     pub player_predictions: [f32; TOTAL_PLAYERS],
 }
 
-/// Extracted player-centric features for all frames, used for incremental segment prediction.
+/// Extracted player-centric features for incremental segment prediction.
 #[derive(Clone)]
 pub struct ExtractedSegmentFeatures {
-    /// One entry per frame.
+    /// One entry per **subsampled** replay frame (same step as training: [`FRAME_SUBSAMPLE_RATE`]).
     pub(crate) player_centric_frames: Vec<[PlayerCentricFrameFeatures; 6]>,
+    /// Length of the original replay frame list (for mapping segment bounds to wall-clock times).
+    pub(crate) original_replay_frame_count: usize,
 }
 
 impl ExtractedSegmentFeatures {
     /// Builds features from game frames (call once, then use for all segments).
+    ///
+    /// Uses the same frame subsampling as the training pipeline (`1` out of every
+    /// [`FRAME_SUBSAMPLE_RATE`] replay frames).
     ///
     /// The roster is derived from all frames so that canonical slot assignments
     /// remain stable even when a player disconnects mid-game.
@@ -339,10 +367,12 @@ impl ExtractedSegmentFeatures {
         let roster = PlayerRoster::from_frames(frames);
         let player_centric_frames = frames
             .iter()
+            .step_by(FRAME_SUBSAMPLE_RATE)
             .map(|frame| extract_all_player_centric_features(frame, &roster))
             .collect();
         Self {
             player_centric_frames,
+            original_replay_frame_count: frames.len(),
         }
     }
 
@@ -356,7 +386,11 @@ impl ExtractedSegmentFeatures {
     }
 
     /// Predicts a single segment by index. Returns `None` if index is out of range.
-    pub fn predict_single_segment<B: Backend>(
+    ///
+    /// This method is `async` so GPU backends (for example WGPU) can read outputs with
+    /// [`Tensor::into_data_async`] on targets such as WASM where synchronous reads are not supported.
+    #[expect(clippy::future_not_send)]
+    pub async fn predict_single_segment<B: Backend>(
         &self,
         model: &SequenceModel<B>,
         device: &B::Device,
@@ -387,21 +421,22 @@ impl ExtractedSegmentFeatures {
             PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
-        // output: [1, 6] (batch_size=1, 6 players) — values are normalised [0,1].
-        // Flatten to [v0..v5] and de-normalise to MMR units.
+        // output: [1, 6] (batch_size=1, 6 players) — raw MMR scale (see training loss).
         let output = model.forward_inference(input);
-        let output_data = output.into_data();
+        let output_data = output.into_data_async().await.ok()?;
         let values = output_data.to_vec::<f32>().ok()?;
         let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
         for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
             if let Some(pred) = player_predictions.get_mut(i) {
-                *pred = val * MMR_SCALE;
+                *pred = *val;
             }
         }
+        let (start_original, end_original_exclusive) =
+            subsampled_bounds_to_original_frames(start, end, self.original_replay_frame_count);
         Some(SegmentPrediction {
             segment_index,
-            start_frame: start,
-            end_frame: end,
+            start_frame: start_original,
+            end_frame: end_original_exclusive,
             player_predictions,
         })
     }
@@ -436,8 +471,10 @@ pub fn predict_player_centric_per_segment<B: Backend>(
     // Using a single roster for the whole game prevents slot shifting when a
     // player disconnects mid-match.
     let roster = PlayerRoster::from_frames(frames);
+    let original_frame_count = frames.len();
     let player_centric_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
         .iter()
+        .step_by(FRAME_SUBSAMPLE_RATE)
         .map(|frame| extract_all_player_centric_features(frame, &roster))
         .collect();
 
@@ -472,8 +509,7 @@ pub fn predict_player_centric_per_segment<B: Backend>(
             PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
-        // Forward pass - output is [1, 6] (batch_size=1, 6 players).
-        // Values are normalised [0,1]; de-normalise to MMR units.
+        // Forward pass - output is [1, 6] (batch_size=1, 6 players), raw MMR scale.
         let output = model.forward_inference(input);
 
         // Extract predictions
@@ -482,13 +518,15 @@ pub fn predict_player_centric_per_segment<B: Backend>(
             let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
             for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
                 if let Some(pred) = player_predictions.get_mut(i) {
-                    *pred = val * MMR_SCALE;
+                    *pred = *val;
                 }
             }
+            let (start_original, end_original_exclusive) =
+                subsampled_bounds_to_original_frames(start, end, original_frame_count);
             results.push(SegmentPrediction {
                 segment_index: seg_idx,
-                start_frame: start,
-                end_frame: end,
+                start_frame: start_original,
+                end_frame: end_original_exclusive,
                 player_predictions,
             });
         }

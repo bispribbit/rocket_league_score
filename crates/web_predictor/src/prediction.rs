@@ -1,6 +1,6 @@
 //! Replay parsing helpers, segment timeline data, and final result building.
 
-use feature_extractor::TOTAL_PLAYERS;
+use feature_extractor::{FRAME_SUBSAMPLE_RATE, TOTAL_PLAYERS};
 use ml_model::SegmentPrediction;
 use replay_structs::{GameFrame, ParsedReplay, RankDivision, Team};
 
@@ -10,15 +10,19 @@ use crate::app_state::{
 };
 
 /// Builds segment step infos (time ranges) from parsed frames and sequence length.
+///
+/// `sequence_length` counts **subsampled** frames (same step as training:
+/// [`FRAME_SUBSAMPLE_RATE`]). Wall-clock bounds use the corresponding span in the original replay.
 pub(crate) fn segment_step_infos(
     frames: &[GameFrame],
     sequence_length: usize,
     num_segments: usize,
 ) -> Vec<SegmentStepInfo> {
+    let step = FRAME_SUBSAMPLE_RATE;
     (0..num_segments)
         .map(|seg_idx| {
-            let start_frame = seg_idx * sequence_length;
-            let end_frame = (start_frame + sequence_length).min(frames.len());
+            let start_frame = seg_idx * sequence_length * step;
+            let end_frame = ((seg_idx + 1) * sequence_length * step).min(frames.len());
             let start_time = frames.get(start_frame).map_or(0.0, |frame| frame.time);
             let end_time = frames
                 .get(end_frame.saturating_sub(1))

@@ -14,8 +14,8 @@ use super::init_device;
 
 type Backend = Wgpu;
 
-/// Default sequence length for inference (should match training config).
-const DEFAULT_SEQUENCE_LENGTH: usize = 300;
+/// Default sequence length for inference (subsampled frames per segment; must match checkpoint).
+const DEFAULT_SEQUENCE_LENGTH: usize = 150;
 
 /// Runs the predict command.
 ///

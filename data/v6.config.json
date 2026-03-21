@@ -1,0 +1,14 @@
+{
+  "model": {
+    "lstm_hidden_1": 128,
+    "lstm_hidden_2": 64,
+    "feedforward_hidden": 64,
+    "cross_player_hidden": 64,
+    "dropout": 0.2
+  },
+  "learning_rate": 0.001,
+  "epochs": 100,
+  "batch_size": 1000,
+  "validation_split": 0.1,
+  "sequence_length": 150
+}
