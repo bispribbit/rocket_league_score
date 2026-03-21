@@ -9,6 +9,7 @@ mod app_state;
 mod browser_async;
 mod embedded_model;
 mod prediction;
+mod rank_icon;
 mod ui;
 
 use ui::App;

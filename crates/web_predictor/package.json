@@ -1,0 +1,12 @@
+{
+  "name": "web_predictor",
+  "private": true,
+  "scripts": {
+    "tailwind:watch": "npx @tailwindcss/cli -i ./input.css -o ./assets/tailwind.css --watch",
+    "tailwind:build": "npx @tailwindcss/cli -i ./input.css -o ./assets/tailwind.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.1.3",
+    "tailwindcss": "4.1.3"
+  }
+}

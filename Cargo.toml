@@ -41,6 +41,7 @@ getrandom_for_transitive_rand = { package = "getrandom", version = "0.3.4", defa
 governor = { version = "0.10.4" }
 js-sys = { version = "0.3" }
 memmap2 = { version = "0.9.10" }
+manganis = { version = "0.7.3", default-features = false, features = ["dioxus"] }
 mimalloc = { version = "0.1.48" }
 object_store = { version = "0.13.1" }
 parking_lot = { version = "0.12.5" }

@@ -6,6 +6,7 @@ use replay_structs::Team;
 
 use crate::app_state::{AnalysisTimelinePhase, GoalMarkerDisplay, ProgressState, StepStatus};
 use crate::prediction::format_time_mm_ss;
+use crate::rank_icon::rank_division_icon_asset;
 
 /// One goal on the timeline after sorting by time, with running score (e.g. `2-1`).
 #[derive(Clone)]
@@ -245,19 +246,13 @@ fn AnalysisTimeline(progress: ProgressState) -> Element {
                                                         .get(segment_index)
                                                         .and_then(|step| step.player_segment_ranks.as_ref())
                                                         .is_some();
-                                                    let rank_text = progress
-                                                        .segments
-                                                        .get(segment_index)
-                                                        .and_then(|step| {
-                                                            step.player_segment_ranks.as_ref().and_then(
-                                                                |ranks| {
-                                                                    ranks
-                                                                        .get(player_lane_index)
-                                                                        .map(|rank| format!("{rank}"))
-                                                                },
-                                                            )
-                                                        })
-                                                        .unwrap_or_default();
+                                                    let segment_rank = progress.segments.get(segment_index).and_then(
+                                                        |step| {
+                                                            step.player_segment_ranks
+                                                                .as_ref()
+                                                                .and_then(|ranks| ranks.get(player_lane_index).copied())
+                                                        },
+                                                    );
                                                     let opacity_class = if rank_visible {
                                                         "opacity-100"
                                                     } else {
@@ -268,8 +263,14 @@ fn AnalysisTimeline(progress: ProgressState) -> Element {
                                                             key: "seg-badge-{player_lane_index}-{segment_index}",
                                                             class: "absolute bottom-0.5 flex justify-center pointer-events-none transition-opacity duration-500 {opacity_class}",
                                                             style: "{segment_style}",
-                                                            span { class: "text-[9px] leading-tight px-1 py-0.5 rounded bg-gray-800/95 text-gray-200 border border-gray-700 max-w-full truncate",
-                                                                "{rank_text}"
+                                                            if let Some(division) = segment_rank {
+                                                                img {
+                                                                    src: rank_division_icon_asset(division),
+                                                                    alt: format!("{division}"),
+                                                                    class: "h-5 w-5 object-contain drop-shadow-sm",
+                                                                }
+                                                            } else {
+                                                                span { class: "h-5 w-5 inline-block" }
                                                             }
                                                         }
                                                     }
@@ -336,21 +337,23 @@ fn AnalysisTimeline(progress: ProgressState) -> Element {
                         if show_global_column {
                             for player_lane_index in 0..TOTAL_PLAYERS {
                                 {
-                                    let global_label = track
+                                    let global_division = track
                                         .global_ranks
-                                        .and_then(|ranks| {
-                                            ranks
-                                                .get(player_lane_index)
-                                                .map(|rank| format!("{rank}"))
-                                        })
-                                        .unwrap_or_default();
+                                        .as_ref()
+                                        .and_then(|ranks| ranks.get(player_lane_index).copied());
                                     let reveal_class = "opacity-100 transition-opacity duration-700";
                                     rsx! {
                                         div {
                                             key: "global-rank-{player_lane_index}",
                                             class: "h-12 flex items-center justify-center px-0.5 border-b border-gray-800/60 last:border-b-0",
-                                            span { class: "text-[9px] text-center leading-tight text-amber-100 font-semibold {reveal_class}",
-                                                "{global_label}"
+                                            if let Some(division) = global_division {
+                                                img {
+                                                    src: rank_division_icon_asset(division),
+                                                    alt: format!("{division}"),
+                                                    class: "h-9 w-9 object-contain drop-shadow-md {reveal_class}",
+                                                }
+                                            } else {
+                                                span { class: "text-[9px] text-center text-amber-100/40 {reveal_class}", "—" }
                                             }
                                         }
                                     }

@@ -2,9 +2,10 @@
 
 use dioxus::prelude::*;
 use feature_extractor::TOTAL_PLAYERS;
-use replay_structs::Team;
+use replay_structs::{RankDivision, Team};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, SegmentDisplayData};
+use crate::rank_icon::rank_division_icon_asset;
 
 /// Results page with per-segment and summary tables.
 #[component]
@@ -66,7 +67,7 @@ pub(crate) fn ResultsPage(
     }
 }
 
-/// Card showing team summary with player MMR and rank.
+/// Card showing team summary with player rank icons and rank names.
 #[component]
 fn TeamSummaryCard(team_name: String, team_color: String, players: Vec<PlayerAverage>) -> Element {
     let border_color = if team_color == "blue" {
@@ -112,11 +113,18 @@ fn TeamSummaryCard(team_name: String, team_color: String, players: Vec<PlayerAve
                             p { class: "font-semibold text-gray-100", "{player.name}" }
                             p { class: "text-sm text-gray-500", "{player.rank}" }
                         }
-                        div { class: "text-right",
-                            p { class: "text-2xl font-bold {text_accent}",
-                                "{player.average_mmr:.0}"
+                        div { class: "text-right flex flex-col items-end gap-1",
+                            {
+                                let mmr_tooltip = format!("Approximate MMR: {:.0}", player.average_mmr);
+                                rsx! {
+                                    img {
+                                        src: rank_division_icon_asset(player.rank),
+                                        alt: format!("{}", player.rank),
+                                        title: mmr_tooltip,
+                                        class: "w-12 h-12 object-contain drop-shadow-md",
+                                    }
+                                }
                             }
-                            p { class: "text-xs text-gray-500", "MMR" }
                         }
                     }
                 }
@@ -139,7 +147,7 @@ fn SegmentTable(segments: Vec<SegmentDisplayData>, player_names: Vec<String>) ->
             div { class: "px-6 py-4 border-b border-gray-800",
                 h2 { class: "text-xl font-bold text-gray-100", "Predictions per segment" }
                 p { class: "text-gray-500 text-sm mt-1",
-                    "Predicted MMR for each player in each time segment"
+                    "Predicted competitive rank for each player in each time segment (hover for approximate MMR)"
                 }
             }
 
@@ -182,11 +190,20 @@ fn SegmentTable(segments: Vec<SegmentDisplayData>, player_names: Vec<String>) ->
                                 for player_index in 0..3 {
                                     {
                                         let predicted_mmr = segment.player_mmr.get(player_index).copied().unwrap_or(0.0);
+                                        let division = RankDivision::from(predicted_mmr);
+                                        let icon = rank_division_icon_asset(division);
+                                        let rank_label = format!("{division}");
+                                        let mmr_tooltip = format!("Approximate MMR: {predicted_mmr:.0}");
                                         rsx! {
                                             td {
                                                 key: "seg-{segment.segment_number}-blue-{player_index}",
-                                                class: "px-4 py-3 text-right font-mono text-blue-300",
-                                                "{predicted_mmr:.0}"
+                                                class: "px-4 py-3 text-right text-blue-300",
+                                                img {
+                                                    src: icon,
+                                                    alt: rank_label,
+                                                    title: mmr_tooltip,
+                                                    class: "w-10 h-10 object-contain inline-block align-middle",
+                                                }
                                             }
                                         }
                                     }
@@ -195,11 +212,20 @@ fn SegmentTable(segments: Vec<SegmentDisplayData>, player_names: Vec<String>) ->
                                 for player_index in 3..TOTAL_PLAYERS {
                                     {
                                         let predicted_mmr = segment.player_mmr.get(player_index).copied().unwrap_or(0.0);
+                                        let division = RankDivision::from(predicted_mmr);
+                                        let icon = rank_division_icon_asset(division);
+                                        let rank_label = format!("{division}");
+                                        let mmr_tooltip = format!("Approximate MMR: {predicted_mmr:.0}");
                                         rsx! {
                                             td {
                                                 key: "seg-{segment.segment_number}-orange-{player_index}",
-                                                class: "px-4 py-3 text-right font-mono text-orange-300",
-                                                "{predicted_mmr:.0}"
+                                                class: "px-4 py-3 text-right text-orange-300",
+                                                img {
+                                                    src: icon,
+                                                    alt: rank_label,
+                                                    title: mmr_tooltip,
+                                                    class: "w-10 h-10 object-contain inline-block align-middle",
+                                                }
                                             }
                                         }
                                     }
