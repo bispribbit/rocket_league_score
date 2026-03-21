@@ -39,18 +39,25 @@ pub const MMR_SCALE: f32 = 2000.0;
 #[derive(Config, Debug)]
 pub struct ModelConfig {
     /// Hidden size for the first LSTM layer.
-    #[config(default = 256)]
+    ///
+    /// Reduced from 256 to 128 to better match the dataset size (~234K segments).
+    /// At 256 the model had ~1.25M params vs ~1.27M effective training examples
+    /// (ratio ~1:1).  At 128 the model has ~350K params, giving a healthier ~3.6:1
+    /// ratio that reduces overfitting risk.
+    #[config(default = 128)]
     pub lstm_hidden_1: usize,
     /// Hidden size for the second LSTM layer.
-    #[config(default = 128)]
+    ///
+    /// Scaled down from 128 to 64 proportionally with `lstm_hidden_1`.
+    #[config(default = 64)]
     pub lstm_hidden_2: usize,
     /// Hidden size for the per-player feedforward layer.
     /// Input to this layer is `lstm_hidden_2 * 2` (last hidden + mean pooling concatenated).
-    #[config(default = 128)]
+    #[config(default = 64)]
     pub feedforward_hidden: usize,
     /// Hidden size for the cross-player interaction MLP.
     /// This layer sees all 6 players at once and produces the final 6 MMR predictions.
-    #[config(default = 128)]
+    #[config(default = 64)]
     pub cross_player_hidden: usize,
     /// Dropout rate for regularization.
     #[config(default = 0.2)]
