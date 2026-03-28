@@ -65,7 +65,7 @@ pub struct FullTrainConfig {
 impl Default for FullTrainConfig {
     fn default() -> Self {
         Self {
-            model_name: String::from("lstm_v6"),
+            model_name: String::from("lstm_v7"),
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
