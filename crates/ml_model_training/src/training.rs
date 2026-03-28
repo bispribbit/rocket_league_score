@@ -13,8 +13,8 @@ use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
 use tracing::info;
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
-use crate::save_checkpoint;
 use crate::segment_cache::SegmentStore;
+use crate::{CheckpointValidationMetrics, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
 #[derive(Debug, Clone, Default)]
@@ -361,7 +361,11 @@ where
 
                     if let Some(ckpt_cfg) = &checkpoint_config {
                         let path = format!("{}_final", ckpt_cfg.path_prefix);
-                        if let Ok(_ckpt) = save_checkpoint(model, &path, config) {
+                        let validation_metrics = state
+                            .current_valid_loss
+                            .map(CheckpointValidationMetrics::from_validation_loss);
+                        if let Ok(_ckpt) = save_checkpoint(model, &path, config, validation_metrics)
+                        {
                             info!("Saved final checkpoint: {path}");
                             checkpoint_paths.push(path);
                         }
@@ -399,7 +403,10 @@ where
                 };
                 let path = format!("{}_{}", ckpt_cfg.path_prefix, suffix);
 
-                match save_checkpoint(model, &path, config) {
+                let validation_metrics = state
+                    .current_valid_loss
+                    .map(CheckpointValidationMetrics::from_validation_loss);
+                match save_checkpoint(model, &path, config, validation_metrics) {
                     Ok(_ckpt) => {
                         info!("Saved checkpoint: {path}");
                         checkpoint_paths.push(path);
@@ -415,7 +422,10 @@ where
     // Save final checkpoint
     if let Some(ckpt_cfg) = &checkpoint_config {
         let path = format!("{}_final", ckpt_cfg.path_prefix);
-        if let Ok(_ckpt) = save_checkpoint(model, &path, config) {
+        let validation_metrics = state
+            .current_valid_loss
+            .map(CheckpointValidationMetrics::from_validation_loss);
+        if let Ok(_ckpt) = save_checkpoint(model, &path, config, validation_metrics) {
             info!("Saved final checkpoint: {path}");
             checkpoint_paths.push(path);
         }

@@ -35,7 +35,7 @@ struct OverfitConfig {
 impl Default for OverfitConfig {
     fn default() -> Self {
         Self {
-            segments_dir: PathBuf::from("data/segments/v3"),
+            segments_dir: PathBuf::from("ballchasing/segments/v3"),
             max_segments: 64,
             epochs: 30,
             batch_size: 64,

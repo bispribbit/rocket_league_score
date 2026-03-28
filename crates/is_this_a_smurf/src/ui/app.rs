@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, ResultsScreenState};
 
 use super::results::{ErrorPage, ResultsPage};
 use super::upload::UploadPage;
@@ -21,8 +21,20 @@ pub(crate) fn App() -> Element {
                 AppState::WaitingForUpload => rsx! {
                     UploadPage { state }
                 },
-                AppState::ShowingResults(filename, results) => rsx! {
-                    ResultsPage { filename, results, state }
+                AppState::ShowingResults(screen) => {
+                    let ResultsScreenState {
+                        filename,
+                        results,
+                        timeline_progress,
+                    } = *screen;
+                    rsx! {
+                        ResultsPage {
+                            filename,
+                            results,
+                            timeline_progress,
+                            state,
+                        }
+                    }
                 },
                 AppState::Error(message) => rsx! {
                     ErrorPage { message, state }

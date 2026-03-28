@@ -19,10 +19,16 @@ RUN apt-get update && apt-get install -y \
     libvulkan-dev \
     vulkan-tools \
     mesa-vulkan-drivers \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Install rust components
-RUN rustup component add rustfmt clippy rust-src llvm-tools
+# Tailwind CSS CLI (matches crates/is_this_a_smurf/package.json)
+RUN npm install -g @tailwindcss/cli@4.1.3
+
+# Install rust components and WebAssembly target (e.g. Dioxus web)
+RUN rustup component add rustfmt clippy rust-src llvm-tools \
+    && rustup target add wasm32-unknown-unknown
 
 # Install cargo-binstall
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash

@@ -1,15 +1,14 @@
 //! Results tables and error view.
 
 use dioxus::prelude::*;
-use feature_extractor::TOTAL_PLAYERS;
-use replay_structs::{RankDivision, Team};
+use replay_structs::Team;
 
-use crate::app_state::{AppState, PlayerAverage, PredictionResults, SegmentDisplayData};
+use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;
+use crate::prediction::SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN;
 use crate::rank_icon::rank_division_icon_asset;
 
-/// MMR above the lobby median before we show the playful smurf badge (predictions are approximate).
-const SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN: f32 = 200.0;
+use super::processing::AnalysisTimeline;
 
 fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
     let mut values: Vec<f32> = player_averages
@@ -34,11 +33,12 @@ fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
     player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
 }
 
-/// Results page with per-segment and summary tables.
+/// Results page with team summary cards and the same match timeline as the processing screen.
 #[component]
 pub(crate) fn ResultsPage(
     filename: String,
     results: PredictionResults,
+    timeline_progress: Option<ProgressState>,
     state: Signal<AppState>,
 ) -> Element {
     let mut state = state;
@@ -57,14 +57,9 @@ pub(crate) fn ResultsPage(
         .collect();
 
     let lobby_median_mmr = lobby_median_average_mmr(&results.player_averages);
-    let player_average_mmrs: Vec<f32> = results
-        .player_averages
-        .iter()
-        .map(|player| player.average_mmr)
-        .collect();
 
     rsx! {
-        div { class: "max-w-6xl mx-auto px-4 py-8",
+        div { class: "max-w-7xl mx-auto px-4 py-8",
             // Header
             div { class: "flex items-center justify-between mb-8",
                 div {
@@ -102,12 +97,27 @@ pub(crate) fn ResultsPage(
                 }
             }
 
-            // Per-segment table
-            SegmentTable {
-                segments: results.segments.clone(),
-                player_names: results.player_names,
-                lobby_median_mmr,
-                player_average_mmrs,
+            if let Some(progress) = timeline_progress {
+                AnalysisTimeline { progress }
+            }
+        }
+    }
+}
+
+/// Warning triangle used to frame the smurf suspect illustration (`alert` — car — `alert`).
+#[component]
+fn LobbyAlertTriangleIcon() -> Element {
+    rsx! {
+        svg {
+            class: "w-9 h-9 sm:w-10 sm:h-10 text-red-500 shrink-0 drop-shadow-md",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.5",
+            view_box: "0 0 24 24",
+            path {
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                d: "M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z",
             }
         }
     }
@@ -156,25 +166,27 @@ fn TeamSummaryCard(
                     }
                 }
             }
-            // Player rows
+            // Player rows: name (left), smurf callout centered between name and rank icon (right).
             div { class: "divide-y divide-gray-800",
                 for player in &players {
-                    div { class: "px-6 py-4 flex items-center justify-between",
-                        div {
-                            div { class: "flex items-center gap-2 flex-wrap",
-                                p { class: "font-semibold text-gray-100", "{player.name}" }
-                                if player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr) {
-                                    img {
-                                        src: SMURF_SUSPECT_BADGE,
-                                        alt: "Predicted MMR much higher than lobby median",
-                                        title: "Predicted MMR is more than 200 above the lobby median (approximate)",
-                                        class: "w-9 h-9 object-contain shrink-0",
-                                    }
-                                }
-                            }
+                    div { class: "px-6 py-4 flex items-center gap-3 min-h-[5.5rem]",
+                        div { class: "min-w-0 flex-1 flex flex-col justify-center gap-1",
+                            p { class: "font-semibold text-gray-100 break-words", "{player.name}" }
                             p { class: "text-sm text-gray-500", "{player.rank}" }
                         }
-                        div { class: "text-right flex flex-col items-end gap-1",
+                        if player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr) {
+                            div { class: "flex shrink-0 items-center justify-center gap-2 sm:gap-3",
+                                LobbyAlertTriangleIcon {}
+                                img {
+                                    src: SMURF_SUSPECT_BADGE,
+                                    alt: "Predicted MMR much higher than lobby median",
+                                    title: "Predicted MMR is more than 200 above the lobby median (approximate)",
+                                    class: "h-14 w-auto max-w-[5rem] sm:h-[4.5rem] sm:max-w-[6rem] object-contain",
+                                }
+                                LobbyAlertTriangleIcon {}
+                            }
+                        }
+                        div { class: "shrink-0 flex flex-col items-end justify-center gap-1",
                             {
                                 let mmr_tooltip = format!("Approximate MMR: {:.0}", player.average_mmr);
                                 rsx! {
@@ -183,157 +195,6 @@ fn TeamSummaryCard(
                                         alt: format!("{}", player.rank),
                                         title: mmr_tooltip,
                                         class: "w-12 h-12 object-contain drop-shadow-md",
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Table showing per-segment predictions for all players.
-#[component]
-fn SegmentTable(
-    segments: Vec<SegmentDisplayData>,
-    player_names: Vec<String>,
-    lobby_median_mmr: f32,
-    player_average_mmrs: Vec<f32>,
-) -> Element {
-    if segments.is_empty() {
-        return rsx! {
-            p { class: "text-gray-500 text-center py-8", "No segments available." }
-        };
-    }
-
-    rsx! {
-        div { class: "bg-gray-900 rounded-xl border border-gray-800 overflow-hidden",
-            div { class: "px-6 py-4 border-b border-gray-800",
-                h2 { class: "text-xl font-bold text-gray-100", "Predictions per segment" }
-                p { class: "text-gray-500 text-sm mt-1",
-                    "Predicted competitive rank for each player in each time segment (hover for approximate MMR)"
-                }
-            }
-
-            div { class: "overflow-x-auto",
-                table { class: "w-full text-sm",
-                    thead {
-                        tr { class: "bg-gray-800/50",
-                            th { class: "px-4 py-3 text-left text-gray-400 font-medium", "Segment" }
-                            th { class: "px-4 py-3 text-left text-gray-400 font-medium", "Time" }
-                            // Blue team headers
-                            for (player_index, name) in player_names.iter().enumerate().take(3) {
-                                {
-                                    let average_mmr = player_average_mmrs
-                                        .get(player_index)
-                                        .copied()
-                                        .unwrap_or(0.0);
-                                    let show_smurf =
-                                        player_looks_high_for_lobby(average_mmr, lobby_median_mmr);
-                                    rsx! {
-                                        th {
-                                            key: "header-blue-{player_index}",
-                                            class: "px-4 py-3 text-right text-blue-400 font-medium",
-                                            div { class: "flex items-center justify-end gap-2",
-                                                if show_smurf {
-                                                    img {
-                                                        src: SMURF_SUSPECT_BADGE,
-                                                        alt: "Smurf suspect",
-                                                        title: "Average predicted MMR is more than 200 above the lobby median",
-                                                        class: "w-7 h-7 object-contain shrink-0",
-                                                    }
-                                                }
-                                                span { "{name}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Orange team headers
-                            for (player_index, name) in player_names.iter().enumerate().skip(3).take(3) {
-                                {
-                                    let average_mmr = player_average_mmrs
-                                        .get(player_index)
-                                        .copied()
-                                        .unwrap_or(0.0);
-                                    let show_smurf =
-                                        player_looks_high_for_lobby(average_mmr, lobby_median_mmr);
-                                    rsx! {
-                                        th {
-                                            key: "header-orange-{player_index}",
-                                            class: "px-4 py-3 text-right text-orange-400 font-medium",
-                                            div { class: "flex items-center justify-end gap-2",
-                                                if show_smurf {
-                                                    img {
-                                                        src: SMURF_SUSPECT_BADGE,
-                                                        alt: "Smurf suspect",
-                                                        title: "Average predicted MMR is more than 200 above the lobby median",
-                                                        class: "w-7 h-7 object-contain shrink-0",
-                                                    }
-                                                }
-                                                span { "{name}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    tbody { class: "divide-y divide-gray-800/50",
-                        for segment in &segments {
-                            tr {
-                                key: "seg-{segment.segment_number}",
-                                class: "hover:bg-gray-800/30 transition-colors",
-                                td { class: "px-4 py-3 font-medium text-gray-300",
-                                    "#{segment.segment_number}"
-                                }
-                                td { class: "px-4 py-3 text-gray-500",
-                                    "{segment.start_time:.1}s - {segment.end_time:.1}s"
-                                }
-                                // Blue team values
-                                for player_index in 0..3 {
-                                    {
-                                        let predicted_mmr = segment.player_mmr.get(player_index).copied().unwrap_or(0.0);
-                                        let division = RankDivision::from(predicted_mmr);
-                                        let icon = rank_division_icon_asset(division);
-                                        let rank_label = format!("{division}");
-                                        let mmr_tooltip = format!("Approximate MMR: {predicted_mmr:.0}");
-                                        rsx! {
-                                            td {
-                                                key: "seg-{segment.segment_number}-blue-{player_index}",
-                                                class: "px-4 py-3 text-right text-blue-300",
-                                                img {
-                                                    src: icon,
-                                                    alt: rank_label,
-                                                    title: mmr_tooltip,
-                                                    class: "w-10 h-10 object-contain inline-block align-middle",
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Orange team values
-                                for player_index in 3..TOTAL_PLAYERS {
-                                    {
-                                        let predicted_mmr = segment.player_mmr.get(player_index).copied().unwrap_or(0.0);
-                                        let division = RankDivision::from(predicted_mmr);
-                                        let icon = rank_division_icon_asset(division);
-                                        let rank_label = format!("{division}");
-                                        let mmr_tooltip = format!("Approximate MMR: {predicted_mmr:.0}");
-                                        rsx! {
-                                            td {
-                                                key: "seg-{segment.segment_number}-orange-{player_index}",
-                                                class: "px-4 py-3 text-right text-orange-300",
-                                                img {
-                                                    src: icon,
-                                                    alt: rank_label,
-                                                    title: mmr_tooltip,
-                                                    class: "w-10 h-10 object-contain inline-block align-middle",
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                             }

@@ -31,5 +31,5 @@
         }
     },
     "remoteUser": "root",
-    "postStartCommand": "cd /workspace/crates/database && sqlx migrate run"
+    "postStartCommand": "bash /workspace/.devcontainer/post_start_command.sh"
 }

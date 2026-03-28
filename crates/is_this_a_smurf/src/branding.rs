@@ -22,10 +22,11 @@ pub(crate) const IS_THIS_A_SMURF_HERO: Asset = asset!(
         .with_avif()
 );
 
-const SMURF_BADGE_WIDTH_PX: u32 = 72;
-const SMURF_BADGE_HEIGHT_PX: u32 = 72;
+// Source is 1024×1536 (2:3); keep ratio so the car art is not squashed.
+const SMURF_BADGE_WIDTH_PX: u32 = 320;
+const SMURF_BADGE_HEIGHT_PX: u32 = 480;
 
-/// Small badge when a player is far above the lobby median MMR (`assets/smurf.png`).
+/// Badge when a player is far above the lobby median MMR (`assets/smurf.png`).
 pub(crate) const SMURF_SUSPECT_BADGE: Asset = asset!(
     "/assets/smurf.png",
     AssetOptions::image()

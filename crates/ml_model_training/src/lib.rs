@@ -8,6 +8,9 @@ mod dataset;
 pub mod segment_cache;
 mod training;
 
-pub use checkpoint::{ModelCheckpoint, load_checkpoint, save_checkpoint, save_checkpoint_bin};
+pub use checkpoint::{
+    CheckpointValidationMetrics, ModelCheckpoint, load_checkpoint, save_checkpoint,
+    save_checkpoint_bin,
+};
 pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
 pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};

@@ -56,9 +56,15 @@ pub struct ModelConfig {
     #[config(default = 64)]
     pub feedforward_hidden: usize,
     /// Hidden size for the cross-player interaction MLP.
-    /// This layer sees all 6 players at once and produces the final 6 MMR predictions.
+    /// This layer provides a shared lobby-level calibration offset that is
+    /// *added* to the per-player prediction head output.
     #[config(default = 64)]
     pub cross_player_hidden: usize,
+    /// Hidden size for the per-player prediction head MLP.
+    /// Each player's feedforward representation (ff_hidden) passes through
+    /// this head independently to produce one MMR scalar per player.
+    #[config(default = 32)]
+    pub player_head_hidden: usize,
     /// Dropout rate for regularization.
     #[config(default = 0.2)]
     pub dropout: f64,
@@ -95,18 +101,21 @@ pub struct TrainingConfig {
     pub sequence_length: usize,
 }
 
-/// LSTM-based sequence model with temporal pooling and cross-player interaction.
+/// LSTM-based sequence model with dual-path prediction.
 ///
 /// Architecture:
 /// 1. Per-player LSTM stack processes each player's sequence independently.
 /// 2. Temporal pooling: concatenates last hidden state + mean over sequence.
 /// 3. Per-player feedforward reduces the pooled representation.
-/// 4. Cross-player MLP: sees all 6 players at once, enabling the model to
-///    learn relative skill differences within a match.
+/// 4. **Dual-path prediction**:
+///    a. *Per-player head*: shared-weight MLP applied independently to each
+///    player's representation, producing one MMR scalar per player.
+///    b. *Cross-player context*: MLP that sees all 6 players at once and
+///    outputs a lobby-level calibration offset per player.
+///    The final prediction is the **sum** of both paths, so individual skill
+///    differences are preserved while the lobby range is calibrated.
 ///
-/// The final output is `[batch_size, 6]` with one value per player in **raw MMR units**
-/// (same scale as training targets). Training divides predictions and targets by
-/// [`MMR_SCALE`] only inside the loss; do **not** multiply outputs by `MMR_SCALE` at inference.
+/// The final output is `[batch_size, 6]` MMR predictions.
 #[derive(Module, Debug)]
 pub struct SequenceModel<B: Backend> {
     /// First LSTM layer processes raw frame features.
@@ -118,10 +127,15 @@ pub struct SequenceModel<B: Backend> {
     /// Per-player feedforward: maps temporal pooling output to player representation.
     /// Input size: `lstm2_hidden * 2` (last + mean concatenated).
     player_fc1: Linear<B>,
+    /// Per-player prediction head layer 1: `ff_hidden -> player_head_hidden`.
+    /// Applied independently to each player (shared weights across all 6 slots).
+    player_head_fc: Linear<B>,
+    /// Per-player prediction head output: `player_head_hidden -> 1`.
+    player_head_out: Linear<B>,
     /// Cross-player MLP layer 1: sees all 6 players simultaneously.
     /// Input size: `TOTAL_PLAYERS * feedforward_hidden`.
     cross_fc1: Linear<B>,
-    /// Cross-player MLP layer 2: produces final per-player MMR predictions.
+    /// Cross-player MLP layer 2: produces lobby-level offset per player.
     cross_fc2: Linear<B>,
     /// `ReLU` activation.
     activation: Relu,
@@ -144,7 +158,12 @@ impl<B: Backend> SequenceModel<B> {
         let player_fc1 =
             LinearConfig::new(config.lstm_hidden_2 * 2, config.feedforward_hidden).init(device);
 
-        // Cross-player layers: input is all 6 players' representations flattened.
+        // Per-player prediction head: produces one MMR scalar per player.
+        let player_head_fc =
+            LinearConfig::new(config.feedforward_hidden, config.player_head_hidden).init(device);
+        let player_head_out = LinearConfig::new(config.player_head_hidden, 1).init(device);
+
+        // Cross-player context layers: lobby-level calibration offset.
         let cross_fc1 = LinearConfig::new(
             TOTAL_PLAYERS * config.feedforward_hidden,
             config.cross_player_hidden,
@@ -157,6 +176,8 @@ impl<B: Backend> SequenceModel<B> {
             lstm2,
             dropout,
             player_fc1,
+            player_head_fc,
+            player_head_out,
             cross_fc1,
             cross_fc2,
             activation: Relu::new(),
@@ -206,16 +227,30 @@ impl<B: Backend> SequenceModel<B> {
         let x = self.dropout.forward(x);
         // x: [batch*6, ff_hidden]
 
-        // Cross-player interaction: reshape so that all 6 players from the same
-        // game are in the same row.  This allows the MLP to learn relative skill
-        // differences within a match (e.g., a smurf stands out even in a high-MMR
-        // lobby because their stats contrast with their team-mates).
-        let x = x.reshape([batch_size, TOTAL_PLAYERS * self.ff_hidden]);
+        // --- Dual-path prediction ---
+
+        // Path A: Per-player head (independent per player, shared weights).
+        // Each player's representation directly predicts their individual MMR.
+        // [batch*6, ff_hidden] → [batch*6, player_head_hidden] → [batch*6, 1]
+        let player_pred = self.player_head_fc.forward(x.clone());
+        let player_pred = self.activation.forward(player_pred);
+        let player_pred = self.player_head_out.forward(player_pred);
+        // [batch*6, 1] → [batch, 6]
+        let player_pred = player_pred.reshape([batch_size, TOTAL_PLAYERS]);
+
+        // Path B: Cross-player context (lobby calibration).
+        // Sees all 6 players together and produces a shared offset that
+        // calibrates the prediction range for the lobby.
+        // [batch*6, ff_hidden] → [batch, 6*ff_hidden]
+        let cross_input = x.reshape([batch_size, TOTAL_PLAYERS * self.ff_hidden]);
         // [batch, 6*ff_hidden] → [batch, cross_hidden]
-        let x = self.cross_fc1.forward(x);
-        let x = self.activation.forward(x);
+        let cross_ctx = self.cross_fc1.forward(cross_input);
+        let cross_ctx = self.activation.forward(cross_ctx);
         // [batch, cross_hidden] → [batch, 6]
-        self.cross_fc2.forward(x)
+        let cross_ctx = self.cross_fc2.forward(cross_ctx);
+
+        // Sum: individual skill + lobby context
+        player_pred + cross_ctx
     }
 
     /// Forward pass for inference (dropout disabled in eval mode).

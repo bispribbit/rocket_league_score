@@ -26,7 +26,9 @@ use config::{OBJECT_STORE, get_base_path};
 use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_player_centric_game_sequence};
 use ml_model::{ModelConfig, TrainingConfig, create_model};
 use ml_model_training::segment_cache::{SegmentStore, SegmentStoreBuilder};
-use ml_model_training::{CheckpointConfig, TrainingState, save_checkpoint, train};
+use ml_model_training::{
+    CheckpointConfig, CheckpointValidationMetrics, TrainingState, save_checkpoint, train,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
@@ -334,7 +336,15 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let next_version = database::get_next_model_version(&config.model_name).await?;
     let final_checkpoint_path = format!("{checkpoint_dir}/final_v{next_version}");
 
-    save_checkpoint(&model, &final_checkpoint_path, &training_config)?;
+    let validation_metrics = output
+        .final_valid_loss
+        .map(CheckpointValidationMetrics::from_validation_loss);
+    save_checkpoint(
+        &model,
+        &final_checkpoint_path,
+        &training_config,
+        validation_metrics,
+    )?;
 
     let training_config_json = serde_json::json!({
         "model_type": "lstm_sequence",

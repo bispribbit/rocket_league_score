@@ -32,15 +32,16 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::processing::ProcessingPage;
 use crate::app_state::{
-    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, StepStatus, TimelineTrackState,
+    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, ResultsScreenState,
+    StepStatus, TimelineTrackState,
 };
 use crate::branding::IS_THIS_A_SMURF_HERO;
-use crate::browser_async::{sleep_milliseconds, yield_to_ui};
+use crate::browser_async::{sleep_milliseconds, yield_for_dom_paint, yield_to_ui};
 use crate::embedded_model::{DEFAULT_SEQUENCE_LENGTH, MODEL_BYTES, MODEL_CONFIG};
 use crate::prediction::{
     build_goal_markers, build_prediction_results, compute_segment_boundary_times,
     global_ranks_from_predictions, prepare_players_for_timeline, ranks_from_player_predictions,
-    segment_step_infos,
+    segment_step_infos, smurf_suspect_flags_from_segment_predictions,
 };
 
 /// Burn backend for inference: WGPU on native hosts, pure CPU ndarray on WASM (WGPU checkpoint
@@ -132,7 +133,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             .and_then(|file_list| file_list.get(0));
                         tracing::info!("[replay] onchange: file selected");
 
-                        async move {
+                        spawn(async move {
                             // ---- Step 1: read file bytes via web-sys (no JS eval, no base64) --
                             let Some(file) = file else {
                                 tracing::info!("[replay] no file found on input element");
@@ -141,6 +142,19 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             };
                             let filename = file.name();
                             tracing::info!("[replay] reading file: {}, size: {} bytes", filename, file.size());
+
+                            local_processing.set(Some(LocalProcessing {
+                                filename: filename.clone(),
+                                progress: ProgressState {
+                                    reading_file: StepStatus::Processing,
+                                    copying_into_memory: StepStatus::Pending,
+                                    parsing: StepStatus::Pending,
+                                    loading_model: StepStatus::Pending,
+                                    segments: vec![],
+                                    timeline: None,
+                                },
+                            }));
+                            yield_to_ui().await;
 
                             let array_buffer = match JsFuture::from(file.array_buffer()).await {
                                 Ok(buffer) => buffer,
@@ -152,15 +166,31 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     return;
                                 }
                             };
-                            let uint8_array = js_sys::Uint8Array::new(&array_buffer);
-                            let data: Vec<u8> = uint8_array.to_vec();
-                            tracing::info!("[replay] file read ok, {} bytes", data.len());
-                            tracing::info!("[replay] file read ok, {} bytes", data.len());
 
-                            // ---- Step 2: show progress (local signal, UploadPage stays mounted) ----
+                            // Browser read is done; `to_vec()` is synchronous and can take seconds.
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
                                 progress: ProgressState {
+                                    reading_file: StepStatus::Done("Done".to_string()),
+                                    copying_into_memory: StepStatus::Processing,
+                                    parsing: StepStatus::Pending,
+                                    loading_model: StepStatus::Pending,
+                                    segments: vec![],
+                                    timeline: None,
+                                },
+                            }));
+                            yield_to_ui().await;
+                            yield_for_dom_paint().await;
+
+                            let uint8_array = js_sys::Uint8Array::new(&array_buffer);
+                            let data: Vec<u8> = uint8_array.to_vec();
+                            tracing::info!("[replay] file read ok, {} bytes", data.len());
+
+                            local_processing.set(Some(LocalProcessing {
+                                filename: filename.clone(),
+                                progress: ProgressState {
+                                    reading_file: StepStatus::Done("Done".to_string()),
+                                    copying_into_memory: StepStatus::Done("Done".to_string()),
                                     parsing: StepStatus::Processing,
                                     loading_model: StepStatus::Pending,
                                     segments: vec![],
@@ -168,6 +198,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 },
                             }));
                             yield_to_ui().await;
+                            yield_for_dom_paint().await;
 
                             // ---- Step 3: parse replay ------------------------------------------
                             tracing::info!("[replay] parse_replay_from_bytes starting");
@@ -191,6 +222,8 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
                                 progress: ProgressState {
+                                    reading_file: StepStatus::Done("Done".to_string()),
+                                    copying_into_memory: StepStatus::Done("Done".to_string()),
                                     parsing: StepStatus::Done("Done".to_string()),
                                     loading_model: StepStatus::Processing,
                                     segments: vec![],
@@ -198,6 +231,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 },
                             }));
                             yield_to_ui().await;
+                            yield_for_dom_paint().await;
 
                             // ---- Step 4: load model --------------------------------------------
                             tracing::info!(
@@ -267,6 +301,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     car_at_boundary_index: 0,
                                     num_segments,
                                     global_ranks: None,
+                                    smurf_suspect_by_player: None,
                                 })
                             } else {
                                 None
@@ -274,6 +309,8 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
                                 progress: ProgressState {
+                                    reading_file: StepStatus::Done("Done".to_string()),
+                                    copying_into_memory: StepStatus::Done("Done".to_string()),
                                     parsing: StepStatus::Done("Done".to_string()),
                                     loading_model: StepStatus::Done("Done".to_string()),
                                     segments: segment_steps.clone(),
@@ -281,6 +318,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 },
                             }));
                             yield_to_ui().await;
+                            yield_for_dom_paint().await;
 
                             let mut segment_predictions = Vec::with_capacity(num_segments);
                             for seg_idx in 0..num_segments {
@@ -313,6 +351,8 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 local_processing.set(Some(LocalProcessing {
                                     filename: filename.clone(),
                                     progress: ProgressState {
+                                        reading_file: StepStatus::Done("Done".to_string()),
+                                        copying_into_memory: StepStatus::Done("Done".to_string()),
                                         parsing: StepStatus::Done("Done".to_string()),
                                         loading_model: StepStatus::Done("Done".to_string()),
                                         segments: segment_steps.clone(),
@@ -326,13 +366,18 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             tracing::info!("[replay] all segments done, revealing global ranks");
                             let global_ranks_array =
                                 global_ranks_from_predictions(&segment_predictions);
+                            let smurf_flags =
+                                smurf_suspect_flags_from_segment_predictions(&segment_predictions);
                             if let Some(track) = timeline_snapshot.as_mut() {
                                 track.phase = AnalysisTimelinePhase::RevealingGlobalRanks;
                                 track.global_ranks = Some(global_ranks_array);
+                                track.smurf_suspect_by_player = smurf_flags;
                             }
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
                                 progress: ProgressState {
+                                    reading_file: StepStatus::Done("Done".to_string()),
+                                    copying_into_memory: StepStatus::Done("Done".to_string()),
                                     parsing: StepStatus::Done("Done".to_string()),
                                     loading_model: StepStatus::Done("Done".to_string()),
                                     segments: segment_steps.clone(),
@@ -345,16 +390,47 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             }
 
                             tracing::info!("[replay] building results");
+                            let timeline_progress = timeline_snapshot.is_some().then(|| ProgressState {
+                                reading_file: StepStatus::Done("Done".to_string()),
+                                copying_into_memory: StepStatus::Done("Done".to_string()),
+                                parsing: StepStatus::Done("Done".to_string()),
+                                loading_model: StepStatus::Done("Done".to_string()),
+                                segments: segment_steps.clone(),
+                                timeline: timeline_snapshot.clone(),
+                            });
                             match build_prediction_results(&parsed, segment_predictions) {
                                 Ok(results) => {
-                                    state.set(AppState::ShowingResults(filename, results));
+                                    state.set(AppState::ShowingResults(Box::new(
+                                        ResultsScreenState {
+                                            filename,
+                                            results,
+                                            timeline_progress,
+                                        },
+                                    )));
                                 }
                                 Err(message) => {
                                     state.set(AppState::Error(message));
                                 }
                             }
-                        }
+                        });
                     },
+                }
+            }
+            if cfg!(debug_assertions) {
+                div { class: "w-full max-w-lg flex flex-col items-center gap-2",
+                    p { class: "text-xs uppercase tracking-wide text-gray-600", "Debug" }
+                    button {
+                        r#type: "button",
+                        class: "rounded-lg border border-dashed border-gray-600 bg-gray-900/40 px-4 py-2 text-sm text-gray-400 hover:border-amber-500/50 hover:text-amber-200/90 transition-colors",
+                        onclick: move |_| {
+                            state.set(AppState::ShowingResults(Box::new(ResultsScreenState {
+                                filename: crate::sample_preview::sample_replay_display_name(),
+                                results: crate::sample_preview::prediction_results_with_obvious_smurf(),
+                                timeline_progress: None,
+                            })));
+                        },
+                        "Show sample results (includes a smurf flag)"
+                    }
                 }
             }
         }

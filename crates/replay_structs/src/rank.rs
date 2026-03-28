@@ -558,11 +558,11 @@ impl RankDivision {
             // Champion III
             Self::ChampionIIIDivision1 => 1333,
             Self::ChampionIIIDivision2 => 1366,
-            Self::ChampionIIIDivision3 => 1393,
+            Self::ChampionIIIDivision3 => 1401,
             Self::ChampionIIIDivision4 => 1419,
             // Grand Champion I
             Self::GrandChampionIDivision1 => 1458,
-            Self::GrandChampionIDivision2 => 1485,
+            Self::GrandChampionIDivision2 => 1497,
             Self::GrandChampionIDivision3 => 1535,
             Self::GrandChampionIDivision4 => 1561,
             // Grand Champion II
@@ -1317,45 +1317,45 @@ impl From<crate::RankInfo> for RankDivision {
 impl From<i32> for RankDivision {
     /// Converts an MMR value to the corresponding `RankDivision`.
     ///
-    /// Iterates through all ranks and finds the one where the MMR falls
-    /// within the `mmr_min` to `mmr_max` range.
+    /// Uses each division's `mmr_min` and `mmr_max`. When the published tables leave a gap
+    /// between one division's maximum and the next division's minimum, the MMR is mapped to the
+    /// lower division so [`RankDivision::from`] does not jump backward for increasing MMR.
     ///
     /// # Returns
     ///
-    /// - If MMR is below the minimum, returns `BronzeIDivision1`
-    /// - If MMR is above the maximum, returns `SupersonicLegend`
-    /// - Otherwise returns the matching rank division
+    /// - If MMR is below the minimum for Bronze I Division 1, returns `BronzeIDivision1`
+    /// - If MMR is above the maximum for Supersonic Legend, returns `SupersonicLegend`
+    /// - Otherwise returns the matching rank division, or the last division passed when in a gap
     fn from(mmr: i32) -> Self {
-        for rank in Self::iter() {
-            if mmr >= rank.mmr_min() && mmr <= rank.mmr_max() {
-                return rank;
-            }
-        }
-
-        // If no exact match found, handle edge cases
         if mmr < Self::BronzeIDivision1.mmr_min() {
             return Self::BronzeIDivision1;
         }
 
-        if mmr > Self::SupersonicLegend.mmr_max() {
-            return Self::SupersonicLegend;
+        let mut chosen = Self::BronzeIDivision1;
+
+        for rank in Self::iter() {
+            let rank_min = rank.mmr_min();
+            let rank_max = rank.mmr_max();
+
+            if mmr < rank_min {
+                return chosen;
+            }
+
+            if mmr <= rank_max {
+                return rank;
+            }
+
+            chosen = rank;
         }
 
-        Self::BronzeIDivision1
+        chosen
     }
 }
 
 impl From<f32> for RankDivision {
     /// Converts an MMR value to the corresponding `RankDivision`.
     ///
-    /// Iterates through all ranks and finds the one where the MMR falls
-    /// within the `mmr_min` to `mmr_max` range.
-    ///
-    /// # Returns
-    ///
-    /// - If MMR is below the minimum, returns `BronzeIDivision1`
-    /// - If MMR is above the maximum, returns `SupersonicLegend`
-    /// - Otherwise returns the matching rank division
+    /// Same rules as `From<i32>` for `RankDivision`.
     fn from(mmr: f32) -> Self {
         let mmr = mmr as i32;
         Self::from(mmr)
@@ -1727,5 +1727,34 @@ mod tests {
             Rank::from_numeric_index_saturating(100),
             Rank::GrandChampion
         );
+    }
+
+    #[test]
+    fn test_rank_divison_from_mmr() {
+        assert_eq!(RankDivision::from(0), RankDivision::BronzeIDivision1);
+        assert_eq!(RankDivision::from(1395), RankDivision::ChampionIIIDivision3);
+
+        assert_eq!(
+            RankDivision::from(1489),
+            RankDivision::GrandChampionIDivision2
+        );
+        assert_eq!(RankDivision::from(1900), RankDivision::SupersonicLegend);
+        assert_eq!(RankDivision::from(2000), RankDivision::SupersonicLegend);
+
+        // Test edge cases: below minimum
+        assert_eq!(RankDivision::from(-100), RankDivision::BronzeIDivision1);
+    }
+
+    #[test]
+    fn test_rank_division_from_mmr_monotonic_through_full_range() {
+        let mut previous = RankDivision::from(0);
+        for mmr in 1..=2000 {
+            let current = RankDivision::from(mmr);
+            assert!(
+                current >= previous,
+                "MMR {mmr}: expected rank >= previous rank ({previous:?}); got {current:?}"
+            );
+            previous = current;
+        }
     }
 }

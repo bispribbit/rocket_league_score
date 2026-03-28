@@ -89,11 +89,26 @@ pub(crate) struct TimelineTrackState {
     pub(crate) car_at_boundary_index: usize,
     pub(crate) num_segments: usize,
     pub(crate) global_ranks: Option<[RankDivision; TOTAL_PLAYERS]>,
+    /// Filled when global ranks are revealed; same rule as the results team cards.
+    pub(crate) smurf_suspect_by_player: Option<[bool; TOTAL_PLAYERS]>,
+}
+
+/// View shown after analysis completes: summary cards and optional frozen match timeline.
+#[derive(Debug, Clone)]
+pub(crate) struct ResultsScreenState {
+    pub(crate) filename: String,
+    pub(crate) results: PredictionResults,
+    /// Final pipeline snapshot so the animated timeline (cars, segment ranks, global column) can stay on screen.
+    pub(crate) timeline_progress: Option<ProgressState>,
 }
 
 /// Live progress during analysis (parsing, model load, segments).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProgressState {
+    /// Reading file bytes from the browser file API (can take a moment for large replays).
+    pub(crate) reading_file: StepStatus,
+    /// Copying the `ArrayBuffer` into a Rust `Vec` (synchronous; often the slowest step after the browser read).
+    pub(crate) copying_into_memory: StepStatus,
     pub(crate) parsing: StepStatus,
     pub(crate) loading_model: StepStatus,
     pub(crate) segments: Vec<SegmentStepInfo>,
@@ -108,8 +123,8 @@ pub(crate) enum AppState {
     /// happens while in this state, with progress shown via a local signal
     /// inside `UploadPage`).
     WaitingForUpload,
-    /// Displaying prediction results (filename, predictions).
-    ShowingResults(String, PredictionResults),
+    /// Displaying prediction results (filename, predictions, optional frozen timeline).
+    ShowingResults(Box<ResultsScreenState>),
     /// An error occurred (error message).
     Error(String),
 }

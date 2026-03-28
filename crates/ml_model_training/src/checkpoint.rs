@@ -7,8 +7,58 @@ use burn::module::Module;
 use burn::prelude::*;
 use burn::record::FullPrecisionSettings;
 use burn::record::NamedMpkFileRecorder;
+use serde_json::json;
 
-use ml_model::{ModelConfig, SequenceModel, TrainingConfig};
+use ml_model::{MMR_SCALE, ModelConfig, SequenceModel, TrainingConfig};
+
+/// Validation metrics merged into the checkpoint `.config.json`.
+///
+/// Records Huber loss on normalized targets and an approximate RMSE in MMR units
+/// (`sqrt(loss) * MMR_SCALE`; exact only in the quadratic Huber regime).
+#[derive(Debug, Clone)]
+pub struct CheckpointValidationMetrics {
+    /// Huber loss on normalized `[0, 1]` targets at save time.
+    pub validation_loss: f64,
+    /// Approximate root mean squared error in MMR units for the same loss.
+    pub validation_approx_rmse_mmr: f64,
+}
+
+impl CheckpointValidationMetrics {
+    /// Builds metrics from the validation loss value used during training.
+    #[must_use]
+    pub fn from_validation_loss(validation_loss: f32) -> Self {
+        Self {
+            validation_loss: f64::from(validation_loss),
+            validation_approx_rmse_mmr: f64::from(validation_loss.sqrt() * MMR_SCALE),
+        }
+    }
+}
+
+fn merge_validation_metrics_into_config_json(
+    config_path: &str,
+    metrics: &CheckpointValidationMetrics,
+) -> anyhow::Result<()> {
+    let json_string = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("Failed to read config JSON: {error}"))?;
+    let mut value: serde_json::Value = serde_json::from_str(&json_string)
+        .map_err(|error| anyhow::anyhow!("Failed to parse config JSON: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Config JSON root must be an object"))?;
+    object.insert(
+        "validation_loss".to_string(),
+        json!(metrics.validation_loss),
+    );
+    object.insert(
+        "validation_approx_rmse_mmr".to_string(),
+        json!(metrics.validation_approx_rmse_mmr),
+    );
+    let merged = serde_json::to_string_pretty(&value)
+        .map_err(|error| anyhow::anyhow!("Failed to serialize merged config JSON: {error}"))?;
+    std::fs::write(config_path, merged)
+        .map_err(|error| anyhow::anyhow!("Failed to write config JSON: {error}"))?;
+    Ok(())
+}
 
 /// Reference to a saved model checkpoint.
 #[derive(Debug, Clone)]
@@ -30,6 +80,7 @@ pub fn save_checkpoint<B: Backend>(
     model: &SequenceModel<B>,
     path: &str,
     config: &TrainingConfig,
+    validation_metrics: Option<CheckpointValidationMetrics>,
 ) -> anyhow::Result<ModelCheckpoint> {
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -45,6 +96,9 @@ pub fn save_checkpoint<B: Backend>(
     config
         .save(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to save config: {e}"))?;
+    if let Some(metrics) = validation_metrics.as_ref() {
+        merge_validation_metrics_into_config_json(&config_path, metrics)?;
+    }
 
     Ok(ModelCheckpoint {
         path: path.to_string(),
