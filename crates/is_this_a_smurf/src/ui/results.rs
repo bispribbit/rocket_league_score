@@ -1,14 +1,13 @@
 //! Results tables and error view.
 
 use dioxus::prelude::*;
+use feature_extractor::TOTAL_PLAYERS;
 use replay_structs::Team;
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;
 use crate::prediction::SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN;
 use crate::rank_icon::rank_division_icon_asset;
-
-use super::processing::AnalysisTimeline;
 
 fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
     let mut values: Vec<f32> = player_averages
@@ -33,16 +32,9 @@ fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
     player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
 }
 
-/// Results page with team summary cards and the same match timeline as the processing screen.
+/// Blue and orange team summary cards for a completed prediction.
 #[component]
-pub(crate) fn ResultsPage(
-    filename: String,
-    results: PredictionResults,
-    timeline_progress: Option<ProgressState>,
-    state: Signal<AppState>,
-) -> Element {
-    let mut state = state;
-
+pub(crate) fn PlayerSummaryGrid(results: PredictionResults) -> Element {
     let blue_players: Vec<PlayerAverage> = results
         .player_averages
         .iter()
@@ -59,46 +51,89 @@ pub(crate) fn ResultsPage(
     let lobby_median_mmr = lobby_median_average_mmr(&results.player_averages);
 
     rsx! {
-        div { class: "max-w-7xl mx-auto px-4 py-8",
-            // Header
-            div { class: "flex items-center justify-between mb-8",
-                div {
-                    h1 { class: "text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-orange-400",
-                        "Replay estimates"
-                    }
-                    p { class: "text-gray-400 mt-1",
-                        "{filename} — {results.segments.len()} segment(s)"
-                    }
-                }
-                button {
-                    class: "px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg transition-colors",
-                    onclick: move |_| {
-                        state.set(AppState::WaitingForUpload);
-                    },
-                    "Analyze another replay"
-                }
+        div { class: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-10",
+            TeamSummaryCard {
+                team_name: "Blue Team",
+                team_color: "blue",
+                loading: false,
+                players_complete: blue_players,
+                player_names_loading: vec![],
+                lobby_median_mmr,
             }
+            TeamSummaryCard {
+                team_name: "Orange Team",
+                team_color: "orange",
+                loading: false,
+                players_complete: orange_players,
+                player_names_loading: vec![],
+                lobby_median_mmr,
+            }
+        }
+    }
+}
 
-            // Summary tables - Blue and Orange side by side
+/// Same layout as [`PlayerSummaryGrid`], but team averages and rank icons stay hidden until results exist.
+#[component]
+pub(crate) fn PlayerSummaryGridLoading(progress: ProgressState) -> Element {
+    let Some(track) = progress.timeline.as_ref() else {
+        return rsx! {
             div { class: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-10",
-                // Blue team summary
                 TeamSummaryCard {
                     team_name: "Blue Team",
                     team_color: "blue",
-                    players: blue_players,
-                    lobby_median_mmr,
+                    loading: true,
+                    players_complete: vec![],
+                    player_names_loading: vec![],
+                    lobby_median_mmr: 0.0,
                 }
-                // Orange team summary
                 TeamSummaryCard {
                     team_name: "Orange Team",
                     team_color: "orange",
-                    players: orange_players,
-                    lobby_median_mmr,
+                    loading: true,
+                    players_complete: vec![],
+                    player_names_loading: vec![],
+                    lobby_median_mmr: 0.0,
                 }
             }
+        };
+    };
 
-            if let Some(progress) = timeline_progress {
-                AnalysisTimeline { progress }
+    let mut blue_names: Vec<String> = Vec::new();
+    let mut orange_names: Vec<String> = Vec::new();
+    for player_lane_index in 0..TOTAL_PLAYERS {
+        let player_name = track
+            .player_names
+            .get(player_lane_index)
+            .cloned()
+            .unwrap_or_else(|| format!("Player {}", player_lane_index + 1));
+        match track
+            .player_teams
+            .get(player_lane_index)
+            .copied()
+            .unwrap_or(Team::Blue)
+        {
+            Team::Blue => blue_names.push(player_name),
+            Team::Orange => orange_names.push(player_name),
+        }
+    }
+
+    rsx! {
+        div { class: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-10",
+            TeamSummaryCard {
+                team_name: "Blue Team",
+                team_color: "blue",
+                loading: true,
+                players_complete: vec![],
+                player_names_loading: blue_names,
+                lobby_median_mmr: 0.0,
+            }
+            TeamSummaryCard {
+                team_name: "Orange Team",
+                team_color: "orange",
+                loading: true,
+                players_complete: vec![],
+                player_names_loading: orange_names,
+                lobby_median_mmr: 0.0,
             }
         }
     }
@@ -128,7 +163,9 @@ fn LobbyAlertTriangleIcon() -> Element {
 fn TeamSummaryCard(
     team_name: String,
     team_color: String,
-    players: Vec<PlayerAverage>,
+    loading: bool,
+    players_complete: Vec<PlayerAverage>,
+    player_names_loading: Vec<String>,
     lobby_median_mmr: f32,
 ) -> Element {
     let border_color = if team_color == "blue" {
@@ -147,55 +184,67 @@ fn TeamSummaryCard(
         "text-orange-400"
     };
 
-    // Team average MMR
-    let team_average_mmr = if players.is_empty() {
+    let _team_average_mmr = if players_complete.is_empty() {
         0.0
     } else {
-        players.iter().map(|player| player.average_mmr).sum::<f32>() / players.len() as f32
+        players_complete
+            .iter()
+            .map(|player| player.average_mmr)
+            .sum::<f32>()
+            / players_complete.len() as f32
     };
 
     rsx! {
         div { class: "bg-gray-900 rounded-xl border {border_color} overflow-hidden",
-            // Header
             div { class: "bg-gradient-to-r {header_gradient} px-6 py-4",
-                div { class: "flex items-center justify-between",
+                div { class: "flex items-center justify-between gap-3",
                     h2 { class: "text-xl font-bold {text_accent}", "{team_name}" }
-                    span { class: "text-gray-400 text-sm",
-                        "Average: "
-                        span { class: "font-semibold text-gray-200", "{team_average_mmr:.0}" }
+                    if loading {
+                        span { class: "text-gray-500 text-sm font-medium", "Calculating…" }
+                    } else {
+                        span { "Predicted rank"
+                        }
                     }
                 }
             }
-            // Player rows: name (left), smurf callout centered between name and rank icon (right).
             div { class: "divide-y divide-gray-800",
-                for player in &players {
-                    div { class: "px-6 py-4 flex items-center gap-3 min-h-[5.5rem]",
-                        div { class: "min-w-0 flex-1 flex flex-col justify-center gap-1",
-                            p { class: "font-semibold text-gray-100 break-words", "{player.name}" }
-                            p { class: "text-sm text-gray-500", "{player.rank}" }
+                if loading {
+                    if player_names_loading.is_empty() {
+                        p { class: "px-6 py-6 text-sm text-gray-500 text-center",
+                            "Waiting for replay data…"
                         }
-                        if player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr) {
-                            div { class: "flex shrink-0 items-center justify-center gap-2 sm:gap-3",
-                                LobbyAlertTriangleIcon {}
-                                img {
-                                    src: SMURF_SUSPECT_BADGE,
-                                    alt: "Predicted MMR much higher than lobby median",
-                                    title: "Predicted MMR is more than 200 above the lobby median (approximate)",
-                                    class: "h-14 w-auto max-w-[5rem] sm:h-[4.5rem] sm:max-w-[6rem] object-contain",
-                                }
-                                LobbyAlertTriangleIcon {}
+                    } else {
+                        for name in player_names_loading {
+                            div { class: "px-6 py-4 flex items-center min-h-[5.5rem]",
+                                p { class: "font-semibold text-gray-100 break-words", "{name}" }
                             }
                         }
-                        div { class: "shrink-0 flex flex-col items-end justify-center gap-1",
-                            {
-                                let mmr_tooltip = format!("Approximate MMR: {:.0}", player.average_mmr);
-                                rsx! {
+                    }
+                } else {
+                    for player in &players_complete {
+                        div { class: "px-6 py-4 flex items-center gap-3 min-h-[5.5rem]",
+                            div { class: "min-w-0 flex-1 flex flex-col justify-center gap-1",
+                                p { class: "font-semibold text-gray-100 break-words", "{player.name}" }
+                                p { class: "text-sm text-gray-500", "{player.rank}" }
+                            }
+                            if player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr) {
+                                div { class: "flex shrink-0 items-center justify-center gap-2 sm:gap-3",
+                                    LobbyAlertTriangleIcon {}
                                     img {
-                                        src: rank_division_icon_asset(player.rank),
-                                        alt: format!("{}", player.rank),
-                                        title: mmr_tooltip,
-                                        class: "w-12 h-12 object-contain drop-shadow-md",
+                                        src: SMURF_SUSPECT_BADGE,
+                                        alt: "Predicted rank is much higher than lobby",
+                                        title: "Predicted rank is much higher than lobby",
+                                        class: "h-14 w-auto max-w-[5rem] sm:h-[4.5rem] sm:max-w-[6rem] object-contain",
                                     }
+                                    LobbyAlertTriangleIcon {}
+                                }
+                            }
+                            div { class: "shrink-0 flex flex-col items-end justify-center gap-1",
+                                img {
+                                    src: rank_division_icon_asset(player.rank),
+                                    alt: "",
+                                    title: player.rank.to_string(),
+                                    class: "block w-12 h-11 object-contain drop-shadow-md",
                                 }
                             }
                         }

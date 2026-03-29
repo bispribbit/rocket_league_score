@@ -2,9 +2,10 @@
 
 use dioxus::prelude::*;
 
-use crate::app_state::{AppState, ResultsScreenState};
+use crate::app_state::AppState;
+use crate::branding::SMURF_SUSPECT_BADGE;
 
-use super::results::{ErrorPage, ResultsPage};
+use super::results::ErrorPage;
 use super::upload::UploadPage;
 
 /// Root application component.
@@ -15,26 +16,16 @@ pub(crate) fn App() -> Element {
 
     rsx! {
         document::Stylesheet { href: asset!("/assets/tailwind.css") }
+        document::Link {
+            rel: "icon",
+            r#type: Some("image/png".to_string()),
+            href: Some(SMURF_SUSPECT_BADGE.into()),
+        }
 
         div { class: "min-h-screen bg-gray-950 text-gray-100",
             match state() {
                 AppState::WaitingForUpload => rsx! {
                     UploadPage { state }
-                },
-                AppState::ShowingResults(screen) => {
-                    let ResultsScreenState {
-                        filename,
-                        results,
-                        timeline_progress,
-                    } = *screen;
-                    rsx! {
-                        ResultsPage {
-                            filename,
-                            results,
-                            timeline_progress,
-                            state,
-                        }
-                    }
                 },
                 AppState::Error(message) => rsx! {
                     ErrorPage { message, state }

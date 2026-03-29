@@ -30,18 +30,18 @@ use replay_parser::parse_replay_from_bytes;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-use super::processing::ProcessingPage;
+use super::processing::{AnalysisTimeline, EarlyWorkingPanel};
+use super::results::{PlayerSummaryGrid, PlayerSummaryGridLoading};
 use crate::app_state::{
-    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, ResultsScreenState,
-    StepStatus, TimelineTrackState,
+    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, StepStatus, TimelineTrackState,
 };
 use crate::branding::IS_THIS_A_SMURF_HERO;
 use crate::browser_async::{sleep_milliseconds, yield_for_dom_paint, yield_to_ui};
-use crate::embedded_model::{DEFAULT_SEQUENCE_LENGTH, MODEL_BYTES, MODEL_CONFIG};
+use crate::embedded_model::{MODEL_BYTES, MODEL_CONFIG, sequence_length_from_embedded_config};
 use crate::prediction::{
     build_goal_markers, build_prediction_results, compute_segment_boundary_times,
     global_ranks_from_predictions, prepare_players_for_timeline, ranks_from_player_predictions,
-    segment_step_infos, smurf_suspect_flags_from_segment_predictions,
+    segment_step_infos,
 };
 
 /// Burn backend for inference: WGPU on native hosts, pure CPU ndarray on WASM (WGPU checkpoint
@@ -58,20 +58,64 @@ type InferenceDevice = WgpuDevice;
 
 /// Upload page with a centered drag-and-drop area.
 ///
-/// Processing runs as a future on **this** component's scope. We avoid
-/// changing `AppState` until we have the final results, which keeps
-/// `UploadPage` mounted and prevents the future from being cancelled.
+/// Processing runs as a future on **this** component's scope. On success we
+/// keep `AppState::WaitingForUpload` and store the outcome in
+/// [`LocalProcessing`] so the timeline and summary stay on one screen without
+/// routing. Errors still use [`AppState::Error`].
 #[component]
 pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
     let mut state = state;
     let mut local_processing = use_signal(|| None::<LocalProcessing>);
 
-    // If we are processing, render the progress page from here.
-    if let Some(processing) = local_processing() {
+    if let Some(LocalProcessing {
+        filename,
+        progress,
+        results,
+    }) = local_processing()
+    {
+        let show_timeline = progress.timeline.is_some();
+        let segment_label = results.as_ref().map(|prediction_results| {
+            format!(
+                "{} — {} segment(s)",
+                filename,
+                prediction_results.segments.len()
+            )
+        });
         return rsx! {
-            ProcessingPage {
-                filename: processing.filename,
-                progress: processing.progress,
+            div { class: "flex flex-col min-h-screen w-full bg-gray-950 text-gray-100",
+                div { class: "max-w-7xl mx-auto px-4 py-8 w-full flex flex-col gap-8",
+                    div { class: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4",
+                        div {
+                            h1 { class: "text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-orange-400",
+                                "Replay estimates"
+                            }
+                            if let Some(label) = segment_label.as_ref() {
+                                p { class: "text-gray-400 mt-1", "{label}" }
+                            } else {
+                                p { class: "text-gray-400 mt-1", "{filename} — analyzing…" }
+                            }
+                        }
+                        if results.is_some() {
+                            button {
+                                class: "px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg transition-colors self-start sm:self-center shrink-0",
+                                onclick: move |_| {
+                                    local_processing.set(None);
+                                },
+                                "Analyze another replay"
+                            }
+                        }
+                    }
+                    if show_timeline {
+                        AnalysisTimeline { progress: progress.clone() }
+                    } else {
+                        EarlyWorkingPanel { progress: progress.clone() }
+                    }
+                    if let Some(prediction_results) = results {
+                        PlayerSummaryGrid { results: prediction_results }
+                    } else {
+                        PlayerSummaryGridLoading { progress }
+                    }
+                }
             }
         };
     }
@@ -153,6 +197,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     segments: vec![],
                                     timeline: None,
                                 },
+                                results: None,
                             }));
                             yield_to_ui().await;
 
@@ -178,6 +223,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     segments: vec![],
                                     timeline: None,
                                 },
+                                results: None,
                             }));
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
@@ -196,6 +242,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     segments: vec![],
                                     timeline: None,
                                 },
+                                results: None,
                             }));
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
@@ -219,6 +266,35 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 ));
                                 return;
                             }
+                            let sequence_length = sequence_length_from_embedded_config();
+                            let extracted = ExtractedSegmentFeatures::from_frames(&parsed.frames);
+                            let num_segments = extracted.segment_count(sequence_length);
+                            let mut segment_steps =
+                                segment_step_infos(&parsed.frames, sequence_length, num_segments);
+                            let (timeline_player_names, timeline_player_teams) =
+                                prepare_players_for_timeline(&parsed);
+                            let goal_markers = build_goal_markers(&parsed, &timeline_player_names);
+                            let match_duration_seconds = parsed
+                                .frames
+                                .last()
+                                .map_or(1.0_f32, |frame| frame.time)
+                                .max(0.001);
+                            let boundary_times_seconds =
+                                compute_segment_boundary_times(&segment_steps);
+                            let mut timeline_snapshot = if num_segments > 0 {
+                                Some(TimelineTrackState {
+                                    match_duration_seconds,
+                                    boundary_times_seconds,
+                                    goals: goal_markers,
+                                    player_names: timeline_player_names,
+                                    player_teams: timeline_player_teams,
+                                    phase: AnalysisTimelinePhase::InferenceInProgress,
+                                    num_segments,
+                                    global_ranks: None,
+                                })
+                            } else {
+                                None
+                            };
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
                                 progress: ProgressState {
@@ -226,9 +302,10 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     copying_into_memory: StepStatus::Done("Done".to_string()),
                                     parsing: StepStatus::Done("Done".to_string()),
                                     loading_model: StepStatus::Processing,
-                                    segments: vec![],
-                                    timeline: None,
+                                    segments: segment_steps.clone(),
+                                    timeline: timeline_snapshot.clone(),
                                 },
+                                results: None,
                             }));
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
@@ -258,54 +335,12 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     return;
                                 }
                             };
-                            let sequence_length = if MODEL_CONFIG.is_empty() {
-                                DEFAULT_SEQUENCE_LENGTH
-                            } else {
-                                serde_json::from_str::<serde_json::Value>(MODEL_CONFIG)
-                                    .ok()
-                                    .and_then(|config_value| {
-                                        config_value.get("sequence_length")?.as_u64()
-                                    })
-                                    .map_or(DEFAULT_SEQUENCE_LENGTH, |length_value| {
-                                        length_value as usize
-                                    })
-                            };
 
-                            // ---- Step 5: extract features & run inference per segment -----------
-                            let extracted = ExtractedSegmentFeatures::from_frames(&parsed.frames);
-                            let num_segments = extracted.segment_count(sequence_length);
+                            // ---- Step 5: run inference per segment ------------------------------
                             tracing::info!("[replay] {} segments, starting inference", num_segments);
-                            let mut segment_steps =
-                                segment_step_infos(&parsed.frames, sequence_length, num_segments);
                             if let Some(first_segment_step) = segment_steps.first_mut() {
                                 first_segment_step.status = StepStatus::Processing;
                             }
-                            let (timeline_player_names, timeline_player_teams) =
-                                prepare_players_for_timeline(&parsed);
-                            let goal_markers = build_goal_markers(&parsed, &timeline_player_names);
-                            let match_duration_seconds = parsed
-                                .frames
-                                .last()
-                                .map_or(1.0_f32, |frame| frame.time)
-                                .max(0.001);
-                            let boundary_times_seconds =
-                                compute_segment_boundary_times(&segment_steps);
-                            let mut timeline_snapshot = if num_segments > 0 {
-                                Some(TimelineTrackState {
-                                    match_duration_seconds,
-                                    boundary_times_seconds,
-                                    goals: goal_markers,
-                                    player_names: timeline_player_names,
-                                    player_teams: timeline_player_teams,
-                                    phase: AnalysisTimelinePhase::InferenceInProgress,
-                                    car_at_boundary_index: 0,
-                                    num_segments,
-                                    global_ranks: None,
-                                    smurf_suspect_by_player: None,
-                                })
-                            } else {
-                                None
-                            };
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
                                 progress: ProgressState {
@@ -316,6 +351,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     segments: segment_steps.clone(),
                                     timeline: timeline_snapshot.clone(),
                                 },
+                                results: None,
                             }));
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
@@ -344,10 +380,6 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 if let Some(next_step) = segment_steps.get_mut(seg_idx + 1) {
                                     next_step.status = StepStatus::Processing;
                                 }
-                                if let Some(track) = timeline_snapshot.as_mut() {
-                                    track.car_at_boundary_index = seg_idx + 1;
-                                    track.phase = AnalysisTimelinePhase::InferenceInProgress;
-                                }
                                 local_processing.set(Some(LocalProcessing {
                                     filename: filename.clone(),
                                     progress: ProgressState {
@@ -358,6 +390,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                         segments: segment_steps.clone(),
                                         timeline: timeline_snapshot.clone(),
                                     },
+                                    results: None,
                                 }));
                                 yield_to_ui().await;
                             }
@@ -366,12 +399,9 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             tracing::info!("[replay] all segments done, revealing global ranks");
                             let global_ranks_array =
                                 global_ranks_from_predictions(&segment_predictions);
-                            let smurf_flags =
-                                smurf_suspect_flags_from_segment_predictions(&segment_predictions);
                             if let Some(track) = timeline_snapshot.as_mut() {
                                 track.phase = AnalysisTimelinePhase::RevealingGlobalRanks;
                                 track.global_ranks = Some(global_ranks_array);
-                                track.smurf_suspect_by_player = smurf_flags;
                             }
                             local_processing.set(Some(LocalProcessing {
                                 filename: filename.clone(),
@@ -383,6 +413,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     segments: segment_steps.clone(),
                                     timeline: timeline_snapshot.clone(),
                                 },
+                                results: None,
                             }));
                             yield_to_ui().await;
                             if timeline_snapshot.is_some() {
@@ -390,23 +421,20 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             }
 
                             tracing::info!("[replay] building results");
-                            let timeline_progress = timeline_snapshot.is_some().then(|| ProgressState {
-                                reading_file: StepStatus::Done("Done".to_string()),
-                                copying_into_memory: StepStatus::Done("Done".to_string()),
-                                parsing: StepStatus::Done("Done".to_string()),
-                                loading_model: StepStatus::Done("Done".to_string()),
-                                segments: segment_steps.clone(),
-                                timeline: timeline_snapshot.clone(),
-                            });
                             match build_prediction_results(&parsed, segment_predictions) {
                                 Ok(results) => {
-                                    state.set(AppState::ShowingResults(Box::new(
-                                        ResultsScreenState {
-                                            filename,
-                                            results,
-                                            timeline_progress,
+                                    local_processing.set(Some(LocalProcessing {
+                                        filename,
+                                        progress: ProgressState {
+                                            reading_file: StepStatus::Done("Done".to_string()),
+                                            copying_into_memory: StepStatus::Done("Done".to_string()),
+                                            parsing: StepStatus::Done("Done".to_string()),
+                                            loading_model: StepStatus::Done("Done".to_string()),
+                                            segments: segment_steps.clone(),
+                                            timeline: timeline_snapshot.clone(),
                                         },
-                                    )));
+                                        results: Some(results),
+                                    }));
                                 }
                                 Err(message) => {
                                     state.set(AppState::Error(message));
@@ -414,23 +442,6 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             }
                         });
                     },
-                }
-            }
-            if cfg!(debug_assertions) {
-                div { class: "w-full max-w-lg flex flex-col items-center gap-2",
-                    p { class: "text-xs uppercase tracking-wide text-gray-600", "Debug" }
-                    button {
-                        r#type: "button",
-                        class: "rounded-lg border border-dashed border-gray-600 bg-gray-900/40 px-4 py-2 text-sm text-gray-400 hover:border-amber-500/50 hover:text-amber-200/90 transition-colors",
-                        onclick: move |_| {
-                            state.set(AppState::ShowingResults(Box::new(ResultsScreenState {
-                                filename: crate::sample_preview::sample_replay_display_name(),
-                                results: crate::sample_preview::prediction_results_with_obvious_smurf(),
-                                timeline_progress: None,
-                            })));
-                        },
-                        "Show sample results (includes a smurf flag)"
-                    }
                 }
             }
         }

@@ -153,59 +153,6 @@ pub(crate) fn format_timeline_boundary_label(seconds: f32) -> String {
     format!("{minutes}:{secs:02}")
 }
 
-fn lobby_median_of_player_average_mmr_values(values: &mut [f32]) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values.get(mid).copied().unwrap_or(0.0)
-    } else {
-        let lower = values.get(mid.saturating_sub(1)).copied().unwrap_or(0.0);
-        let upper = values.get(mid).copied().unwrap_or(0.0);
-        f32::midpoint(lower, upper)
-    }
-}
-
-fn player_average_mmr_per_lane_from_predictions(
-    segment_predictions: &[SegmentPrediction],
-) -> [f32; TOTAL_PLAYERS] {
-    if segment_predictions.is_empty() {
-        return [0.0_f32; TOTAL_PLAYERS];
-    }
-    let segment_count = segment_predictions.len() as f32;
-    std::array::from_fn(|player_index| {
-        let sum_mmr: f32 = segment_predictions
-            .iter()
-            .map(|segment| {
-                segment
-                    .player_predictions
-                    .get(player_index)
-                    .copied()
-                    .unwrap_or(0.0)
-            })
-            .sum();
-        sum_mmr / segment_count
-    })
-}
-
-/// Per-player smurf flags from the same averaging rule as [`global_ranks_from_predictions`].
-pub(crate) fn smurf_suspect_flags_from_segment_predictions(
-    segment_predictions: &[SegmentPrediction],
-) -> Option<[bool; TOTAL_PLAYERS]> {
-    if segment_predictions.is_empty() {
-        return None;
-    }
-    let averages = player_average_mmr_per_lane_from_predictions(segment_predictions);
-    let mut values_for_median: Vec<f32> = averages.to_vec();
-    let lobby_median_mmr = lobby_median_of_player_average_mmr_values(&mut values_for_median);
-    Some(std::array::from_fn(|player_index| {
-        averages.get(player_index).copied().unwrap_or(0.0)
-            > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
-    }))
-}
-
 /// Builds full prediction results from parsed data and segment predictions.
 pub(crate) fn build_prediction_results(
     parsed: &ParsedReplay,

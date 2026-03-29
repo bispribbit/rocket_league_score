@@ -10,7 +10,6 @@ mod browser_async;
 mod embedded_model;
 mod prediction;
 mod rank_icon;
-mod sample_preview;
 mod ui;
 
 use ui::App;

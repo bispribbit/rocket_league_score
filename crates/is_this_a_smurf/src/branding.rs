@@ -4,7 +4,7 @@
 
 #![expect(clippy::volatile_composites)] // from manganis `asset!` macro
 
-use manganis::{Asset, AssetOptions, ImageSize, asset};
+use manganis::{Asset, AssetOptions, ImageFormat, ImageSize, asset};
 
 // Source asset is 1024×1536 (2:3 portrait). Encoding must keep the same aspect ratio or the
 // output looks stretched. 480×720 preserves 2:3.
@@ -19,7 +19,7 @@ pub(crate) const IS_THIS_A_SMURF_HERO: Asset = asset!(
             width: HERO_WIDTH_PX,
             height: HERO_HEIGHT_PX,
         })
-        .with_avif()
+        .with_format(ImageFormat::Png)
 );
 
 // Source is 1024×1536 (2:3); keep ratio so the car art is not squashed.
@@ -34,5 +34,5 @@ pub(crate) const SMURF_SUSPECT_BADGE: Asset = asset!(
             width: SMURF_BADGE_WIDTH_PX,
             height: SMURF_BADGE_HEIGHT_PX,
         })
-        .with_avif()
+        .with_format(ImageFormat::Png)
 );

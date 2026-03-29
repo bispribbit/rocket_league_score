@@ -1,11 +1,11 @@
 //! Static rank tier icons under `assets/ranks` (one image per Roman tier, not per division).
 //!
 //! Icons must be registered with [`asset!`] so the Dioxus CLI copies them into the build output.
-//! Sources are PNG on disk; [`manganis`] encodes them as AVIF at build time for smaller payloads.
+//! Sources are PNG on disk; [`manganis`] resizes at build time and keeps PNG for fast decode in the browser.
 
 #![expect(clippy::volatile_composites)] // from manganis `asset!` macro
 
-use manganis::{Asset, AssetOptions, ImageSize, asset};
+use manganis::{Asset, AssetOptions, ImageFormat, ImageSize, asset};
 use replay_structs::RankDivision;
 
 /// Maximum on-screen size is about 48 CSS pixels; 128 covers roughly 2× density.
@@ -21,7 +21,7 @@ macro_rules! rank_icon_asset {
                     width: RANK_ICON_WIDTH_PX,
                     height: RANK_ICON_HEIGHT_PX,
                 })
-                .with_avif()
+                .with_format(ImageFormat::Png)
         )
     };
 }

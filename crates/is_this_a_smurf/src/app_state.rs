@@ -85,21 +85,8 @@ pub(crate) struct TimelineTrackState {
     pub(crate) player_names: Vec<String>,
     pub(crate) player_teams: Vec<Team>,
     pub(crate) phase: AnalysisTimelinePhase,
-    /// Index into [`TimelineTrackState::boundary_times_seconds`] where cars sit (left edge of current work).
-    pub(crate) car_at_boundary_index: usize,
     pub(crate) num_segments: usize,
     pub(crate) global_ranks: Option<[RankDivision; TOTAL_PLAYERS]>,
-    /// Filled when global ranks are revealed; same rule as the results team cards.
-    pub(crate) smurf_suspect_by_player: Option<[bool; TOTAL_PLAYERS]>,
-}
-
-/// View shown after analysis completes: summary cards and optional frozen match timeline.
-#[derive(Debug, Clone)]
-pub(crate) struct ResultsScreenState {
-    pub(crate) filename: String,
-    pub(crate) results: PredictionResults,
-    /// Final pipeline snapshot so the animated timeline (cars, segment ranks, global column) can stay on screen.
-    pub(crate) timeline_progress: Option<ProgressState>,
 }
 
 /// Live progress during analysis (parsing, model load, segments).
@@ -123,8 +110,6 @@ pub(crate) enum AppState {
     /// happens while in this state, with progress shown via a local signal
     /// inside `UploadPage`).
     WaitingForUpload,
-    /// Displaying prediction results (filename, predictions, optional frozen timeline).
-    ShowingResults(Box<ResultsScreenState>),
     /// An error occurred (error message).
     Error(String),
 }
@@ -137,4 +122,6 @@ pub(crate) struct LocalProcessing {
     pub(crate) filename: String,
     /// Current progress.
     pub(crate) progress: ProgressState,
+    /// Filled when inference completes; keeps the timeline and summary on one screen without routing.
+    pub(crate) results: Option<PredictionResults>,
 }
