@@ -10,6 +10,7 @@ mod model;
 mod rank;
 mod replay;
 mod team;
+mod unsupported_match;
 
 pub use game_mode::*;
 pub use math::*;
@@ -17,6 +18,7 @@ pub use model::*;
 pub use rank::*;
 pub use replay::*;
 pub use team::*;
+pub use unsupported_match::*;
 
 /// Player ID information.
 #[derive(Debug, Clone, Deserialize, Serialize)]

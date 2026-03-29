@@ -60,7 +60,7 @@ pub fn run(replay_path: &Path, model_path: &Path) -> Result<()> {
     let model: SequenceModel<Backend> = load_checkpoint(&model_path.to_string_lossy(), &device)?;
 
     // Parse the replay
-    let parsed = parse_replay(replay_path)?;
+    let parsed = parse_replay(replay_path).map_err(|error| anyhow::anyhow!("{error}"))?;
 
     if parsed.frames.is_empty() {
         warn!("No frames found in replay");

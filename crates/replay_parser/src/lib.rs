@@ -10,7 +10,37 @@ use std::sync::Arc;
 use boxcars::{Attribute, HeaderProp, ParserBuilder, Replay};
 use replay_structs::{
     ActorState, BallState, GameFrame, GoalEvent, ParsedReplay, PlayerState, Team,
+    UnsupportedReplayMatch,
 };
+
+mod match_validation;
+
+/// Parsing or policy errors when loading a replay.
+#[derive(Debug)]
+pub enum ReplayAcceptanceError {
+    /// Replay is valid but not allowed for this product.
+    Unsupported(UnsupportedReplayMatch),
+    /// Low-level parse or IO failure.
+    Parse(anyhow::Error),
+}
+
+impl std::fmt::Display for ReplayAcceptanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(details) => write!(f, "{}", details.user_message()),
+            Self::Parse(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayAcceptanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(err) => Some(err.as_ref()),
+            Self::Unsupported(_) => None,
+        }
+    }
+}
 
 /// Internal player info used during parsing (different from `replay_structs::PlayerInfo`).
 #[derive(Debug, Default)]
@@ -90,9 +120,9 @@ fn update_car_to_pri_mapping(
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or parsed.
-pub fn parse_replay(path: &Path) -> anyhow::Result<ParsedReplay> {
-    let raw_data = std::fs::read(path)?;
+/// Returns an error if the file cannot be read or parsed, or the match is not supported.
+pub fn parse_replay(path: &Path) -> Result<ParsedReplay, ReplayAcceptanceError> {
+    let raw_data = std::fs::read(path).map_err(|io| ReplayAcceptanceError::Parse(io.into()))?;
     parse_replay_from_bytes(&raw_data)
 }
 
@@ -100,11 +130,15 @@ pub fn parse_replay(path: &Path) -> anyhow::Result<ParsedReplay> {
 ///
 /// # Errors
 ///
-/// Returns an error if the data cannot be parsed.
-pub fn parse_replay_from_bytes(data: &[u8]) -> anyhow::Result<ParsedReplay> {
-    let replay = ParserBuilder::new(data).must_parse_network_data().parse()?;
-
-    parse_boxcars_replay(&replay)
+/// Returns an error if the data cannot be parsed, or the replay is not ranked standard 3v3.
+pub fn parse_replay_from_bytes(data: &[u8]) -> Result<ParsedReplay, ReplayAcceptanceError> {
+    let replay = ParserBuilder::new(data)
+        .must_parse_network_data()
+        .parse()
+        .map_err(|error| ReplayAcceptanceError::Parse(anyhow::anyhow!(error)))?;
+    match_validation::validate_supported_match(&replay)
+        .map_err(ReplayAcceptanceError::Unsupported)?;
+    parse_boxcars_replay(&replay).map_err(ReplayAcceptanceError::Parse)
 }
 
 fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
@@ -608,32 +642,26 @@ fn find_object_id(objects: &[String], name: &str) -> Option<usize> {
 }
 
 /// Extract player name -> team mapping from the replay header's `PlayerStats`.
-/// This is the authoritative source for team assignments.
+/// This is the authoritative source for team assignments when present.
 fn extract_player_teams_from_header(replay: &Replay) -> HashMap<String, Team> {
     let mut player_teams = HashMap::new();
 
-    for (key, value) in &replay.properties {
-        if key == "PlayerStats"
-            && let HeaderProp::Array(player_stats) = value
-        {
-            for player_props in player_stats {
-                let mut name = String::new();
-                let mut team: Option<u8> = None;
+    for player_props in match_validation::player_stats_row_slices(replay) {
+        let mut name = String::new();
+        let mut team: Option<u8> = None;
 
-                for (prop_key, prop_value) in player_props {
-                    match (prop_key.as_str(), prop_value) {
-                        ("Name", HeaderProp::Str(n)) => name.clone_from(n),
-                        ("Team", HeaderProp::Int(t)) => team = Some(*t as u8),
-                        _ => {}
-                    }
-                }
-
-                if !name.is_empty()
-                    && let Some(t) = team
-                {
-                    player_teams.insert(name, Team::from(t));
-                }
+        for (prop_key, prop_value) in player_props {
+            match (prop_key.as_str(), prop_value) {
+                ("Name", HeaderProp::Str(n)) => name.clone_from(n),
+                ("Team", HeaderProp::Int(t)) => team = Some(*t as u8),
+                _ => {}
             }
+        }
+
+        if !name.is_empty()
+            && let Some(t) = team
+        {
+            player_teams.insert(name, Team::from(t));
         }
     }
 

@@ -11,6 +11,7 @@ mod embedded_model;
 mod prediction;
 mod rank_icon;
 mod ui;
+mod verdict_copy;
 
 use ui::App;
 

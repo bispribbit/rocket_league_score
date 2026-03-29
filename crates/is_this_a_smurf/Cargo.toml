@@ -13,6 +13,7 @@ ml_model.workspace = true
 replay_parser.workspace = true
 replay_structs.workspace = true
 feature_extractor.workspace = true
+rand.workspace = true
 
 burn.workspace = true
 dioxus = { workspace = true, features = ["web"] }

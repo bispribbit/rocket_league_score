@@ -1,7 +1,7 @@
 //! Application state, progress tracking, and result payloads.
 
 use feature_extractor::TOTAL_PLAYERS;
-use replay_structs::{RankDivision, Team};
+use replay_structs::{RankDivision, Team, UnsupportedReplayMatch};
 
 /// Prediction results for the entire replay.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +112,8 @@ pub(crate) enum AppState {
     WaitingForUpload,
     /// An error occurred (error message).
     Error(String),
+    /// Replay parsed but the match type is not supported (e.g. not ranked 3v3 standard).
+    UnsupportedReplay(UnsupportedReplayMatch),
 }
 
 /// Local processing state kept inside `UploadPage` so the component stays

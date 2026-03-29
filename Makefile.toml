@@ -25,7 +25,8 @@ command = "cargo"
 args = ["update"]
 
 [tasks.start-web]
-run_task = { name = ["start-web-dx", "start-web-tailwind"], parallel = true }
+cwd = "/workspace/crates/is_this_a_smurf"
+run_task = { name = ["start-web-tailwind", "start-web-dx"], parallel = true }
 
 [tasks.start-web-dx]
 cwd = "/workspace/crates/is_this_a_smurf"

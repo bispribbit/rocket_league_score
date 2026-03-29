@@ -2,12 +2,27 @@
 
 use dioxus::prelude::*;
 use feature_extractor::TOTAL_PLAYERS;
-use replay_structs::Team;
+use replay_structs::{Team, UnsupportedReplayMatch};
+
+use rand::{Rng, rng};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;
 use crate::prediction::SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN;
 use crate::rank_icon::rank_division_icon_asset;
+
+const PREDICTED_RANK_ROAST_LABELS: [&str; 10] = [
+    "Estimated Delusion Bracket",
+    "Alleged Skill Bracket",
+    "Court-Ordered Rank Guessed",
+    "Projected Excuse Division",
+    "Certified Bad Decision Tier",
+    "Approximate Main Character Level",
+    "Likely Quick Chat Skill Class",
+    "Estimated Blame Allocation Rank",
+    "Audited Ball-Chasing Bracket",
+    "Professional Opinion Nobody Asked For",
+];
 
 fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
     let mut values: Vec<f32> = player_averages
@@ -30,6 +45,15 @@ fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
 
 fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
     player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
+}
+
+fn predicted_rank_roast_label() -> &'static str {
+    let mut rng = rng();
+    let index = rng.random_range(0..PREDICTED_RANK_ROAST_LABELS.len());
+    PREDICTED_RANK_ROAST_LABELS
+        .get(index)
+        .copied()
+        .unwrap_or("Estimated Delusion Bracket")
 }
 
 /// Blue and orange team summary cards for a completed prediction.
@@ -67,6 +91,19 @@ pub(crate) fn PlayerSummaryGrid(results: PredictionResults) -> Element {
                 players_complete: orange_players,
                 player_names_loading: vec![],
                 lobby_median_mmr,
+            }
+        }
+    }
+}
+
+/// One-line verdict under the team summary: tier-flavored if no smurf, or names suspects.
+#[component]
+pub(crate) fn MatchVerdictBanner(results: PredictionResults) -> Element {
+    let line = crate::verdict_copy::match_verdict_paragraph(&results);
+    rsx! {
+        div { class: "rounded-xl border border-gray-800 bg-gray-900/80 px-5 py-4 mb-10",
+            p { class: "text-center text-base leading-relaxed text-gray-200",
+                "{line}"
             }
         }
     }
@@ -168,6 +205,7 @@ fn TeamSummaryCard(
     player_names_loading: Vec<String>,
     lobby_median_mmr: f32,
 ) -> Element {
+    let roast_label = predicted_rank_roast_label();
     let border_color = if team_color == "blue" {
         "border-blue-500/50"
     } else {
@@ -202,7 +240,7 @@ fn TeamSummaryCard(
                     if loading {
                         span { class: "text-gray-500 text-sm font-medium", "Calculating…" }
                     } else {
-                        span { "Predicted rank"
+                        span { "{roast_label}"
                         }
                     }
                 }
@@ -250,6 +288,42 @@ fn TeamSummaryCard(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Shown when the replay is valid but not ranked standard 3v3.
+#[component]
+pub(crate) fn UnsupportedReplayPage(
+    details: UnsupportedReplayMatch,
+    state: Signal<AppState>,
+) -> Element {
+    let mut state = state;
+    let message = details.user_message();
+
+    rsx! {
+        div { class: "flex flex-col items-center justify-center min-h-screen px-4",
+            svg {
+                class: "w-20 h-20 text-amber-500 mb-6",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.5",
+                view_box: "0 0 24 24",
+                path {
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                    d: "M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z",
+                }
+            }
+            h2 { class: "text-2xl font-bold text-amber-400 mb-4", "Unsupported match type" }
+            p { class: "text-gray-400 text-center max-w-md mb-8", "{message}" }
+            button {
+                class: "px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium transition-colors",
+                onclick: move |_| {
+                    state.set(AppState::WaitingForUpload);
+                },
+                "Try another replay"
             }
         }
     }

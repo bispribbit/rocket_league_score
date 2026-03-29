@@ -26,12 +26,12 @@ use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::wgpu::WgpuDevice;
 use dioxus::prelude::*;
 use ml_model::{ExtractedSegmentFeatures, SequenceModel, load_checkpoint_from_bytes};
-use replay_parser::parse_replay_from_bytes;
+use replay_parser::{ReplayAcceptanceError, parse_replay_from_bytes};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 use super::processing::{AnalysisTimeline, EarlyWorkingPanel};
-use super::results::{PlayerSummaryGrid, PlayerSummaryGridLoading};
+use super::results::{MatchVerdictBanner, PlayerSummaryGrid, PlayerSummaryGridLoading};
 use crate::app_state::{
     AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, StepStatus, TimelineTrackState,
 };
@@ -61,7 +61,8 @@ type InferenceDevice = WgpuDevice;
 /// Processing runs as a future on **this** component's scope. On success we
 /// keep `AppState::WaitingForUpload` and store the outcome in
 /// [`LocalProcessing`] so the timeline and summary stay on one screen without
-/// routing. Errors still use [`AppState::Error`].
+/// routing. Errors use [`AppState::Error`]; unsupported match types use
+/// [`AppState::UnsupportedReplay`].
 #[component]
 pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
     let mut state = state;
@@ -74,26 +75,15 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
     }) = local_processing()
     {
         let show_timeline = progress.timeline.is_some();
-        let segment_label = results.as_ref().map(|prediction_results| {
-            format!(
-                "{} — {} segment(s)",
-                filename,
-                prediction_results.segments.len()
-            )
-        });
         return rsx! {
             div { class: "flex flex-col min-h-screen w-full bg-gray-950 text-gray-100",
                 div { class: "max-w-7xl mx-auto px-4 py-8 w-full flex flex-col gap-8",
                     div { class: "flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4",
                         div {
                             h1 { class: "text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-orange-400",
-                                "Replay estimates"
+                                "Is there a smurf in this match?"
                             }
-                            if let Some(label) = segment_label.as_ref() {
-                                p { class: "text-gray-400 mt-1", "{label}" }
-                            } else {
-                                p { class: "text-gray-400 mt-1", "{filename} — analyzing…" }
-                            }
+                            p { class: "text-gray-400 mt-1", "{filename}" }
                         }
                         if results.is_some() {
                             button {
@@ -111,7 +101,8 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                         EarlyWorkingPanel { progress: progress.clone() }
                     }
                     if let Some(prediction_results) = results {
-                        PlayerSummaryGrid { results: prediction_results }
+                        PlayerSummaryGrid { results: prediction_results.clone() }
+                        MatchVerdictBanner { results: prediction_results }
                     } else {
                         PlayerSummaryGridLoading { progress }
                     }
@@ -135,7 +126,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                     }
                 }
                 p { class: "mt-4 text-center text-base leading-relaxed text-gray-400",
-                    "Upload a Rocket League replay. We guess everyone's MMR — and flag anyone who looks a little too strong for the lobby."
+                    "Upload a Rocket League replay. We guess everyone's rank, then expose who's committed to the smurf lifestyle."
                 }
             }
 
@@ -251,7 +242,15 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             tracing::info!("[replay] parse_replay_from_bytes starting");
                             let parsed = match parse_replay_from_bytes(&data) {
                                 Ok(parsed) => parsed,
-                                Err(error) => {
+                                Err(ReplayAcceptanceError::Unsupported(details)) => {
+                                    tracing::info!(
+                                        "[replay] unsupported match: {}",
+                                        details.detected_mode_label
+                                    );
+                                    state.set(AppState::UnsupportedReplay(details));
+                                    return;
+                                }
+                                Err(ReplayAcceptanceError::Parse(error)) => {
                                     tracing::info!("[replay] parse error: {}", error);
                                     state.set(AppState::Error(format!(
                                         "Replay parsing error: {error}"

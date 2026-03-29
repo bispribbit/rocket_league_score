@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 use crate::app_state::AppState;
 use crate::branding::SMURF_SUSPECT_BADGE;
 
-use super::results::ErrorPage;
+use super::results::{ErrorPage, UnsupportedReplayPage};
 use super::upload::UploadPage;
 
 /// Root application component.
@@ -29,6 +29,9 @@ pub(crate) fn App() -> Element {
                 },
                 AppState::Error(message) => rsx! {
                     ErrorPage { message, state }
+                },
+                AppState::UnsupportedReplay(details) => rsx! {
+                    UnsupportedReplayPage { details, state }
                 },
             }
         }

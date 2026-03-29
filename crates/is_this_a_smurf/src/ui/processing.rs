@@ -105,7 +105,7 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
         div { class: "w-full mb-10 rounded-xl border border-gray-800 bg-gradient-to-b from-gray-900/90 to-gray-950/95 p-5 overflow-x-hidden shadow-lg shadow-black/40",
             div { class: "mb-4",
                 h3 { class: "text-lg font-semibold text-gray-100 tracking-tight text-center",
-                    "Match analysis timeline"
+                    "Smelling smurfs"
                 }
                 div { class: "flex flex-wrap justify-center gap-x-6 gap-y-2 mt-3 text-[11px] text-gray-400",
                     span { class: "flex items-center gap-1.5",
@@ -114,7 +114,7 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                     }
                     span { class: "flex items-center gap-1.5",
                         span { class: "w-1 h-4 bg-zinc-900 ring-1 ring-zinc-600 inline-block" }
-                        "Analyzed segment"
+                        "Smurf-scanned segment"
                     }
                 }
             }
