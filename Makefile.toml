@@ -44,3 +44,15 @@ args = [
     "./assets/tailwind.css",
     "--watch",
 ]
+
+# Restore PostgreSQL from the custom-format dump shipped in the devcontainer image (or data/database_dump.dump on the bind mount).
+[tasks.restore-database]
+cwd = "/workspace"
+command = "bash"
+args = ["scripts/restore-database.sh"]
+
+# Write data/database_dump.dump from a live database (pg_dump -Fc; rebuild the devcontainer image to bake a new snapshot).
+[tasks.database-dump]
+cwd = "/workspace"
+command = "bash"
+args = ["scripts/database-dump.sh"]
