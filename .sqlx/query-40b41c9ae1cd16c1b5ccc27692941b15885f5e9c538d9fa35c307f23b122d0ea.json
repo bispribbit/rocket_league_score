@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata,\n                       download_status as \"download_status: DownloadStatus\", file_path, error_message,\n                       dataset_split as \"dataset_split: DatasetSplit\", created_at, updated_at\n                FROM replays\n                WHERE rank = $1\n                ORDER BY created_at\n                ",
+  "query": "\n            SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata,\n                    download_status as \"download_status: DownloadStatus\", file_path, error_message,\n                    dataset_split as \"dataset_split: DatasetSplit\", created_at, updated_at\n            FROM replays\n            WHERE rank = $1\n            ORDER BY created_at\n            ",
   "describe": {
     "columns": [
       {
@@ -71,7 +71,11 @@
                 "champion1",
                 "champion2",
                 "champion3",
-                "grand_champion"
+                "grand_champion",
+                "grand_champion1",
+                "grand_champion2",
+                "grand_champion3",
+                "supersonic_legend"
               ]
             }
           }
@@ -161,7 +165,11 @@
                 "champion1",
                 "champion2",
                 "champion3",
-                "grand_champion"
+                "grand_champion",
+                "grand_champion1",
+                "grand_champion2",
+                "grand_champion3",
+                "supersonic_legend"
               ]
             }
           }
@@ -181,5 +189,5 @@
       false
     ]
   },
-  "hash": "ff935f109801778dd739692a9ad36189d6b7cbaf81827f388aee32912963318a"
+  "hash": "40b41c9ae1cd16c1b5ccc27692941b15885f5e9c538d9fa35c307f23b122d0ea"
 }

@@ -71,7 +71,11 @@
                 "champion1",
                 "champion2",
                 "champion3",
-                "grand_champion"
+                "grand_champion",
+                "grand_champion1",
+                "grand_champion2",
+                "grand_champion3",
+                "supersonic_legend"
               ]
             }
           }
@@ -161,7 +165,11 @@
                 "champion1",
                 "champion2",
                 "champion3",
-                "grand_champion"
+                "grand_champion",
+                "grand_champion1",
+                "grand_champion2",
+                "grand_champion3",
+                "supersonic_legend"
               ]
             }
           }

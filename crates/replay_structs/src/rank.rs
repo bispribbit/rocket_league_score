@@ -1068,7 +1068,10 @@ pub enum Rank {
     Champion1,
     Champion2,
     Champion3,
-    GrandChampion,
+    GrandChampion1,
+    GrandChampion2,
+    GrandChampion3,
+    SupersonicLegend,
 }
 
 impl Rank {
@@ -1095,7 +1098,10 @@ impl Rank {
             Self::Champion1 => "champion-1",
             Self::Champion2 => "champion-2",
             Self::Champion3 => "champion-3",
-            Self::GrandChampion => "grand-champion",
+            Self::GrandChampion1 => "grand-champion-1",
+            Self::GrandChampion2 => "grand-champion-2",
+            Self::GrandChampion3 => "grand-champion-3",
+            Self::SupersonicLegend => "supersonic-legend",
         }
     }
 
@@ -1122,7 +1128,10 @@ impl Rank {
             Self::Champion1 => "champion-1",
             Self::Champion2 => "champion-2",
             Self::Champion3 => "champion-3",
-            Self::GrandChampion => "grand-champion",
+            Self::GrandChampion1 => "grand-champion-1",
+            Self::GrandChampion2 => "grand-champion-2",
+            Self::GrandChampion3 => "grand-champion-3",
+            Self::SupersonicLegend => "supersonic-legend",
         }
     }
 
@@ -1147,7 +1156,10 @@ impl Rank {
             Self::Champion1,
             Self::Champion2,
             Self::Champion3,
-            Self::GrandChampion,
+            Self::GrandChampion1,
+            Self::GrandChampion2,
+            Self::GrandChampion3,
+            Self::SupersonicLegend,
         ]
         .into_iter()
     }
@@ -1188,7 +1200,10 @@ impl FromStr for Rank {
             "champion-1" => Ok(Self::Champion1),
             "champion-2" => Ok(Self::Champion2),
             "champion-3" => Ok(Self::Champion3),
-            "grand-champion" => Ok(Self::GrandChampion),
+            "grand-champion-1" => Ok(Self::GrandChampion1),
+            "grand-champion-2" => Ok(Self::GrandChampion2),
+            "grand-champion-3" => Ok(Self::GrandChampion3),
+            "supersonic-legend" => Ok(Self::SupersonicLegend),
             _ => Err(anyhow::anyhow!("Invalid rank: {s}")),
         }
     }
@@ -1198,7 +1213,7 @@ impl Rank {
     /// Maximum valid index for ranks.
     const MAX_INDEX: usize = Self::COUNT - 1;
 
-    /// Returns the numeric index of this rank (0 = Unranked, 1 = Bronze1, ..., 19 = GrandChampion).
+    /// Returns the numeric index of this rank (0 = Unranked, 1 = Bronze1, ..., 22 = SupersonicLegend).
     #[must_use]
     pub const fn as_numeric_index(self) -> i32 {
         self as i32
@@ -1206,18 +1221,18 @@ impl Rank {
 
     /// Creates a `Rank` from a numeric index, saturating at boundaries.
     ///
-    /// Index 0 = Unranked, 1 = Bronze1, ..., 19 = GrandChampion.
-    /// Values below 0 return Unranked, values above 19 return GrandChampion.
+    /// Index 0 = Unranked, 1 = Bronze1, ..., 22 = SupersonicLegend.
+    /// Values below 0 return Unranked, values above 22 return SupersonicLegend.
     #[must_use]
     pub fn from_numeric_index_saturating(index: i32) -> Self {
         if index <= 0 {
             return Self::Unranked;
         }
         let clamped = (index as usize).min(Self::MAX_INDEX);
-        Self::iter().nth(clamped).unwrap_or(Self::GrandChampion)
+        Self::iter().nth(clamped).unwrap_or(Self::SupersonicLegend)
     }
 
-    /// Adds an offset to this rank, saturating at Unranked (min) and GrandChampion (max).
+    /// Adds an offset to this rank, saturating at Unranked (min) and SupersonicLegend (max).
     ///
     /// # Examples
     ///
@@ -1225,7 +1240,7 @@ impl Rank {
     /// use replay_structs::Rank;
     ///
     /// assert_eq!(Rank::Bronze1.saturating_add(3), Rank::Silver1);
-    /// assert_eq!(Rank::GrandChampion.saturating_add(5), Rank::GrandChampion);
+    /// assert_eq!(Rank::SupersonicLegend.saturating_add(5), Rank::SupersonicLegend);
     /// assert_eq!(Rank::Bronze1.saturating_add(-5), Rank::Unranked);
     /// ```
     #[must_use]
@@ -1234,7 +1249,7 @@ impl Rank {
         Self::from_numeric_index_saturating(new_index)
     }
 
-    /// Subtracts an offset from this rank, saturating at Unranked (min) and GrandChampion (max).
+    /// Subtracts an offset from this rank, saturating at Unranked (min) and SupersonicLegend (max).
     ///
     /// # Examples
     ///
@@ -1263,7 +1278,7 @@ impl Add<i32> for Rank {
     /// use replay_structs::Rank;
     ///
     /// assert_eq!(Rank::Bronze1 + 3, Rank::Silver1);
-    /// assert_eq!(Rank::GrandChampion + 1, Rank::GrandChampion);
+    /// assert_eq!(Rank::SupersonicLegend + 1, Rank::SupersonicLegend);
     /// ```
     fn add(self, offset: i32) -> Self::Output {
         self.saturating_add(offset)
@@ -1308,9 +1323,27 @@ impl Sub<Self> for Rank {
 
 impl From<crate::RankInfo> for RankDivision {
     fn from(rank_info: crate::RankInfo) -> Self {
-        let tier = rank_info.tier.unwrap_or(1);
-        let division = rank_info.division;
-        Self::from_tier_and_division(tier, division).unwrap_or(Self::BronzeIDivision1)
+        if let Some(tier) = rank_info.tier {
+            if let Some(division) = Self::from_tier_and_division(tier, rank_info.division) {
+                return division;
+            }
+        }
+
+        match rank_info.id.as_str() {
+            "grand-champion" => Self::GrandChampionIDivision2,
+            "grand-champion-1" => Self::from_tier_and_division(19, rank_info.division)
+                .unwrap_or(Self::GrandChampionIDivision1),
+            "grand-champion-2" => Self::from_tier_and_division(20, rank_info.division)
+                .unwrap_or(Self::GrandChampionIIDivision1),
+            "grand-champion-3" => Self::from_tier_and_division(21, rank_info.division)
+                .unwrap_or(Self::GrandChampionIIIDivision1),
+            "supersonic-legend" => Self::SupersonicLegend,
+            _ => {
+                let tier = rank_info.tier.unwrap_or(1);
+                let division = rank_info.division;
+                Self::from_tier_and_division(tier, division).unwrap_or(Self::BronzeIDivision1)
+            }
+        }
     }
 }
 
@@ -1440,16 +1473,16 @@ impl From<RankDivision> for Rank {
             RankDivision::GrandChampionIDivision1
             | RankDivision::GrandChampionIDivision2
             | RankDivision::GrandChampionIDivision3
-            | RankDivision::GrandChampionIDivision4
-            | RankDivision::GrandChampionIIDivision1
+            | RankDivision::GrandChampionIDivision4 => Self::GrandChampion1,
+            RankDivision::GrandChampionIIDivision1
             | RankDivision::GrandChampionIIDivision2
             | RankDivision::GrandChampionIIDivision3
-            | RankDivision::GrandChampionIIDivision4
-            | RankDivision::GrandChampionIIIDivision1
+            | RankDivision::GrandChampionIIDivision4 => Self::GrandChampion2,
+            RankDivision::GrandChampionIIIDivision1
             | RankDivision::GrandChampionIIIDivision2
             | RankDivision::GrandChampionIIIDivision3
-            | RankDivision::GrandChampionIIIDivision4
-            | RankDivision::SupersonicLegend => Self::GrandChampion,
+            | RankDivision::GrandChampionIIIDivision4 => Self::GrandChampion3,
+            RankDivision::SupersonicLegend => Self::SupersonicLegend,
         }
     }
 }
@@ -1667,8 +1700,8 @@ mod tests {
         assert_eq!(Rank::Bronze1 + 6, Rank::Gold1); // 1 + 6 = 7 = Gold1
 
         // Saturation at max
-        assert_eq!(Rank::GrandChampion + 1, Rank::GrandChampion);
-        assert_eq!(Rank::Champion3 + 5, Rank::GrandChampion);
+        assert_eq!(Rank::SupersonicLegend + 1, Rank::SupersonicLegend);
+        assert_eq!(Rank::Champion3 + 5, Rank::SupersonicLegend);
 
         // Adding zero
         assert_eq!(Rank::Gold1 + 0, Rank::Gold1);
@@ -1699,9 +1732,9 @@ mod tests {
         // Difference between ranks
         assert_eq!(Rank::Silver1 - Rank::Bronze1, 3);
         assert_eq!(Rank::Bronze1 - Rank::Silver1, -3);
-        assert_eq!(Rank::GrandChampion - Rank::Bronze1, 18);
+        assert_eq!(Rank::SupersonicLegend - Rank::Bronze1, 21);
         assert_eq!(Rank::Bronze1 - Rank::Bronze1, 0);
-        assert_eq!(Rank::GrandChampion - Rank::Unranked, 19);
+        assert_eq!(Rank::SupersonicLegend - Rank::Unranked, 22);
     }
 
     #[test]
@@ -1711,7 +1744,7 @@ mod tests {
         assert_eq!(Rank::Bronze2.as_numeric_index(), 2);
         assert_eq!(Rank::Bronze3.as_numeric_index(), 3);
         assert_eq!(Rank::Silver1.as_numeric_index(), 4);
-        assert_eq!(Rank::GrandChampion.as_numeric_index(), 19);
+        assert_eq!(Rank::SupersonicLegend.as_numeric_index(), 22);
     }
 
     #[test]
@@ -1719,13 +1752,16 @@ mod tests {
         assert_eq!(Rank::from_numeric_index_saturating(0), Rank::Unranked);
         assert_eq!(Rank::from_numeric_index_saturating(1), Rank::Bronze1);
         assert_eq!(Rank::from_numeric_index_saturating(4), Rank::Silver1);
-        assert_eq!(Rank::from_numeric_index_saturating(19), Rank::GrandChampion);
+        assert_eq!(
+            Rank::from_numeric_index_saturating(22),
+            Rank::SupersonicLegend
+        );
 
         // Saturation
         assert_eq!(Rank::from_numeric_index_saturating(-5), Rank::Unranked);
         assert_eq!(
             Rank::from_numeric_index_saturating(100),
-            Rank::GrandChampion
+            Rank::SupersonicLegend
         );
     }
 

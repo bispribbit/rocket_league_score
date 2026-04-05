@@ -1,5 +1,6 @@
 //! Repository functions for replay operations.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use replay_structs::{DatasetSplit, DownloadStatus, GameMode, Rank, Replay};
@@ -125,6 +126,25 @@ pub async fn list_replays_by_rank(rank: Rank) -> Result<Vec<Replay>, sqlx::Error
     )
     .fetch_all(pool)
     .await
+}
+
+/// Returns every replay UUID in the database, regardless of rank.
+///
+/// Used for fetch deduplication: a replay row is unique by `id` globally, but the
+/// ballchasing API may return the same replay when querying different rank
+/// filters. Skipping only IDs already stored under the current rank would treat
+/// those as new, then `insert_replays` would apply `ON CONFLICT DO NOTHING` and
+/// the per-rank count would never advance, repeating the same API pages.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn list_all_replay_ids() -> Result<HashSet<Uuid>, sqlx::Error> {
+    let pool = get_pool();
+    let rows = sqlx::query!(r#"SELECT id FROM replays"#)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|row| row.id).collect())
 }
 
 /// Samples replays evenly across all ranks in a deterministic way.
@@ -382,6 +402,26 @@ pub async fn count_replays_by_rank_and_status(
         r#"SELECT COUNT(*) as "count!" FROM replays WHERE rank = $1 AND download_status = $2"#,
         rank as Rank,
         status as DownloadStatus
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result.count)
+}
+
+/// Counts replays that are not yet successfully downloaded (`not_downloaded` or `in_progress`).
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn count_replays_pending_download_completion() -> Result<i64, sqlx::Error> {
+    let pool = get_pool();
+    let result = sqlx::query!(
+        r#"
+        SELECT COUNT(*) as "count!"
+        FROM replays
+        WHERE download_status = 'not_downloaded' OR download_status = 'in_progress'
+        "#
     )
     .fetch_one(pool)
     .await?;
