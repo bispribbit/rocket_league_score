@@ -33,7 +33,7 @@ const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
 const MAX_CONCURRENT_DOWNLOADS: usize = 1;
 
 /// Default pause when the server returns HTTP 429 without a `Retry-After` header.
-const DEFAULT_PAUSE_ON_RATE_LIMIT_SECONDS: u64 = 120;
+const DEFAULT_PAUSE_ON_RATE_LIMIT_SECONDS: u64 = 600;
 
 /// Maximum pause we apply when honoring `Retry-After` (avoid multi-hour sleeps from bad headers).
 const MAX_PAUSE_ON_RATE_LIMIT_SECONDS: u64 = 600;

@@ -1323,10 +1323,10 @@ impl Sub<Self> for Rank {
 
 impl From<crate::RankInfo> for RankDivision {
     fn from(rank_info: crate::RankInfo) -> Self {
-        if let Some(tier) = rank_info.tier {
-            if let Some(division) = Self::from_tier_and_division(tier, rank_info.division) {
-                return division;
-            }
+        if let Some(tier) = rank_info.tier
+            && let Some(division) = Self::from_tier_and_division(tier, rank_info.division)
+        {
+            return division;
         }
 
         match rank_info.id.as_str() {
