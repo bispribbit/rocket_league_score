@@ -597,3 +597,139 @@ pub async fn update_replay_split(replay_id: Uuid, split: DatasetSplit) -> Result
 
     Ok(())
 }
+
+/// Summary counts after aligning `download_status` with files on disk under `base_path`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplayDownloadStatusSyncSummary {
+    /// Rows that had `download_status = 'failed'` and were reset to `not_downloaded` for retry.
+    pub failed_reset_to_not_downloaded: usize,
+    /// Rows that had `download_status = 'downloaded'` and were checked.
+    pub downloaded_rows_checked: usize,
+    /// Of those, files that existed on disk (unchanged).
+    pub downloaded_existing_on_disk: usize,
+    /// Those rows whose file was missing; status set to `not_downloaded`.
+    pub missing_files_reset_to_not_downloaded: usize,
+    /// Rows that had `download_status = 'not_downloaded'` and were checked.
+    pub not_downloaded_rows_checked: usize,
+    /// Those rows whose file existed; status set to `downloaded`.
+    pub existing_files_marked_downloaded: usize,
+    /// Of not-downloaded rows, files still absent on disk.
+    pub not_downloaded_still_missing: usize,
+}
+
+struct ReplayIdAndFilePath {
+    id: Uuid,
+    file_path: String,
+}
+
+/// Updates `download_status` so it matches replay files present under `base_path`.
+///
+/// First resets all `failed` rows to `not_downloaded` (clears `error_message`) so the downloader
+/// can retry them. Then: replays marked `downloaded` but missing on disk become
+/// `not_downloaded`; replays marked `not_downloaded` but present on disk become `downloaded`.
+///
+/// # Errors
+///
+/// Returns an error if a database operation fails.
+pub async fn synchronize_replay_download_status_with_filesystem(
+    base_path: &Path,
+) -> Result<ReplayDownloadStatusSyncSummary, sqlx::Error> {
+    let pool = get_pool();
+
+    let failed_reset_count = reset_failed_downloads().await? as usize;
+
+    let downloaded_rows = sqlx::query!(
+        r#"
+        SELECT id, file_path
+        FROM replays
+        WHERE download_status = 'downloaded'
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let downloaded_replays: Vec<ReplayIdAndFilePath> = downloaded_rows
+        .into_iter()
+        .map(|row| ReplayIdAndFilePath {
+            id: row.id,
+            file_path: row.file_path,
+        })
+        .collect();
+
+    let mut missing_count = 0usize;
+    let mut existing_count = 0usize;
+
+    for replay in &downloaded_replays {
+        let path = base_path.join(&replay.file_path);
+
+        if !path.exists() {
+            sqlx::query!(
+                r#"
+                UPDATE replays
+                SET download_status = $1, updated_at = NOW()
+                WHERE id = $2
+                "#,
+                DownloadStatus::NotDownloaded as DownloadStatus,
+                replay.id
+            )
+            .execute(pool)
+            .await?;
+
+            missing_count += 1;
+        } else {
+            existing_count += 1;
+        }
+    }
+
+    let not_downloaded_rows = sqlx::query!(
+        r#"
+        SELECT id, file_path
+        FROM replays
+        WHERE download_status = 'not_downloaded'
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let not_downloaded_replays: Vec<ReplayIdAndFilePath> = not_downloaded_rows
+        .into_iter()
+        .map(|row| ReplayIdAndFilePath {
+            id: row.id,
+            file_path: row.file_path,
+        })
+        .collect();
+
+    let mut found_count = 0usize;
+
+    for replay in &not_downloaded_replays {
+        let path = base_path.join(&replay.file_path);
+
+        if path.exists() {
+            sqlx::query!(
+                r#"
+                UPDATE replays
+                SET download_status = $1, updated_at = NOW()
+                WHERE id = $2
+                "#,
+                DownloadStatus::Downloaded as DownloadStatus,
+                replay.id
+            )
+            .execute(pool)
+            .await?;
+
+            found_count += 1;
+        }
+    }
+
+    let still_missing_count = not_downloaded_replays.len().saturating_sub(found_count);
+
+    Ok(ReplayDownloadStatusSyncSummary {
+        failed_reset_to_not_downloaded: failed_reset_count,
+        downloaded_rows_checked: downloaded_replays.len(),
+        downloaded_existing_on_disk: existing_count,
+        missing_files_reset_to_not_downloaded: missing_count,
+        not_downloaded_rows_checked: not_downloaded_replays.len(),
+        existing_files_marked_downloaded: found_count,
+        not_downloaded_still_missing: still_missing_count,
+    })
+}

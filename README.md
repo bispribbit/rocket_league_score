@@ -43,15 +43,7 @@ cd /workspace
 cargo make restore-database
 ```
 
-### 3. Verify replay files on disk
-
-This checks paths in the database against files under your replay base directory and fixes `download_status` when files are missing (first run) or unexpectedly present.
-
-```bash
-cargo run -p rocket_league_score --bin verify_downloaded_replays
-```
-
-### 4. Download replays from Ballchasing
+### 3. Download replays from Ballchasing
 
 Set `DATABASE_URL` and a **Ballchasing API key** (see `crates/config` — `BALLCHASING_API_KEY`). 
 
@@ -62,9 +54,9 @@ export BALLCHASING_API_KEY="your-api-key"
 cargo run -p ballchasing_downloader
 ```
 
-The binary runs migrations and then the downloader loop.
+The binary runs migrations, synchronizes `download_status` with replay files under your replay base directory (same rules as `verify_downloaded_replays`), then starts the downloader loop.
 
-### 5. Run the training pipeline (release)
+### 4. Run the training pipeline (release)
 
 This is the long step: full training against the database, potentially **many days**.
 
@@ -76,7 +68,7 @@ The example writes a log file under `models/` relative to your **current working
 
 **GPU:** For practical speed, run this **outside** the devcontainer on a host with a suitable GPU (and the same `DATABASE_URL` reachable from that host). The devcontainer is fine for development but training benefits from native GPU acceleration (e.g. Burn / WGPU).
 
-### 6. Copy the new model into `data/`
+### 5. Copy the new model into `data/`
 
 Training produces checkpoint and config artifacts. Copy the **binary checkpoint** and **JSON config** you want to ship into the **repo root** `data/` directory using a versioned pair, for example:
 
@@ -90,7 +82,7 @@ Then point the web app at them by editing `crates/is_this_a_smurf/src/embedded_m
 
 Rebuild the WASM app after changing versions.
 
-### 7. Start the “Is this a smurf?” website
+### 6. Start the “Is this a smurf?” website
 
 From the **workspace root** (requires `cargo-make`, installed in the devcontainer via `cargo-binstall`):
 

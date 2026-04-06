@@ -3,8 +3,10 @@
 //! Downloads Rocket League replays from ballchasing.com organized by rank.
 
 use anyhow::Result;
-use config::CONFIG;
-use database::{initialize_pool, run_migrations};
+use config::{CONFIG, get_base_path};
+use database::{
+    initialize_pool, run_migrations, synchronize_replay_download_status_with_filesystem,
+};
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -47,6 +49,23 @@ async fn main() -> Result<()> {
 
     // Run migrations
     run_migrations().await?;
+
+    let replay_base = get_base_path();
+    info!(
+        "Synchronizing replay download status with files under {}",
+        replay_base.display()
+    );
+    let sync_summary = synchronize_replay_download_status_with_filesystem(&replay_base).await?;
+    info!(
+        failed_reset = sync_summary.failed_reset_to_not_downloaded,
+        downloaded_checked = sync_summary.downloaded_rows_checked,
+        existing_on_disk = sync_summary.downloaded_existing_on_disk,
+        missing_reset = sync_summary.missing_files_reset_to_not_downloaded,
+        not_downloaded_checked = sync_summary.not_downloaded_rows_checked,
+        found_marked_downloaded = sync_summary.existing_files_marked_downloaded,
+        still_missing = sync_summary.not_downloaded_still_missing,
+        "Replay download status sync finished"
+    );
 
     // Run the downloader
     ballchasing_downloader::run().await?;

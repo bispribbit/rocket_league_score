@@ -1,51 +1,32 @@
-//! Example: Verify downloaded replays exist on disk.
+//! Binary: Verify downloaded replays exist on disk.
 //!
-//! This script:
-//! - Selects all replays where `download_status` = 'downloaded'
-//! - Checks if each file path exists on disk
-//! - Marks replays as '`not_downloaded`' if the file doesn't exist
-//! - Selects all replays where `download_status` = 'not_downloaded'
-//! - Checks if each file path exists on disk
-//! - Marks replays as '`downloaded`' if the file exists
+//! Aligns `download_status` in the database with files under `REPLAY_BASE_PATH` (same logic as
+//! `database::synchronize_replay_download_status_with_filesystem`, which runs automatically when
+//! starting `ballchasing_downloader`).
 //!
-//! Usage:
-//!   cargo run --example `verify_downloaded_replays`
-//!
-//! Environment Variables:
-//!   `DATABASE_URL` - `PostgreSQL` connection string (required)
-//!   `REPLAY_BASE_PATH` - Base path for replay files (required)
+//! Environment variables:
+//! - `DATABASE_URL` — PostgreSQL connection string (required)
+//! - `REPLAY_BASE_PATH` — Base path for replay files (optional; platform default if unset)
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use database::{get_pool, initialize_pool};
-use replay_structs::DownloadStatus;
+use database::{initialize_pool, synchronize_replay_download_status_with_filesystem};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
-
-/// Represents a downloaded replay record from the database.
-struct DownloadedReplay {
-    id: Uuid,
-    file_path: String,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("info"))
         .init();
 
-    // Initialize database
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
     initialize_pool(&database_url).await?;
 
-    // Get the base path for replay files
     #[cfg(target_os = "linux")]
     let base_path_unwrap = PathBuf::from("/workspace/ballchasing");
 
@@ -60,126 +41,37 @@ async fn main() -> Result<()> {
     info!("=== Verify Downloaded Replays ===");
     info!("Base path: {}\n", base_path.display());
 
-    // Select all replays where download_status = 'downloaded'
-    let pool = get_pool();
-    let rows = sqlx::query!(
-        "
-        SELECT id, file_path
-        FROM replays
-        WHERE download_status = 'downloaded'
-        "
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let downloaded_replays: Vec<DownloadedReplay> = rows
-        .into_iter()
-        .map(|row| DownloadedReplay {
-            id: row.id,
-            file_path: row.file_path,
-        })
-        .collect();
+    let summary = synchronize_replay_download_status_with_filesystem(&base_path).await?;
 
     info!(
-        "Found {} replays with download_status = 'downloaded'\n",
-        downloaded_replays.len()
+        "\n=== Failed downloads reset to not_downloaded (for retry) ===\n{}",
+        summary.failed_reset_to_not_downloaded
     );
-
-    // Check each file path and mark as 'not_downloaded' if it doesn't exist
-    let mut missing_count = 0;
-    let mut existing_count = 0;
-
-    for replay in &downloaded_replays {
-        let path = base_path.join(&replay.file_path);
-
-        if !path.exists() {
-            info!("Missing: {} (ID: {})", replay.file_path, replay.id);
-
-            // Mark as 'not_downloaded'
-            sqlx::query!(
-                "
-                UPDATE replays
-                SET download_status = $1, updated_at = NOW()
-                WHERE id = $2
-                ",
-                DownloadStatus::NotDownloaded as DownloadStatus,
-                replay.id
-            )
-            .execute(pool)
-            .await?;
-
-            missing_count += 1;
-        } else {
-            existing_count += 1;
-        }
-    }
 
     info!("\n=== Summary (Downloaded Replays) ===");
-    info!("Total downloaded replays: {}", downloaded_replays.len());
-    info!("Existing on disk:         {existing_count}");
-    info!("Missing (marked as not_downloaded): {missing_count}");
-
-    // Select all replays where download_status = 'not_downloaded'
-    info!("\n=== Verify Not Downloaded Replays ===");
-    let not_downloaded_rows = sqlx::query!(
-        "
-        SELECT id, file_path
-        FROM replays
-        WHERE download_status = 'not_downloaded'
-        "
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let not_downloaded_replays: Vec<DownloadedReplay> = not_downloaded_rows
-        .into_iter()
-        .map(|row| DownloadedReplay {
-            id: row.id,
-            file_path: row.file_path,
-        })
-        .collect();
-
     info!(
-        "Found {} replays with download_status = 'not_downloaded'\n",
-        not_downloaded_replays.len()
+        "Total downloaded replays: {}",
+        summary.downloaded_rows_checked
     );
-
-    // Check each file path and mark as 'downloaded' if it exists
-    let mut found_count = 0;
-    let mut still_missing_count = 0;
-
-    for replay in &not_downloaded_replays {
-        let path = base_path.join(&replay.file_path);
-
-        if path.exists() {
-            info!("Found: {} (ID: {})", replay.file_path, replay.id);
-
-            // Mark as 'downloaded'
-            sqlx::query!(
-                "
-                UPDATE replays
-                SET download_status = $1, updated_at = NOW()
-                WHERE id = $2
-                ",
-                DownloadStatus::Downloaded as DownloadStatus,
-                replay.id
-            )
-            .execute(pool)
-            .await?;
-
-            found_count += 1;
-        } else {
-            still_missing_count += 1;
-        }
-    }
+    info!(
+        "Existing on disk:         {}",
+        summary.downloaded_existing_on_disk
+    );
+    info!(
+        "Missing (marked as not_downloaded): {}",
+        summary.missing_files_reset_to_not_downloaded
+    );
 
     info!("\n=== Summary (Not Downloaded Replays) ===");
     info!(
         "Total not_downloaded replays: {}",
-        not_downloaded_replays.len()
+        summary.not_downloaded_rows_checked
     );
-    info!("Found on disk (marked as downloaded): {found_count}");
-    info!("Still missing: {still_missing_count}");
+    info!(
+        "Found on disk (marked as downloaded): {}",
+        summary.existing_files_marked_downloaded
+    );
+    info!("Still missing: {}", summary.not_downloaded_still_missing);
 
     Ok(())
 }
