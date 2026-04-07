@@ -8,6 +8,10 @@ license.workspace = true
 name = "verify_downloaded_replays"
 path = "src/verify_downloaded_replays.rs"
 
+[[bin]]
+name = "validate_ballchasing_player_counts"
+path = "src/validate_ballchasing_player_counts.rs"
+
 [lints]
 workspace = true
 

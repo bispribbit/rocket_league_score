@@ -576,6 +576,28 @@ pub async fn list_replays_by_split(split: DatasetSplit) -> Result<Vec<Replay>, s
     .await
 }
 
+/// Lists every replay marked as downloaded (for example files under the ballchasing object store).
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn list_downloaded_replays() -> Result<Vec<Replay>, sqlx::Error> {
+    let pool = get_pool();
+    sqlx::query_as!(
+        Replay,
+        r#"
+        SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
+               download_status as "download_status: DownloadStatus", file_path, error_message,
+               dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
+        FROM replays
+        WHERE download_status = 'downloaded'
+        ORDER BY id
+        "#
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Updates the dataset split for a specific replay.
 ///
 /// # Errors

@@ -2,19 +2,8 @@
 
 use std::collections::HashSet;
 
-use boxcars::{HeaderProp, Replay};
+use boxcars::{Attribute, HeaderProp, Replay};
 use replay_structs::UnsupportedReplayMatch;
-
-/// How many initial network frames to scan when counting PRI spawns for player totals.
-/// Replays downloaded from sites such as Ballchasing sometimes omit header `PlayerStats`; PRI
-/// actors still spawn at match start within the first few seconds.
-///
-/// We do **not** count car actors: each demo and respawn creates a new car `new_actor`, so unique
-/// car IDs over many frames are not human player counts.
-///
-/// Some replays list only a subset of players in `PlayerStats`; we combine with PRI count (see
-/// `effective_human_player_count`).
-const EARLY_FRAMES_FOR_PRI_PLAYER_COUNT: usize = 8000;
 
 const SOCCAR_REPLAY_GAME_TYPE: &str = "TAGame.Replay_Soccar_TA";
 const RANKED_STANDARD_PLAYLIST_ID: i32 = 13;
@@ -116,44 +105,95 @@ fn collect_player_stat_row_slices(property: &HeaderProp) -> Vec<&Vec<(String, He
     }
 }
 
-/// Header `PlayerStats` is sometimes incomplete (for example four rows in a six-player lobby).
-/// PRI spawns approximate humans; we take the maximum of header rows and PRI-derived count.
+/// Counts unique human players by combining two complementary signals:
+///
+/// - `PlayerStats` header rows: never inflated, but sometimes incomplete.
+/// - Named PRI actors in network frames: never inflated (phantom PRIs have no name), but
+///   occasionally misses a player whose name is replicated through a path the lightweight scan
+///   does not cover.
+///
+/// Taking the maximum of both gives the most accurate count.
 fn effective_human_player_count(replay: &Replay) -> usize {
     let header_rows = player_stats_row_slices(replay).len();
-    let network_pri = unique_pri_spawn_count_in_early_frames(replay);
-    header_rows.max(network_pri)
+    let named_player_count = count_named_pri_players(replay);
+    header_rows.max(named_player_count)
 }
 
-fn unique_pri_spawn_count_in_early_frames(replay: &Replay) -> usize {
-    unique_spawn_count_for_predicate(replay, |replay, object_index| {
-        replay
-            .objects
-            .get(object_index)
-            .is_some_and(|object_name| object_name.contains("PRI_TA") && !object_name.contains(':'))
-    })
-}
-
-fn unique_spawn_count_for_predicate(
-    replay: &Replay,
-    mut object_matches: impl FnMut(&Replay, usize) -> bool,
-) -> usize {
+/// Scans network frames for PRI actors that receive a non-empty `PlayerName` string attribute,
+/// mirroring the same logic the main replay parser uses. Returns the number of unique player names.
+fn count_named_pri_players(replay: &Replay) -> usize {
     let Some(network) = replay.network_frames.as_ref() else {
         return 0;
     };
-    let mut seen = HashSet::new();
-    for frame in network
-        .frames
+
+    let player_name_attr_id = replay
+        .objects
         .iter()
-        .take(EARLY_FRAMES_FOR_PRI_PLAYER_COUNT)
-    {
+        .position(|o| o == "Engine.PlayerReplicationInfo:PlayerName");
+
+    let Some(player_name_attr_id) = player_name_attr_id else {
+        return 0;
+    };
+
+    let mut pri_actor_ids: HashSet<i32> = HashSet::new();
+    let mut named_players: HashSet<String> = HashSet::new();
+
+    for frame in &network.frames {
         for new_actor in &frame.new_actors {
             let object_index = new_actor.object_id.0 as usize;
-            if object_matches(replay, object_index) {
-                seen.insert(new_actor.actor_id.0);
+            if let Some(object_name) = replay.objects.get(object_index)
+                && object_name.contains("PRI_TA")
+                && !object_name.contains(':')
+            {
+                pri_actor_ids.insert(new_actor.actor_id.0);
+            }
+        }
+
+        for update in &frame.updated_actors {
+            let actor_id = update.actor_id.0;
+            if !pri_actor_ids.contains(&actor_id) {
+                continue;
+            }
+            if update.object_id.0 as usize != player_name_attr_id {
+                continue;
+            }
+            if let Attribute::String(name) = &update.attribute
+                && !name.is_empty()
+            {
+                named_players.insert(name.clone());
             }
         }
     }
-    seen.len()
+
+    named_players.len()
+}
+
+/// Breakdown of how the replay parser estimates human player count (for diagnostics).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanPlayerCountBreakdown {
+    /// Rows under `PlayerStats` in the replay header.
+    pub player_stats_rows: usize,
+    /// Unique player names observed on PRI actors in network frames.
+    pub named_pri_player_count: usize,
+    /// `TeamSize` from the replay header when present.
+    pub team_size_header: Option<i32>,
+    /// Final count used for validation.
+    pub effective_count: usize,
+}
+
+/// Returns header and network-derived player counts, plus the effective count used for validation.
+#[must_use]
+pub fn diagnose_human_player_count(replay: &Replay) -> HumanPlayerCountBreakdown {
+    let player_stats_rows = player_stats_row_slices(replay).len();
+    let named_pri_player_count = count_named_pri_players(replay);
+    let team_size_header = header_int_property(replay, "TeamSize");
+    let effective_count = player_stats_rows.max(named_pri_player_count);
+    HumanPlayerCountBreakdown {
+        player_stats_rows,
+        named_pri_player_count,
+        team_size_header,
+        effective_count,
+    }
 }
 
 /// Match type class names appear in the replay `objects` table (not necessarily as `new_actors`).
