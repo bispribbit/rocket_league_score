@@ -18,5 +18,15 @@ fi
 : "${DATABASE_URL:?DATABASE_URL is required}"
 
 echo "Restoring from ${dump_path} (pg_restore custom format)"
-pg_restore --dbname="${DATABASE_URL}" --no-owner --no-acl --exit-on-error --verbose "${dump_path}"
+# --clean drops objects present in the dump before recreating them so a non-empty database is replaced.
+# --if-exists avoids errors when a prior partial restore left nothing to drop.
+pg_restore \
+    --dbname="${DATABASE_URL}" \
+    --clean \
+    --if-exists \
+    --no-owner \
+    --no-acl \
+    --exit-on-error \
+    --verbose \
+    "${dump_path}"
 echo "Restore finished."
