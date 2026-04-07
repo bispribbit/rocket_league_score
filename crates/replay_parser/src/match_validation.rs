@@ -172,15 +172,16 @@ fn count_pri_players(replay: &Replay) -> PriPlayerCounts {
 
             if player_name_attr_id.is_some_and(|id| update.object_id.0 as usize == id)
                 && let Attribute::String(name) = &update.attribute
-                    && !name.is_empty()
-                {
-                    named_players.insert(name.clone());
-                }
+                && !name.is_empty()
+            {
+                named_players.insert(name.clone());
+            }
 
             if unique_id_attr_id.is_some_and(|id| update.object_id.0 as usize == id)
-                && let Attribute::UniqueId(uid) = &update.attribute {
-                    unique_ids.insert(*uid.clone());
-                }
+                && let Attribute::UniqueId(uid) = &update.attribute
+            {
+                unique_ids.insert(*uid.clone());
+            }
         }
     }
 
