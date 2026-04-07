@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use boxcars::{Attribute, HeaderProp, Replay};
+use boxcars::{Attribute, HeaderProp, Replay, UniqueId};
 use replay_structs::UnsupportedReplayMatch;
 
 const SOCCAR_REPLAY_GAME_TYPE: &str = "TAGame.Replay_Soccar_TA";
@@ -105,25 +105,38 @@ fn collect_player_stat_row_slices(property: &HeaderProp) -> Vec<&Vec<(String, He
     }
 }
 
-/// Counts unique human players by combining two complementary signals:
+/// Counts unique human players by combining three complementary signals:
 ///
 /// - `PlayerStats` header rows: never inflated, but sometimes incomplete.
 /// - Named PRI actors in network frames: never inflated (phantom PRIs have no name), but
-///   occasionally misses a player whose name is replicated through a path the lightweight scan
-///   does not cover.
+///   collapses players that share the same display name (e.g. privacy-hidden "Player 0").
+/// - `UniqueId` on PRI actors: the platform identity (Steam, PS4, Xbox, Epic, etc.) that each
+///   player carries regardless of display name — this is what ballchasing uses to distinguish
+///   players.
 ///
-/// Taking the maximum of both gives the most accurate count.
+/// Taking the maximum of all three gives the most accurate count.
 fn effective_human_player_count(replay: &Replay) -> usize {
     let header_rows = player_stats_row_slices(replay).len();
-    let named_player_count = count_named_pri_players(replay);
-    header_rows.max(named_player_count)
+    let pri_counts = count_pri_players(replay);
+    header_rows
+        .max(pri_counts.named_player_count)
+        .max(pri_counts.unique_id_count)
 }
 
-/// Scans network frames for PRI actors that receive a non-empty `PlayerName` string attribute,
-/// mirroring the same logic the main replay parser uses. Returns the number of unique player names.
-fn count_named_pri_players(replay: &Replay) -> usize {
+struct PriPlayerCounts {
+    named_player_count: usize,
+    unique_id_count: usize,
+}
+
+/// Scans network frames for PRI actors, collecting both unique display names and unique platform
+/// identities (`UniqueId`). Display names can collide (e.g. multiple "Player 0"), but `UniqueId`
+/// is always unique per player.
+fn count_pri_players(replay: &Replay) -> PriPlayerCounts {
     let Some(network) = replay.network_frames.as_ref() else {
-        return 0;
+        return PriPlayerCounts {
+            named_player_count: 0,
+            unique_id_count: 0,
+        };
     };
 
     let player_name_attr_id = replay
@@ -131,12 +144,14 @@ fn count_named_pri_players(replay: &Replay) -> usize {
         .iter()
         .position(|o| o == "Engine.PlayerReplicationInfo:PlayerName");
 
-    let Some(player_name_attr_id) = player_name_attr_id else {
-        return 0;
-    };
+    let unique_id_attr_id = replay
+        .objects
+        .iter()
+        .position(|o| o == "Engine.PlayerReplicationInfo:UniqueId");
 
     let mut pri_actor_ids: HashSet<i32> = HashSet::new();
     let mut named_players: HashSet<String> = HashSet::new();
+    let mut unique_ids: HashSet<UniqueId> = HashSet::new();
 
     for frame in &network.frames {
         for new_actor in &frame.new_actors {
@@ -154,18 +169,25 @@ fn count_named_pri_players(replay: &Replay) -> usize {
             if !pri_actor_ids.contains(&actor_id) {
                 continue;
             }
-            if update.object_id.0 as usize != player_name_attr_id {
-                continue;
-            }
-            if let Attribute::String(name) = &update.attribute
-                && !name.is_empty()
-            {
-                named_players.insert(name.clone());
-            }
+
+            if player_name_attr_id.is_some_and(|id| update.object_id.0 as usize == id)
+                && let Attribute::String(name) = &update.attribute
+                    && !name.is_empty()
+                {
+                    named_players.insert(name.clone());
+                }
+
+            if unique_id_attr_id.is_some_and(|id| update.object_id.0 as usize == id)
+                && let Attribute::UniqueId(uid) = &update.attribute {
+                    unique_ids.insert(*uid.clone());
+                }
         }
     }
 
-    named_players.len()
+    PriPlayerCounts {
+        named_player_count: named_players.len(),
+        unique_id_count: unique_ids.len(),
+    }
 }
 
 /// Breakdown of how the replay parser estimates human player count (for diagnostics).
@@ -175,6 +197,8 @@ pub struct HumanPlayerCountBreakdown {
     pub player_stats_rows: usize,
     /// Unique player names observed on PRI actors in network frames.
     pub named_pri_player_count: usize,
+    /// Unique platform identities (`UniqueId`) observed on PRI actors.
+    pub unique_id_pri_player_count: usize,
     /// `TeamSize` from the replay header when present.
     pub team_size_header: Option<i32>,
     /// Final count used for validation.
@@ -185,12 +209,15 @@ pub struct HumanPlayerCountBreakdown {
 #[must_use]
 pub fn diagnose_human_player_count(replay: &Replay) -> HumanPlayerCountBreakdown {
     let player_stats_rows = player_stats_row_slices(replay).len();
-    let named_pri_player_count = count_named_pri_players(replay);
+    let pri_counts = count_pri_players(replay);
     let team_size_header = header_int_property(replay, "TeamSize");
-    let effective_count = player_stats_rows.max(named_pri_player_count);
+    let effective_count = player_stats_rows
+        .max(pri_counts.named_player_count)
+        .max(pri_counts.unique_id_count);
     HumanPlayerCountBreakdown {
         player_stats_rows,
-        named_pri_player_count,
+        named_pri_player_count: pri_counts.named_player_count,
+        unique_id_pri_player_count: pri_counts.unique_id_count,
         team_size_header,
         effective_count,
     }

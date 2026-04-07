@@ -93,6 +93,7 @@ pub async fn run() -> Result<()> {
                 database_player_row_count,
                 player_stats_rows = breakdown.player_stats_rows,
                 named_pri_player_count = breakdown.named_pri_player_count,
+                unique_id_pri_player_count = breakdown.unique_id_pri_player_count,
                 team_size_header = ?breakdown.team_size_header,
                 effective_count = breakdown.effective_count,
                 "Player count mismatch (expected six humans for 3v3)"
