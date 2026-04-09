@@ -1,6 +1,6 @@
 //! Match-level verdict copy: one line picked from tier-specific pools (no tech wording).
 
-use rand::{Rng, rng};
+use rand::{Rng, RngExt, rng};
 use replay_structs::RankDivision;
 
 use crate::app_state::{PlayerAverage, PredictionResults};

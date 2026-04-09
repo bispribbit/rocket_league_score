@@ -529,9 +529,11 @@ pub struct PlayerCentricGameSequence {
 }
 
 /// Frame subsampling rate: take 1 frame out of every N frames.
-/// This reduces data size while still capturing gameplay patterns.
-/// At 30fps, taking 1/6 frames gives ~5fps effective sampling rate.
-pub const FRAME_SUBSAMPLE_RATE: usize = 6;
+///
+/// At 30fps, taking 1/3 frames gives ~10fps effective sampling rate,
+/// which better captures the fast mechanical decisions that distinguish
+/// high-rank gameplay (speed flips, wavedashes, fast aerials).
+pub const FRAME_SUBSAMPLE_RATE: usize = 3;
 
 /// Extracts a game sequence sample with player-centric features.
 ///

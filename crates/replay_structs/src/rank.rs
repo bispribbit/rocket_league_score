@@ -581,9 +581,18 @@ impl RankDivision {
     }
 
     /// Returns the middle MMR value for this rank.
+    ///
+    /// Supersonic Legend is special-cased to 2000 because the rank is unbounded
+    /// above — real SSL players commonly sit at 2000-2200+.  Using the naïve
+    /// midpoint of `(1883 + 2000) / 2 = 1941` would compress the label gap
+    /// between GC3 Div 4 and SSL to only ~95 MMR, making it very hard for the
+    /// model to distinguish them.
     #[must_use]
     pub const fn mmr_middle(self) -> i32 {
-        i32::midpoint(self.mmr_min(), self.mmr_max())
+        match self {
+            Self::SupersonicLegend => 2000,
+            _ => i32::midpoint(self.mmr_min(), self.mmr_max()),
+        }
     }
 
     /// Returns an iterator over all possible ranks in order from lowest to highest.
@@ -1524,8 +1533,8 @@ mod tests {
     fn test_mmr_middle() {
         // BronzeIDivision1: min=0, max=117, middle=58
         assert_eq!(RankDivision::BronzeIDivision1.mmr_middle(), 58);
-        // SupersonicLegend: min=1883, max=2000, middle=1941
-        assert_eq!(RankDivision::SupersonicLegend.mmr_middle(), 1941);
+        // SupersonicLegend: special-cased to 2000 (unbounded rank)
+        assert_eq!(RankDivision::SupersonicLegend.mmr_middle(), 2000);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use feature_extractor::TOTAL_PLAYERS;
 use replay_structs::{Team, UnsupportedReplayMatch};
 
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;

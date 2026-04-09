@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
-use burn::nn::loss::HuberLoss;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
@@ -98,6 +97,36 @@ const PREFETCH_COUNT: usize = 8;
 /// Higher values = better GPU utilization but less frequent progress updates.
 const LOSS_SYNC_INTERVAL: usize = 10;
 
+/// MMR threshold above which sample weights start increasing (roughly GC1).
+const WEIGHT_MMR_THRESHOLD: f32 = 1400.0;
+
+/// Maximum extra weight for the highest-MMR samples. With this value an SSL
+/// sample (~1941 MMR) gets a raw weight of ~3.45× before normalization.
+const WEIGHT_BOOST: f32 = 3.0;
+
+/// Computes per-sample loss weights from mean target MMR.
+///
+/// Applies a smooth quadratic ramp starting at [`WEIGHT_MMR_THRESHOLD`] so the
+/// model invests more capacity in distinguishing the top of the rank ladder.
+/// Weights are normalised to mean 1.0 so the effective learning rate is unchanged.
+fn compute_mmr_weights<B: Backend>(mean_mmr: Tensor<B, 2>) -> Tensor<B, 2> {
+    let range = MMR_SCALE - WEIGHT_MMR_THRESHOLD;
+    let above_threshold = (mean_mmr - WEIGHT_MMR_THRESHOLD).clamp_min(0.0) / range;
+    let raw_weights = above_threshold.powf_scalar(2.0) * WEIGHT_BOOST + 1.0;
+
+    let mean_weight: f32 = raw_weights
+        .clone()
+        .mean()
+        .into_data()
+        .to_vec()
+        .unwrap_or_else(|_| vec![1.0])
+        .first()
+        .copied()
+        .unwrap_or(1.0);
+
+    raw_weights / mean_weight
+}
+
 /// Trains the sequence model using cached segment data.
 ///
 /// This training method loads segments from disk on-demand.
@@ -148,11 +177,10 @@ where
     // the quadratic regime.  This makes the loss behave like MSE for typical
     // predictions while still capping the gradient for extreme outliers (e.g.
     // corrupt replays with wildly wrong MMR labels).
+    //
+    // Computed element-wise (not via HuberLoss struct) so we can apply
+    // per-sample MMR-based weights before reduction.
     let huber_delta = 1.0_f32;
-    let loss_fn = HuberLoss {
-        delta: huber_delta,
-        lin_bias: huber_delta * huber_delta / 2.0,
-    };
 
     let mut checkpoint_paths = Vec::new();
 
@@ -172,6 +200,7 @@ where
         "Batch size: {}, Learning rate: {}, Segment length: {}, Prefetch: {}",
         config.batch_size, config.learning_rate, config.sequence_length, PREFETCH_COUNT
     );
+    info!("MMR loss weighting enabled: threshold={WEIGHT_MMR_THRESHOLD}, boost={WEIGHT_BOOST}");
     if start_epoch > 0 {
         info!("Resuming from epoch {}", start_epoch + 1);
     }
@@ -232,16 +261,26 @@ where
             // New model returns [batch_size, 6] directly — no reshape needed.
             let predictions = model.forward(batch.inputs);
 
+            // Per-sample weights: upweight GC1+ so the model works harder on the
+            // top of the rank ladder where gameplay features are hardest to separate.
+            let mean_target_mmr = batch.targets.clone().mean_dim(1); // [batch, 1]
+            let weights = compute_mmr_weights::<B>(mean_target_mmr); // [batch, 1]
+
             // Normalise both predictions and targets to [0, 1] before loss computation.
             // This stabilises gradients and makes the Huber delta scale-invariant.
-            let targets_norm = batch.targets.clone() / MMR_SCALE;
+            let targets_norm = batch.targets / MMR_SCALE;
             let predictions_norm = predictions / MMR_SCALE;
 
-            let loss = loss_fn.forward(
-                predictions_norm,
-                targets_norm,
-                burn::nn::loss::Reduction::Mean,
-            );
+            // Element-wise Huber loss (avoids HuberLoss struct so we can weight
+            // per-sample before reduction).
+            let diff = predictions_norm - targets_norm;
+            let abs_diff = diff.clone().abs();
+            let clamped = abs_diff.clone().clamp_min(0.0).clamp_max(huber_delta);
+            let element_loss =
+                clamped.clone().powf_scalar(2.0) * 0.5 + (abs_diff - clamped) * huber_delta;
+
+            // Apply per-sample weights (broadcasts [batch,1] over [batch,6]) and reduce.
+            let loss = (element_loss * weights).mean();
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
             // Accumulate loss on GPU (no sync)
