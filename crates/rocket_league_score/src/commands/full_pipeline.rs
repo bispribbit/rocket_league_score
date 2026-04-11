@@ -65,7 +65,7 @@ pub struct FullTrainConfig {
 impl Default for FullTrainConfig {
     fn default() -> Self {
         Self {
-            model_name: String::from("lstm_v10"),
+            model_name: String::from("lstm_v11"),
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
@@ -814,28 +814,31 @@ fn check_replay_segments_cached(
 }
 
 /// Builds a target MMR array from database player records.
+///
+/// Players whose rank was inferred (not directly known from the API) are left
+/// at the 1000.0 default so they don't corrupt the training signal.
 fn build_target_mmr_from_players(players: &[replay_structs::ReplayPlayer]) -> [f32; TOTAL_PLAYERS] {
     let mut target_mmr = [1000.0f32; TOTAL_PLAYERS];
 
-    // Separate by team and sort
     let mut blue_players: Vec<_> = players.iter().filter(|p| p.team == 0).collect();
     let mut orange_players: Vec<_> = players.iter().filter(|p| p.team == 1).collect();
 
-    // Sort by name for consistent ordering
     blue_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
     orange_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
 
-    // Fill blue team (first 3 slots)
     for (i, player) in blue_players.iter().take(3).enumerate() {
-        if let Some(slot) = target_mmr.get_mut(i) {
-            *slot = player.rank_division.mmr_middle() as f32;
+        if player.rank_known {
+            if let Some(slot) = target_mmr.get_mut(i) {
+                *slot = player.rank_division.mmr_middle() as f32;
+            }
         }
     }
 
-    // Fill orange team (slots 3-5)
     for (i, player) in orange_players.iter().take(3).enumerate() {
-        if let Some(slot) = target_mmr.get_mut(i + 3) {
-            *slot = player.rank_division.mmr_middle() as f32;
+        if player.rank_known {
+            if let Some(slot) = target_mmr.get_mut(i + 3) {
+                *slot = player.rank_division.mmr_middle() as f32;
+            }
         }
     }
 

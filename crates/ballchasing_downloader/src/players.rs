@@ -9,6 +9,10 @@ pub struct ExtractedPlayer {
 
     /// Rank division
     pub rank_division: replay_structs::RankDivision,
+
+    /// Whether the rank came directly from the player's profile (true)
+    /// or was inferred from the lobby min/max midpoint (false).
+    pub rank_known: bool,
 }
 
 /// Extracts player information from ballchasing metadata.
@@ -40,25 +44,36 @@ pub fn extract_players_from_metadata(
     let mut players = Vec::new();
 
     // Helper function to extract rank division from a player's rank or use midpoint
+    /// Result of resolving a player's rank: the division and whether it was
+    /// directly reported by the API (`rank_known = true`) or inferred from
+    /// lobby min/max (`rank_known = false`).
+    struct ResolvedRank {
+        division: RankDivision,
+        rank_known: bool,
+    }
+
     let get_rank_division = |player_rank: &Option<RankInfo>,
                              min_rank: &Option<RankInfo>,
                              max_rank: &Option<RankInfo>|
-     -> anyhow::Result<Option<RankDivision>> {
+     -> anyhow::Result<Option<ResolvedRank>> {
         if let Some(rank) = player_rank {
-            Ok(Some(rank.clone().into()))
+            Ok(Some(ResolvedRank {
+                division: rank.clone().into(),
+                rank_known: true,
+            }))
         } else if let (Some(min_rank), Some(max_rank)) = (min_rank, max_rank) {
-            // Use middle division if player rank is null
             let min_division: RankDivision = min_rank.clone().into();
             let max_division: RankDivision = max_rank.clone().into();
 
-            // Find middle division between min and max using indices
             let min_idx = min_division.as_index();
             let max_idx = max_division.as_index();
             let mid_idx = usize::midpoint(min_idx, max_idx);
 
-            // Convert index back to RankDivision
             let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
-            Ok(all_divisions.get(mid_idx).copied())
+            Ok(all_divisions.get(mid_idx).copied().map(|division| ResolvedRank {
+                division,
+                rank_known: false,
+            }))
         } else {
             Ok(None)
         }
@@ -72,12 +87,13 @@ pub fn extract_players_from_metadata(
      -> anyhow::Result<Vec<ExtractedPlayer>> {
         let mut team_players_vec = Vec::new();
         for player in team_players {
-            let rank_division = get_rank_division(&player.rank, min_rank, max_rank)?;
-            if let (Some(name), Some(rank_div)) = (player.name.as_ref(), rank_division) {
+            let resolved = get_rank_division(&player.rank, min_rank, max_rank)?;
+            if let (Some(name), Some(resolved)) = (player.name.as_ref(), resolved) {
                 team_players_vec.push(ExtractedPlayer {
                     player_name: name.clone(),
                     team: team_number,
-                    rank_division: rank_div,
+                    rank_division: resolved.division,
+                    rank_known: resolved.rank_known,
                 });
             }
         }

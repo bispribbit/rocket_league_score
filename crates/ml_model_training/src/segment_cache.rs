@@ -58,7 +58,7 @@ pub const fn compute_segment_count(total_frames: usize, segment_length: usize) -
 
 /// Cache format version. Bump this when the player ordering or feature layout changes
 /// to force automatic regeneration of all cached segments.
-const CACHE_VERSION: &str = "v4";
+const CACHE_VERSION: &str = "v5";
 
 /// Generates the directory path for a replay's segments.
 ///

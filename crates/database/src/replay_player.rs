@@ -19,19 +19,21 @@ pub async fn insert_replay_players(players: &[ReplayPlayer]) -> Result<(), sqlx:
     let player_names: Vec<String> = players.iter().map(|p| p.player_name.clone()).collect();
     let teams: Vec<i16> = players.iter().map(|p| p.team).collect();
     let rank_divisions: Vec<RankDivision> = players.iter().map(|p| p.rank_division).collect();
+    let rank_knowns: Vec<bool> = players.iter().map(|p| p.rank_known).collect();
 
     let pool = get_pool();
 
     sqlx::query!(
         r#"
-        INSERT INTO replay_players (replay_id, player_name, team, rank_division)
-        SELECT * FROM unnest($1::uuid[], $2::text[], $3::smallint[], $4::rank_division[])
+        INSERT INTO replay_players (replay_id, player_name, team, rank_division, rank_known)
+        SELECT * FROM unnest($1::uuid[], $2::text[], $3::smallint[], $4::rank_division[], $5::boolean[])
         ON CONFLICT (replay_id, player_name) DO NOTHING
         "#,
         &replay_ids as &[Uuid],
         &player_names as &[String],
         &teams as &[i16],
-        &rank_divisions as &[RankDivision]
+        &rank_divisions as &[RankDivision],
+        &rank_knowns as &[bool]
     )
     .execute(pool)
     .await?;
@@ -51,7 +53,7 @@ pub async fn list_replay_players_by_replay(
     sqlx::query_as!(
         ReplayPlayer,
         r#"
-        SELECT id, replay_id, player_name, team, rank_division as "rank_division: RankDivision", created_at
+        SELECT id, replay_id, player_name, team, rank_division as "rank_division: RankDivision", rank_known, created_at
         FROM replay_players
         WHERE replay_id = $1
         ORDER BY team, player_name

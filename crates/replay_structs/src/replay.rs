@@ -13,6 +13,7 @@ pub struct ReplayPlayer {
     pub player_name: String,
     pub team: i16,
     pub rank_division: RankDivision,
+    pub rank_known: bool,
     pub created_at: DateTime<Utc>,
 }
 
