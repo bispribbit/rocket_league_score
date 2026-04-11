@@ -8,6 +8,10 @@ use replay_structs::UnsupportedReplayMatch;
 const SOCCAR_REPLAY_GAME_TYPE: &str = "TAGame.Replay_Soccar_TA";
 const RANKED_STANDARD_PLAYLIST_ID: i32 = 13;
 
+/// Validates that a replay is a supported match.
+///
+/// # Errors
+/// Returns an error if the replay is not a supported match.
 pub fn validate_supported_match(replay: &Replay) -> Result<(), UnsupportedReplayMatch> {
     if replay.game_type != SOCCAR_REPLAY_GAME_TYPE {
         return Err(UnsupportedReplayMatch {

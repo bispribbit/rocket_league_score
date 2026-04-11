@@ -116,7 +116,43 @@ pub(crate) fn build_goal_markers(
     markers
 }
 
-/// Average MMR across segments per player, mapped to global rank badges.
+/// Median of a pre-sorted slice of `f32` values. Returns `0.0` for an empty slice.
+///
+/// Even-length slices return the midpoint of the two central values.
+fn median_f32(sorted_values: &[f32]) -> f32 {
+    let len = sorted_values.len();
+    if len == 0 {
+        return 0.0;
+    }
+    let mid = len / 2;
+    if len % 2 == 1 {
+        sorted_values.get(mid).copied().unwrap_or(0.0)
+    } else {
+        let lower = sorted_values
+            .get(mid.saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0);
+        let upper = sorted_values.get(mid).copied().unwrap_or(0.0);
+        f32::midpoint(lower, upper)
+    }
+}
+
+/// Median of per-player median MMR values across the lobby.
+///
+/// Used as the lobby baseline when deciding whether a player looks suspiciously high.
+pub(crate) fn lobby_median_mmr(player_averages: &[crate::app_state::PlayerAverage]) -> f32 {
+    let mut values: Vec<f32> = player_averages
+        .iter()
+        .map(|player| player.median_mmr)
+        .collect();
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    median_f32(&values)
+}
+
+/// Median MMR across segments per player, mapped to global rank badges.
+///
+/// The median is used instead of the mean so that a few low segments (e.g. an SSL
+/// player having an off-moment) do not pull the final rank estimate down.
 pub(crate) fn global_ranks_from_predictions(
     segment_predictions: &[SegmentPrediction],
 ) -> [RankDivision; TOTAL_PLAYERS] {
@@ -124,14 +160,14 @@ pub(crate) fn global_ranks_from_predictions(
     if segment_predictions.is_empty() {
         return result;
     }
-    let segment_count = segment_predictions.len() as f32;
     for (player_index, slot) in result.iter_mut().enumerate() {
-        let sum_mmr: f32 = segment_predictions
+        let mut mmr_values: Vec<f32> = segment_predictions
             .iter()
             .filter_map(|segment| segment.player_predictions.get(player_index).copied())
-            .sum();
-        let average_mmr = sum_mmr / segment_count;
-        *slot = RankDivision::from(average_mmr);
+            .collect();
+        mmr_values
+            .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+        *slot = RankDivision::from(median_f32(&mmr_values));
     }
     result
 }
@@ -192,7 +228,7 @@ pub(crate) fn build_prediction_results(
 
     let player_averages: Vec<PlayerAverage> = (0..TOTAL_PLAYERS)
         .map(|player_index| {
-            let sum: f32 = segment_predictions
+            let mut mmr_values: Vec<f32> = segment_predictions
                 .iter()
                 .map(|segment| {
                     segment
@@ -201,9 +237,11 @@ pub(crate) fn build_prediction_results(
                         .copied()
                         .unwrap_or(0.0)
                 })
-                .sum();
-            let count = segment_predictions.len().max(1) as f32;
-            let average_mmr = sum / count;
+                .collect();
+            mmr_values.sort_by(|left, right| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let median_mmr = median_f32(&mmr_values);
             let name = player_names
                 .get(player_index)
                 .cloned()
@@ -212,11 +250,11 @@ pub(crate) fn build_prediction_results(
                 .get(player_index)
                 .copied()
                 .unwrap_or(Team::Blue);
-            let rank = RankDivision::from(average_mmr);
+            let rank = RankDivision::from(median_mmr);
             PlayerAverage {
                 name,
                 team,
-                average_mmr,
+                median_mmr,
                 rank,
             }
         })

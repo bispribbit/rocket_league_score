@@ -9,6 +9,7 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
+use replay_structs::{Rank, RankDivision};
 use tracing::info;
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
@@ -478,7 +479,56 @@ where
     })
 }
 
+/// Per-rank error accumulator for validation diagnostics.
+#[derive(Default)]
+struct PerRankErrors {
+    squared_error_sum: f64,
+    count: usize,
+}
+
+impl PerRankErrors {
+    fn rmse(&self) -> f32 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        ((self.squared_error_sum / self.count as f64) as f32).sqrt()
+    }
+}
+
+/// Collects squared errors per [`Rank`] from raw prediction/target vectors.
+fn accumulate_per_rank_errors(
+    stats: &mut std::collections::HashMap<Rank, PerRankErrors>,
+    predictions: &[f32],
+    targets: &[f32],
+) {
+    for (pred, target) in predictions.iter().zip(targets.iter()) {
+        let rank = Rank::from(RankDivision::from(*target));
+        let entry = stats.entry(rank).or_default();
+        let err = (*pred - *target) as f64;
+        entry.squared_error_sum += err * err;
+        entry.count += 1;
+    }
+}
+
+fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>) {
+    info!("  Validation RMSE by rank:");
+    for rank in Rank::all_ranked() {
+        if let Some(entry) = stats.get(&rank)
+            && entry.count > 0
+        {
+            info!(
+                "    {:<20} {:>7.1} MMR RMSE  (n={:>6})",
+                rank.as_api_string(),
+                entry.rmse(),
+                entry.count
+            );
+        }
+    }
+}
+
 /// Computes validation loss on a segment dataset.
+///
+/// Also logs a per-rank-tier RMSE breakdown for diagnostics.
 fn compute_validation_loss<B: Backend>(
     model: &SequenceModel<B>,
     dataset: &Arc<SegmentStore>,
@@ -492,6 +542,8 @@ fn compute_validation_loss<B: Backend>(
 
     let mut total_loss = 0.0;
     let mut total_samples = 0;
+    let mut rank_stats: std::collections::HashMap<Rank, PerRankErrors> =
+        std::collections::HashMap::new();
 
     let indices: Vec<usize> = (0..num_segments).collect();
 
@@ -510,8 +562,18 @@ fn compute_validation_loss<B: Backend>(
         // New model returns [batch_size, 6] directly — no reshape needed.
         let predictions = model.forward(batch.inputs);
 
-        // Compute Huber loss on normalised targets (same as training).
-        let targets_norm = batch.targets.clone() / MMR_SCALE;
+        // Extract raw values for per-rank breakdown before normalizing.
+        let raw_preds: Vec<f32> = predictions.clone().into_data().to_vec().unwrap_or_default();
+        let raw_targets: Vec<f32> = batch
+            .targets
+            .clone()
+            .into_data()
+            .to_vec()
+            .unwrap_or_default();
+        accumulate_per_rank_errors(&mut rank_stats, &raw_preds, &raw_targets);
+
+        // Compute MSE on normalised targets for the overall validation metric.
+        let targets_norm = batch.targets / MMR_SCALE;
         let predictions_norm = predictions / MMR_SCALE;
         let diff = predictions_norm - targets_norm;
         let squared = diff.powf_scalar(2.0);
@@ -528,6 +590,8 @@ fn compute_validation_loss<B: Backend>(
         total_loss += loss_value as f64 * num_items as f64;
         total_samples += num_items;
     }
+
+    log_per_rank_breakdown(&rank_stats);
 
     if total_samples > 0 {
         (total_loss / total_samples as f64) as f32

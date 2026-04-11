@@ -36,9 +36,9 @@ pub(crate) struct PlayerAverage {
     pub(crate) name: String,
     /// Player team.
     pub(crate) team: Team,
-    /// Average predicted MMR across all segments.
-    pub(crate) average_mmr: f32,
-    /// Rank derived from average MMR.
+    /// Median predicted MMR across all segments.
+    pub(crate) median_mmr: f32,
+    /// Rank derived from median MMR.
     pub(crate) rank: RankDivision,
 }
 

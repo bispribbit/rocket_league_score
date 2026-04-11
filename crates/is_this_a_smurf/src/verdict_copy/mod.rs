@@ -3,8 +3,8 @@
 use rand::{Rng, RngExt, rng};
 use replay_structs::RankDivision;
 
-use crate::app_state::{PlayerAverage, PredictionResults};
-use crate::prediction::SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN;
+use crate::app_state::PredictionResults;
+use crate::prediction::{SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN, lobby_median_mmr};
 
 mod no_smurf_lines;
 
@@ -107,25 +107,6 @@ pub(crate) const fn no_smurf_lines_for_median_rank(rank: RankDivision) -> &'stat
     }
 }
 
-fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
-    let mut values: Vec<f32> = player_averages
-        .iter()
-        .map(|player| player.average_mmr)
-        .collect();
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values.get(mid).copied().unwrap_or(0.0)
-    } else {
-        let lower = values.get(mid.saturating_sub(1)).copied().unwrap_or(0.0);
-        let upper = values.get(mid).copied().unwrap_or(0.0);
-        f32::midpoint(lower, upper)
-    }
-}
-
 fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
     player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
 }
@@ -199,14 +180,14 @@ const MULTI_SMURF_LINES: &[&str] = &[
 #[must_use]
 pub(crate) fn match_verdict_paragraph(results: &PredictionResults) -> String {
     let mut rng = rng();
-    let lobby_median_mmr = lobby_median_average_mmr(&results.player_averages);
+    let lobby_median_mmr = lobby_median_mmr(&results.player_averages);
     let median_rank = RankDivision::from(lobby_median_mmr);
     let no_smurf_pool = no_smurf_lines_for_median_rank(median_rank);
 
     let suspects: Vec<String> = results
         .player_averages
         .iter()
-        .filter(|player| player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr))
+        .filter(|player| player_looks_high_for_lobby(player.median_mmr, lobby_median_mmr))
         .map(|player| player.name.clone())
         .collect();
 

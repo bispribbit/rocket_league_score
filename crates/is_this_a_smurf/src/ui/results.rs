@@ -8,7 +8,7 @@ use rand::{RngExt, rng};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;
-use crate::prediction::SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN;
+use crate::prediction::{SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN, lobby_median_mmr};
 use crate::rank_icon::rank_division_icon_asset;
 
 const PREDICTED_RANK_ROAST_LABELS: [&str; 10] = [
@@ -23,25 +23,6 @@ const PREDICTED_RANK_ROAST_LABELS: [&str; 10] = [
     "Audited Ball-Chasing Bracket",
     "Professional Opinion Nobody Asked For",
 ];
-
-fn lobby_median_average_mmr(player_averages: &[PlayerAverage]) -> f32 {
-    let mut values: Vec<f32> = player_averages
-        .iter()
-        .map(|player| player.average_mmr)
-        .collect();
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values.get(mid).copied().unwrap_or(0.0)
-    } else {
-        let lower = values.get(mid.saturating_sub(1)).copied().unwrap_or(0.0);
-        let upper = values.get(mid).copied().unwrap_or(0.0);
-        f32::midpoint(lower, upper)
-    }
-}
 
 fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
     player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
@@ -72,7 +53,7 @@ pub(crate) fn PlayerSummaryGrid(results: PredictionResults) -> Element {
         .cloned()
         .collect();
 
-    let lobby_median_mmr = lobby_median_average_mmr(&results.player_averages);
+    let lobby_median_mmr = lobby_median_mmr(&results.player_averages);
 
     rsx! {
         div { class: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-10",
@@ -227,7 +208,7 @@ fn TeamSummaryCard(
     } else {
         players_complete
             .iter()
-            .map(|player| player.average_mmr)
+            .map(|player| player.median_mmr)
             .sum::<f32>()
             / players_complete.len() as f32
     };
@@ -265,7 +246,7 @@ fn TeamSummaryCard(
                                 p { class: "font-semibold text-gray-100 break-words", "{player.name}" }
                                 p { class: "text-sm text-gray-500", "{player.rank}" }
                             }
-                            if player_looks_high_for_lobby(player.average_mmr, lobby_median_mmr) {
+                            if player_looks_high_for_lobby(player.median_mmr, lobby_median_mmr) {
                                 div { class: "flex shrink-0 items-center justify-center gap-2 sm:gap-3",
                                     LobbyAlertTriangleIcon {}
                                     img {
