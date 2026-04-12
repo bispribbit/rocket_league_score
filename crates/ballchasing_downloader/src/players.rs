@@ -70,10 +70,13 @@ pub fn extract_players_from_metadata(
             let mid_idx = usize::midpoint(min_idx, max_idx);
 
             let all_divisions: Vec<RankDivision> = RankDivision::all().collect();
-            Ok(all_divisions.get(mid_idx).copied().map(|division| ResolvedRank {
-                division,
-                rank_known: false,
-            }))
+            Ok(all_divisions
+                .get(mid_idx)
+                .copied()
+                .map(|division| ResolvedRank {
+                    division,
+                    rank_known: false,
+                }))
         } else {
             Ok(None)
         }

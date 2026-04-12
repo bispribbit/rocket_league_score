@@ -815,10 +815,12 @@ fn check_replay_segments_cached(
 
 /// Builds a target MMR array from database player records.
 ///
-/// Players whose rank was inferred (not directly known from the API) are left
-/// at the 1000.0 default so they don't corrupt the training signal.
+/// Slots where the rank is unknown (inferred from lobby midpoint) are set to
+/// `0.0` as a sentinel. The training loop masks these slots so they produce no
+/// gradient — the model is only trained on players whose rank was confirmed by
+/// the Ballchasing API.
 fn build_target_mmr_from_players(players: &[replay_structs::ReplayPlayer]) -> [f32; TOTAL_PLAYERS] {
-    let mut target_mmr = [1000.0f32; TOTAL_PLAYERS];
+    let mut target_mmr = [0.0f32; TOTAL_PLAYERS];
 
     let mut blue_players: Vec<_> = players.iter().filter(|p| p.team == 0).collect();
     let mut orange_players: Vec<_> = players.iter().filter(|p| p.team == 1).collect();
@@ -827,18 +829,18 @@ fn build_target_mmr_from_players(players: &[replay_structs::ReplayPlayer]) -> [f
     orange_players.sort_by(|a, b| a.player_name.cmp(&b.player_name));
 
     for (i, player) in blue_players.iter().take(3).enumerate() {
-        if player.rank_known {
-            if let Some(slot) = target_mmr.get_mut(i) {
-                *slot = player.rank_division.mmr_middle() as f32;
-            }
+        if player.rank_known
+            && let Some(slot) = target_mmr.get_mut(i)
+        {
+            *slot = player.rank_division.mmr_middle() as f32;
         }
     }
 
     for (i, player) in orange_players.iter().take(3).enumerate() {
-        if player.rank_known {
-            if let Some(slot) = target_mmr.get_mut(i + 3) {
-                *slot = player.rank_division.mmr_middle() as f32;
-            }
+        if player.rank_known
+            && let Some(slot) = target_mmr.get_mut(i + 3)
+        {
+            *slot = player.rank_division.mmr_middle() as f32;
         }
     }
 

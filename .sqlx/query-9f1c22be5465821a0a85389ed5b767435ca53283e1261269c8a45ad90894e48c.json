@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, replay_id, player_name, team, rank_division as \"rank_division: RankDivision\", created_at\n        FROM replay_players\n        WHERE replay_id = $1\n        ORDER BY team, player_name\n        ",
+  "query": "\n        SELECT id, replay_id, player_name, team, rank_division as \"rank_division: RankDivision\", rank_known, created_at\n        FROM replay_players\n        WHERE replay_id = $1\n        ORDER BY team, player_name\n        ",
   "describe": {
     "columns": [
       {
@@ -124,6 +124,11 @@
       },
       {
         "ordinal": 5,
+        "name": "rank_known",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
       }
@@ -139,8 +144,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "221462396e6a38beadd05f353b5de7190aa3ffb9627d536456336d1bb5b35663"
+  "hash": "9f1c22be5465821a0a85389ed5b767435ca53283e1261269c8a45ad90894e48c"
 }

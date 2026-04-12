@@ -259,29 +259,40 @@ where
 
             // Time for forward pass
             let t_forward_start = Instant::now();
-            // New model returns [batch_size, 6] directly — no reshape needed.
             let predictions = model.forward(batch.inputs);
 
-            // Per-sample weights: upweight GC1+ so the model works harder on the
-            // top of the rank ladder where gameplay features are hardest to separate.
-            let mean_target_mmr = batch.targets.clone().mean_dim(1); // [batch, 1]
+            // Mask: 1.0 where the target is known (> 0), 0.0 for sentinel slots.
+            // This prevents unknown-rank players from contributing any gradient.
+            let mask = batch.targets.clone().greater_elem(0.0).float(); // [batch, 6]
+            let known_count = mask
+                .clone()
+                .sum()
+                .into_data()
+                .to_vec()
+                .unwrap_or_else(|_| vec![1.0f32])
+                .first()
+                .copied()
+                .unwrap_or(1.0f32)
+                .max(1.0f32);
+
+            // Per-sample weights based on mean MMR of *known* slots only.
+            let known_per_row = mask.clone().sum_dim(1).clamp_min(1.0); // [batch, 1]
+            let masked_targets = batch.targets.clone() * mask.clone();
+            let mean_target_mmr = masked_targets.clone().sum_dim(1) / known_per_row; // [batch, 1]
             let weights = compute_mmr_weights::<B>(mean_target_mmr); // [batch, 1]
 
-            // Normalise both predictions and targets to [0, 1] before loss computation.
-            // This stabilises gradients and makes the Huber delta scale-invariant.
             let targets_norm = batch.targets / MMR_SCALE;
             let predictions_norm = predictions / MMR_SCALE;
 
-            // Element-wise Huber loss (avoids HuberLoss struct so we can weight
-            // per-sample before reduction).
             let diff = predictions_norm - targets_norm;
             let abs_diff = diff.clone().abs();
             let clamped = abs_diff.clone().clamp_min(0.0).clamp_max(huber_delta);
             let element_loss =
                 clamped.clone().powf_scalar(2.0) * 0.5 + (abs_diff - clamped) * huber_delta;
 
-            // Apply per-sample weights (broadcasts [batch,1] over [batch,6]) and reduce.
-            let loss = (element_loss * weights).mean();
+            // Zero out loss for unknown-rank slots, apply per-sample weights, then
+            // average over the number of *known* elements (not total elements).
+            let loss = (element_loss * mask * weights).sum() / known_count;
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
             // Accumulate loss on GPU (no sync)
@@ -496,12 +507,17 @@ impl PerRankErrors {
 }
 
 /// Collects squared errors per [`Rank`] from raw prediction/target vectors.
+///
+/// Targets with value `0.0` (sentinel for unknown rank) are skipped.
 fn accumulate_per_rank_errors(
     stats: &mut std::collections::HashMap<Rank, PerRankErrors>,
     predictions: &[f32],
     targets: &[f32],
 ) {
     for (pred, target) in predictions.iter().zip(targets.iter()) {
+        if *target <= 0.0 {
+            continue;
+        }
         let rank = Rank::from(RankDivision::from(*target));
         let entry = stats.entry(rank).or_default();
         let err = (*pred - *target) as f64;
@@ -558,8 +574,6 @@ fn compute_validation_loss<B: Backend>(
             continue;
         };
 
-        let num_items = batch_indices.len();
-        // New model returns [batch_size, 6] directly — no reshape needed.
         let predictions = model.forward(batch.inputs);
 
         // Extract raw values for per-rank breakdown before normalizing.
@@ -572,12 +586,24 @@ fn compute_validation_loss<B: Backend>(
             .unwrap_or_default();
         accumulate_per_rank_errors(&mut rank_stats, &raw_preds, &raw_targets);
 
-        // Compute MSE on normalised targets for the overall validation metric.
+        // Mask unknown-rank slots (target == 0.0 sentinel).
+        let mask = batch.targets.clone().greater_elem(0.0).float();
+        let known_count = mask
+            .clone()
+            .sum()
+            .into_data()
+            .to_vec()
+            .unwrap_or_else(|_| vec![1.0f32])
+            .first()
+            .copied()
+            .unwrap_or(1.0f32)
+            .max(1.0f32);
+
         let targets_norm = batch.targets / MMR_SCALE;
         let predictions_norm = predictions / MMR_SCALE;
         let diff = predictions_norm - targets_norm;
-        let squared = diff.powf_scalar(2.0);
-        let mse = squared.mean();
+        let squared = diff.powf_scalar(2.0) * mask;
+        let mse = squared.sum() / known_count;
 
         let loss_value: f32 = mse
             .into_data()
@@ -587,8 +613,8 @@ fn compute_validation_loss<B: Backend>(
             .copied()
             .unwrap_or(0.0);
 
-        total_loss += loss_value as f64 * num_items as f64;
-        total_samples += num_items;
+        total_loss += loss_value as f64;
+        total_samples += 1;
     }
 
     log_per_rank_breakdown(&rank_stats);

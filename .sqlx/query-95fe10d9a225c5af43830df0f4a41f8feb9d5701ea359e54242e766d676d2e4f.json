@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO replay_players (replay_id, player_name, team, rank_division)\n        SELECT * FROM unnest($1::uuid[], $2::text[], $3::smallint[], $4::rank_division[])\n        ON CONFLICT (replay_id, player_name) DO NOTHING\n        ",
+  "query": "\n        INSERT INTO replay_players (replay_id, player_name, team, rank_division, rank_known)\n        SELECT * FROM unnest($1::uuid[], $2::text[], $3::smallint[], $4::rank_division[], $5::boolean[])\n        ON CONFLICT (replay_id, player_name) DO NOTHING\n        ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -109,10 +109,11 @@
               }
             }
           }
-        }
+        },
+        "BoolArray"
       ]
     },
     "nullable": []
   },
-  "hash": "93772f9534ddec8374feae79f8893f19c560066da03326fc4015be3db7d06bcc"
+  "hash": "95fe10d9a225c5af43830df0f4a41f8feb9d5701ea359e54242e766d676d2e4f"
 }
