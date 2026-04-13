@@ -118,30 +118,70 @@ fn random_pool_index(rng: &mut impl Rng, pool_len: usize) -> usize {
     rng.random_range(0..pool_len)
 }
 
-fn join_suspect_names(names: &[String]) -> String {
+/// One fragment of the verdict line: normal copy or a smurf player name (rendered bold in the UI).
+#[derive(Debug, Clone)]
+pub(crate) enum VerdictSegment {
+    Plain(String),
+    BoldName(String),
+}
+
+fn join_suspect_name_segments(names: &[String]) -> Vec<VerdictSegment> {
     match names.len() {
-        0 => String::new(),
-        1 => names.first().cloned().unwrap_or_default(),
-        2 => format!(
-            "{} and {}",
-            names.first().map_or("", String::as_str),
-            names.get(1).map_or("", String::as_str)
-        ),
+        0 => Vec::new(),
+        1 => vec![VerdictSegment::BoldName(
+            names.first().cloned().unwrap_or_default(),
+        )],
+        2 => vec![
+            VerdictSegment::BoldName(names.first().cloned().unwrap_or_default()),
+            VerdictSegment::Plain(" and ".to_string()),
+            VerdictSegment::BoldName(names.get(1).cloned().unwrap_or_default()),
+        ],
         _ => {
-            let mut out = String::new();
+            let mut segments: Vec<VerdictSegment> = Vec::new();
             for (index, name) in names.iter().enumerate() {
                 if index > 0 {
                     if index == names.len() - 1 {
-                        out.push_str(", and ");
+                        segments.push(VerdictSegment::Plain(", and ".to_string()));
                     } else {
-                        out.push_str(", ");
+                        segments.push(VerdictSegment::Plain(", ".to_string()));
                     }
                 }
-                out.push_str(name);
+                segments.push(VerdictSegment::BoldName(name.clone()));
             }
-            out
+            segments
         }
     }
+}
+
+fn split_single_smurf_line(template: &str, name: &str) -> Vec<VerdictSegment> {
+    if !template.contains(SMURF_NAME_PLACEHOLDER) {
+        return vec![VerdictSegment::Plain(template.to_string())];
+    }
+    let parts: Vec<&str> = template.split(SMURF_NAME_PLACEHOLDER).collect();
+    let before = parts.first().copied().unwrap_or("");
+    let after = parts.get(1).copied().unwrap_or("");
+    vec![
+        VerdictSegment::Plain(before.to_string()),
+        VerdictSegment::BoldName(name.to_string()),
+        VerdictSegment::Plain(after.to_string()),
+    ]
+}
+
+fn split_multi_smurf_line(
+    template: &str,
+    name_segments: Vec<VerdictSegment>,
+) -> Vec<VerdictSegment> {
+    if !template.contains(SMURF_NAMES_PLACEHOLDER) {
+        return vec![VerdictSegment::Plain(template.to_string())];
+    }
+    let parts: Vec<&str> = template.split(SMURF_NAMES_PLACEHOLDER).collect();
+    let before = parts.first().copied().unwrap_or("");
+    let after = parts.get(1).copied().unwrap_or("");
+    let mut segments: Vec<VerdictSegment> = Vec::new();
+    segments.push(VerdictSegment::Plain(before.to_string()));
+    segments.extend(name_segments);
+    segments.push(VerdictSegment::Plain(after.to_string()));
+    segments
 }
 
 /// Single-smurf lines: use `{name}` placeholder.
@@ -176,9 +216,9 @@ const MULTI_SMURF_LINES: &[&str] = &[
     "{names} are the reason the rest of the lobby suddenly needs a union rep.",
 ];
 
-/// One paragraph for the verdict banner under the summary grid.
+/// Segments for the verdict banner under the summary grid (smurf names are separate for bold styling).
 #[must_use]
-pub(crate) fn match_verdict_paragraph(results: &PredictionResults) -> String {
+pub(crate) fn match_verdict_segments(results: &PredictionResults) -> Vec<VerdictSegment> {
     let mut rng = rng();
     let lobby_median_mmr = lobby_median_mmr(&results.player_averages);
     let median_rank = RankDivision::from(lobby_median_mmr);
@@ -193,11 +233,11 @@ pub(crate) fn match_verdict_paragraph(results: &PredictionResults) -> String {
 
     if suspects.is_empty() {
         let variant = random_pool_index(&mut rng, no_smurf_pool.len());
-        no_smurf_pool
+        let line = no_smurf_pool
             .get(variant)
             .copied()
-            .unwrap_or(NO_SMURF_LINE_FALLBACK)
-            .to_string()
+            .unwrap_or(NO_SMURF_LINE_FALLBACK);
+        vec![VerdictSegment::Plain(line.to_string())]
     } else if suspects.len() == 1 {
         let variant = random_pool_index(&mut rng, SINGLE_SMURF_LINES.len());
         let line = SINGLE_SMURF_LINES
@@ -205,13 +245,14 @@ pub(crate) fn match_verdict_paragraph(results: &PredictionResults) -> String {
             .copied()
             .unwrap_or(SMURF_SINGLE_LINE_FALLBACK);
         let name = suspects.first().map_or("", String::as_str);
-        line.replace(SMURF_NAME_PLACEHOLDER, name)
+        split_single_smurf_line(line, name)
     } else {
         let variant = random_pool_index(&mut rng, MULTI_SMURF_LINES.len());
         let line = MULTI_SMURF_LINES
             .get(variant)
             .copied()
             .unwrap_or("{names} tilted this lobby off its usual axis.");
-        line.replace(SMURF_NAMES_PLACEHOLDER, &join_suspect_names(&suspects))
+        let name_segments = join_suspect_name_segments(&suspects);
+        split_multi_smurf_line(line, name_segments)
     }
 }

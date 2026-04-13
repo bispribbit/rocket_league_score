@@ -12,10 +12,52 @@ use crate::app_state::{
 /// MMR above the lobby median before we treat a player as a smurf suspect (approximate).
 pub(crate) const SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN: f32 = 200.0;
 
+/// Cached regulation-clock parameters derived once from the frame list.
+///
+/// Rocket League replays store an absolute `time` (seconds from replay start) and a
+/// `seconds_remaining` game-clock countdown (starts at 300 for a 5-minute match).
+/// After the clock reaches 0 the ball stays live (ball-on-ground rule) and overtime
+/// also plays with `seconds_remaining == 0`.
+///
+/// Play-time is what a viewer sees on ballchasing.com: 0:00 at kickoff, 5:00 at the
+/// end of regulation, and beyond 5:00 for overtime / ball-on-ground.
+pub(crate) struct PlayTimeClock {
+    pub(crate) regulation_seconds: f32,
+    replay_time_at_clock_zero: Option<f32>,
+}
+
+impl PlayTimeClock {
+    pub(crate) fn from_frames(frames: &[GameFrame]) -> Self {
+        let regulation_seconds = frames
+            .first()
+            .map_or(300.0, |frame| frame.seconds_remaining as f32);
+        let replay_time_at_clock_zero = frames
+            .iter()
+            .find(|frame| frame.seconds_remaining <= 0)
+            .map(|frame| frame.time);
+        Self {
+            regulation_seconds,
+            replay_time_at_clock_zero,
+        }
+    }
+
+    pub(crate) fn play_time(&self, frame: &GameFrame) -> f32 {
+        if frame.seconds_remaining > 0 {
+            self.regulation_seconds - frame.seconds_remaining as f32
+        } else if let Some(zero_time) = self.replay_time_at_clock_zero {
+            self.regulation_seconds + (frame.time - zero_time).max(0.0)
+        } else {
+            self.regulation_seconds
+        }
+    }
+}
+
 /// Builds segment step infos (time ranges) from parsed frames and sequence length.
 ///
 /// `sequence_length` counts **subsampled** frames (same step as training:
-/// [`FRAME_SUBSAMPLE_RATE`]). Wall-clock bounds use the corresponding span in the original replay.
+/// [`FRAME_SUBSAMPLE_RATE`]). Times use the absolute replay clock (`frame.time`) so that
+/// every segment spans the same number of network frames and produces equal-width bars
+/// on the timeline.
 pub(crate) fn segment_step_infos(
     frames: &[GameFrame],
     sequence_length: usize,
@@ -38,6 +80,35 @@ pub(crate) fn segment_step_infos(
             }
         })
         .collect()
+}
+
+/// Same boundary extraction as [`compute_segment_boundary_times`] but using the game
+/// clock (`seconds_remaining`) instead of the raw replay clock.  Used only for the
+/// human-readable labels under the timeline axis.
+pub(crate) fn compute_segment_boundary_play_times(
+    frames: &[GameFrame],
+    segment_steps: &[SegmentStepInfo],
+    sequence_length: usize,
+) -> Vec<f32> {
+    let clock = PlayTimeClock::from_frames(frames);
+    let step = FRAME_SUBSAMPLE_RATE;
+    let mut play_times = Vec::with_capacity(segment_steps.len() + 1);
+    for (seg_idx, _) in segment_steps.iter().enumerate() {
+        let frame_index = seg_idx * sequence_length * step;
+        let play_time = frames
+            .get(frame_index)
+            .map_or(0.0, |frame| clock.play_time(frame));
+        play_times.push(play_time);
+    }
+    if let Some(last_step) = segment_steps.last() {
+        let last_seg_idx = segment_steps.len() - 1;
+        let end_frame_index = ((last_seg_idx + 1) * sequence_length * step).min(frames.len());
+        let play_time = frames
+            .get(end_frame_index.saturating_sub(1))
+            .map_or(last_step.end_time, |frame| clock.play_time(frame));
+        play_times.push(play_time);
+    }
+    play_times
 }
 
 /// Converts per-player predicted MMR to rank divisions for one segment.
@@ -94,6 +165,7 @@ pub(crate) fn prepare_players_for_timeline(parsed: &ParsedReplay) -> (Vec<String
 }
 
 /// Goal markers for the timeline, derived from replay header goals and frame times.
+/// Uses absolute replay time for positioning on the equal-width segment timeline.
 pub(crate) fn build_goal_markers(
     parsed: &ParsedReplay,
     player_names: &[String],

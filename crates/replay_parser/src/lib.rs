@@ -172,6 +172,10 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     let player_name_attr =
         find_object_id(&replay.objects, "Engine.PlayerReplicationInfo:PlayerName");
     let team_attr = find_object_id(&replay.objects, "Engine.PlayerReplicationInfo:Team");
+    let seconds_remaining_attr = find_object_id(
+        &replay.objects,
+        "TAGame.GameEvent_Soccar_TA:SecondsRemaining",
+    );
 
     let network_frames = replay
         .network_frames
@@ -446,9 +450,8 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                     }
                 }
                 Attribute::Int(seconds) => {
-                    // Check if this is SecondsRemaining
-                    let object_name = replay.objects.get(update.stream_id.0 as usize);
-                    if object_name.is_some_and(|n| n.contains("SecondsRemaining")) {
+                    let object_id = update.object_id.0 as usize;
+                    if Some(object_id) == seconds_remaining_attr {
                         current_seconds_remaining = *seconds;
                     }
                 }
@@ -789,5 +792,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dump_smurf_replay_timing() {
+        let replay_path = Path::new("../../data/smurf/ab793727-e03c-4fc7-aab9-5de6ed5c1c19.replay");
+        if !replay_path.exists() {
+            eprintln!("smurf replay not found, skipping");
+            return;
+        }
+        let parsed = parse_replay(replay_path).expect("Failed to parse smurf replay");
+        let total = parsed.frames.len();
+        assert!(total > 1000);
+        let last = parsed.frames.last().unwrap();
+        assert!(
+            last.seconds_remaining < 300,
+            "seconds_remaining should decrease during a match"
+        );
     }
 }

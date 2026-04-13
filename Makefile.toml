@@ -45,6 +45,29 @@ args = [
     "--watch",
 ]
 
+# Build the web app for production (tailwind first, then dx release build → dist/).
+[tasks.build-web]
+cwd = "/workspace/crates/is_this_a_smurf"
+run_task = { name = ["build-web-tailwind", "build-web-dx"], parallel = false }
+
+[tasks.build-web-tailwind]
+cwd = "/workspace/crates/is_this_a_smurf"
+command = "npx"
+args = [
+    "--yes",
+    "@tailwindcss/cli",
+    "-i",
+    "./input.css",
+    "-o",
+    "./assets/tailwind.css",
+    "--minify",
+]
+
+[tasks.build-web-dx]
+cwd = "/workspace/crates/is_this_a_smurf"
+command = "dx"
+args = ["build", "--platform", "web", "--release"]
+
 # Restore PostgreSQL from the custom-format dump shipped in the devcontainer image (or data/database_dump.dump on the bind mount).
 [tasks.restore-database]
 cwd = "/workspace"

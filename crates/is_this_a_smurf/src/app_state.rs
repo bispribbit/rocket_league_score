@@ -80,7 +80,10 @@ pub(crate) enum AnalysisTimelinePhase {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TimelineTrackState {
     pub(crate) match_duration_seconds: f32,
+    /// Absolute replay-clock boundary times (used for positioning).
     pub(crate) boundary_times_seconds: Vec<f32>,
+    /// Game-clock (play-time) at each boundary (used for display labels only).
+    pub(crate) boundary_play_times_seconds: Vec<f32>,
     pub(crate) goals: Vec<GoalMarkerDisplay>,
     pub(crate) player_names: Vec<String>,
     pub(crate) player_teams: Vec<Team>,

@@ -83,21 +83,29 @@ fn sorted_goals_with_scores(goals: &[GoalMarkerDisplay]) -> Vec<GoalTimelineRow>
 /// Horizontal match timeline with per-player lanes, segment boundaries, goals, and ranks.
 #[component]
 pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
-    const MATCH_TRACK_WIDTH_PERCENT: f32 = 100.0;
-
     let Some(track) = progress.timeline.clone() else {
         return rsx! {};
     };
 
-    let duration_seconds = track.match_duration_seconds.max(0.001);
-    // Scale the track so the right edge matches the last analyzed segment (not full match length).
-    let timeline_span_seconds = track
-        .boundary_times_seconds
-        .last()
-        .copied()
-        .filter(|seconds| *seconds > 0.0)
-        .unwrap_or(duration_seconds)
-        .max(0.001);
+    let num_segments = track.num_segments.max(1) as f32;
+
+    let goal_index_position = |goal_time: f32| -> f32 {
+        let boundaries = &track.boundary_times_seconds;
+        for seg_idx in 0..track.num_segments {
+            let Some(seg_start) = boundaries.get(seg_idx).copied() else {
+                continue;
+            };
+            let Some(seg_end) = boundaries.get(seg_idx + 1).copied() else {
+                continue;
+            };
+            if goal_time >= seg_start && goal_time <= seg_end {
+                let span = (seg_end - seg_start).max(0.001);
+                let fraction = (goal_time - seg_start) / span;
+                return (seg_idx as f32 + fraction) / num_segments * 100.0;
+            }
+        }
+        0.0
+    };
 
     let goal_entries = sorted_goals_with_scores(&track.goals);
 
@@ -159,15 +167,9 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                         div { class: "relative h-72 min-h-72 shrink-0",
                         // Full-height overlays: boundaries + goal markers
                         div { class: "absolute inset-0 pointer-events-none z-[1]",
-                            for (boundary_index, boundary_time) in track
-                                .boundary_times_seconds
-                                .iter()
-                                .copied()
-                                .enumerate()
-                            {
+                            for boundary_index in 0..track.boundary_times_seconds.len() {
                                 {
-                                    let boundary_left =
-                                        (boundary_time / timeline_span_seconds) * MATCH_TRACK_WIDTH_PERCENT;
+                                    let boundary_left = boundary_index as f32 / num_segments * 100.0;
                                     let boundary_count = track.boundary_times_seconds.len();
                                     let is_last_boundary =
                                         boundary_count > 0 && boundary_index == boundary_count - 1;
@@ -189,8 +191,7 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                             }
                             for (goal_index, entry) in goal_entries.iter().enumerate() {
                                 {
-                                    let goal_left = (entry.time_seconds / timeline_span_seconds)
-                                        * MATCH_TRACK_WIDTH_PERCENT;
+                                    let goal_left = goal_index_position(entry.time_seconds);
                                     let dash_color = if entry.team == Team::Blue {
                                         "border-blue-400"
                                     } else {
@@ -241,20 +242,10 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                             class: "relative h-11 shrink-0 overflow-visible border-b border-gray-800/60 {lane_bg}",
                                             for segment_index in 0..track.num_segments {
                                                 {
-                                                    let (segment_left, segment_width) = match (
-                                                        track.boundary_times_seconds.get(segment_index),
-                                                        track.boundary_times_seconds.get(segment_index + 1),
-                                                    ) {
-                                                        (Some(start_seconds), Some(end_seconds)) => (
-                                                            (*start_seconds / timeline_span_seconds)
-                                                                * MATCH_TRACK_WIDTH_PERCENT,
-                                                            ((*end_seconds - *start_seconds) / timeline_span_seconds)
-                                                                * MATCH_TRACK_WIDTH_PERCENT,
-                                                        ),
-                                                        _ => (0.0_f32, 0.0_f32),
-                                                    };
+                                                    let segment_left = segment_index as f32 / num_segments * 100.0;
+                                                    let segment_width = 100.0 / num_segments;
                                                     let segment_style = format!(
-                                                        "left: {segment_left:.2}%; width: {segment_width:.2}%;",
+                                                        "left: {segment_left:.4}%; width: {segment_width:.4}%;",
                                                     );
                                                     let rank_visible = progress
                                                         .segments
@@ -273,20 +264,20 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                                     } else {
                                                         "opacity-0"
                                                     };
-                                                    rsx! {
-                                                        div {
-                                                            key: "seg-badge-{player_lane_index}-{segment_index}",
-                                                            class: "absolute inset-x-0 top-0 bottom-0 flex items-end justify-center px-0 pb-px pt-0 leading-none transition-opacity duration-500 {opacity_class}",
-                                                            style: "{segment_style}",
+                                                                    rsx! {
+                                                                        div {
+                                                                            key: "seg-badge-{player_lane_index}-{segment_index}",
+                                                                            class: "absolute inset-x-0 top-0 bottom-0 flex items-end justify-center px-0 pb-px pt-0 leading-none transition-opacity duration-500 {opacity_class}",
+                                                                            style: "{segment_style}",
                                                             if let Some(division) = segment_rank {
                                                                 img {
                                                                     src: rank_division_icon_asset(division),
                                                                     alt: "",
                                                                     title: division.to_string(),
-                                                                    class: "block h-10 w-10 max-h-[calc(100%-2px)] max-w-[min(2.5rem,96%)] shrink-0 object-contain object-bottom drop-shadow-sm",
+                                                                    class: "block h-10 w-10 max-h-[calc(100%-2px)] shrink-0 object-contain object-bottom drop-shadow-sm",
                                                                 }
                                                             } else {
-                                                                span { class: "block h-10 w-10 max-h-[calc(100%-2px)] max-w-[min(2.5rem,96%)] shrink-0" }
+                                                                span { class: "block h-10 w-10 max-h-[calc(100%-2px)] shrink-0" }
                                                             }
                                                         }
                                                     }
@@ -294,8 +285,7 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                             }
                                             for (goal_index, entry) in goal_entries.iter().enumerate() {
                                                 {
-                                                    let marker_left = (entry.time_seconds / timeline_span_seconds)
-                                                        * MATCH_TRACK_WIDTH_PERCENT;
+                                                    let marker_left = goal_index_position(entry.time_seconds);
                                                     let marker_style = format!(
                                                         "left: {marker_left:.2}%; top: 50%; transform: translate(-50%, -50%);",
                                                     );
@@ -322,17 +312,12 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                         }
                         }
 
-                        // Bottom axis: one time label under each segment boundary (same horizontal scale as bars)
+                        // Bottom axis: one time label under each segment boundary.
+                        // Position uses index-based equal spacing; label text uses play-time.
                         div { class: "relative shrink-0 h-11 w-full border-t border-gray-800/80 bg-gray-950/60",
-                            for (boundary_index, boundary_time_seconds) in track
-                                .boundary_times_seconds
-                                .iter()
-                                .copied()
-                                .enumerate()
-                            {
+                            for boundary_index in 0..track.boundary_times_seconds.len() {
                                 {
-                                    let boundary_left_percent = (boundary_time_seconds / timeline_span_seconds)
-                                        * MATCH_TRACK_WIDTH_PERCENT;
+                                    let boundary_left_percent = boundary_index as f32 / num_segments * 100.0;
                                     let boundary_count = track.boundary_times_seconds.len();
                                     let is_last_boundary =
                                         boundary_count > 0 && boundary_index == boundary_count - 1;
@@ -345,8 +330,18 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                             "left: {boundary_left_percent:.2}%; transform: translateX(-50%);",
                                         )
                                     };
+                                    let fallback_time = track
+                                        .boundary_times_seconds
+                                        .get(boundary_index)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let play_time = track
+                                        .boundary_play_times_seconds
+                                        .get(boundary_index)
+                                        .copied()
+                                        .unwrap_or(fallback_time);
                                     let boundary_tick_label =
-                                        format_timeline_boundary_label(boundary_time_seconds);
+                                        format_timeline_boundary_label(play_time);
                                     rsx! {
                                         div {
                                             key: "boundary-time-{boundary_index}",

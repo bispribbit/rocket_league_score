@@ -39,9 +39,9 @@ use crate::branding::IS_THIS_A_SMURF_HERO;
 use crate::browser_async::{sleep_milliseconds, yield_for_dom_paint, yield_to_ui};
 use crate::embedded_model::{MODEL_BYTES, MODEL_CONFIG, sequence_length_from_embedded_config};
 use crate::prediction::{
-    build_goal_markers, build_prediction_results, compute_segment_boundary_times,
-    global_ranks_from_predictions, prepare_players_for_timeline, ranks_from_player_predictions,
-    segment_step_infos,
+    build_goal_markers, build_prediction_results, compute_segment_boundary_play_times,
+    compute_segment_boundary_times, global_ranks_from_predictions, prepare_players_for_timeline,
+    ranks_from_player_predictions, segment_step_infos,
 };
 
 /// Burn backend for inference: WGPU on native hosts, pure CPU ndarray on WASM (WGPU checkpoint
@@ -280,10 +280,17 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 .max(0.001);
                             let boundary_times_seconds =
                                 compute_segment_boundary_times(&segment_steps);
+                            let boundary_play_times_seconds =
+                                compute_segment_boundary_play_times(
+                                    &parsed.frames,
+                                    &segment_steps,
+                                    sequence_length,
+                                );
                             let mut timeline_snapshot = if num_segments > 0 {
                                 Some(TimelineTrackState {
                                     match_duration_seconds,
                                     boundary_times_seconds,
+                                    boundary_play_times_seconds,
                                     goals: goal_markers,
                                     player_names: timeline_player_names,
                                     player_teams: timeline_player_teams,

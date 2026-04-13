@@ -24,6 +24,15 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 'lts/*'
+
+    - name: Build Tailwind CSS
+      working-directory: crates/is_this_a_smurf
+      run: npx --yes @tailwindcss/cli -i ./input.css -o ./assets/tailwind.css
+
     - name: Cargo Fmt
       run: cargo fmt --all -- --check
 

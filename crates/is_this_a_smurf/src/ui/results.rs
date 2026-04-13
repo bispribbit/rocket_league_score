@@ -10,6 +10,7 @@ use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState
 use crate::branding::SMURF_SUSPECT_BADGE;
 use crate::prediction::{SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN, lobby_median_mmr};
 use crate::rank_icon::rank_division_icon_asset;
+use crate::verdict_copy::VerdictSegment;
 
 const PREDICTED_RANK_ROAST_LABELS: [&str; 10] = [
     "Estimated Delusion Bracket",
@@ -80,11 +81,18 @@ pub(crate) fn PlayerSummaryGrid(results: PredictionResults) -> Element {
 /// One-line verdict under the team summary: tier-flavored if no smurf, or names suspects.
 #[component]
 pub(crate) fn MatchVerdictBanner(results: PredictionResults) -> Element {
-    let line = crate::verdict_copy::match_verdict_paragraph(&results);
+    let segments = crate::verdict_copy::match_verdict_segments(&results);
     rsx! {
         div { class: "rounded-xl border border-gray-800 bg-gray-900/80 px-5 py-4 mb-10",
             p { class: "text-center text-base leading-relaxed text-gray-200",
-                "{line}"
+                for segment in segments {
+                    match segment {
+                        VerdictSegment::Plain(text) => rsx! { "{text}" },
+                        VerdictSegment::BoldName(name) => rsx! {
+                            span { class: "font-bold text-gray-100", "{name}" }
+                        },
+                    }
+                }
             }
         }
     }
