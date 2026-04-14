@@ -173,14 +173,13 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                         let boundary_count = track.boundary_times_seconds.len();
                                         let is_last_boundary =
                                             boundary_count > 0 && boundary_index == boundary_count - 1;
-                                            && boundary_index == boundary_count - 1;
                                         let boundary_style = if is_last_boundary {
                                             format!(
                                                 "left: {boundary_left:.2}%; height: 100%; transform: translateX(-100%);",
                                             )
                                         } else {
                                             format!("left: {boundary_left:.2}%; height: 100%;")
-                                        }
+                                        };
                                         rsx! {
                                             div {
                                                 key: "boundary-{boundary_index}",
@@ -317,7 +316,6 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                     let boundary_count = track.boundary_times_seconds.len();
                                     let is_last_boundary =
                                         boundary_count > 0 && boundary_index == boundary_count - 1;
-                                        && boundary_index == boundary_count - 1;
                                     let boundary_tick_style = if is_last_boundary {
                                         format!("left: {boundary_left_percent:.2}%; transform: translateX(-100%);")
                                     } else {

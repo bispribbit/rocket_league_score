@@ -14,7 +14,7 @@ use tracing::info;
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
 use crate::segment_cache::SegmentStore;
-use crate::{CheckpointValidationMetrics, save_checkpoint};
+use crate::{CheckpointValidationMetrics, ValidationRankRmseEntry, save_checkpoint};
 
 /// Tracks the current state of training for resumption.
 #[derive(Debug, Clone, Default)]
@@ -29,6 +29,16 @@ pub struct TrainingState {
     pub current_train_loss: f32,
     /// Current validation loss.
     pub current_valid_loss: Option<f32>,
+    /// Per-rank validation RMSE from the last validation pass (MMR units).
+    pub last_validation_rank_rmse: Option<Vec<ValidationRankRmseEntry>>,
+}
+
+fn checkpoint_validation_metrics_from_state(
+    state: &TrainingState,
+) -> Option<CheckpointValidationMetrics> {
+    let loss = state.current_valid_loss?;
+    let rank_entries = state.last_validation_rank_rmse.clone().unwrap_or_default();
+    Some(CheckpointValidationMetrics::from_validation_loss_with_rank_breakdown(loss, rank_entries))
 }
 
 impl TrainingState {
@@ -41,6 +51,7 @@ impl TrainingState {
             epochs_without_improvement: 0,
             current_train_loss: 0.0,
             current_valid_loss: None,
+            last_validation_rank_rmse: None,
         }
     }
 }
@@ -98,22 +109,32 @@ const PREFETCH_COUNT: usize = 8;
 /// Higher values = better GPU utilization but less frequent progress updates.
 const LOSS_SYNC_INTERVAL: usize = 10;
 
-/// MMR threshold above which sample weights start increasing (roughly GC1).
-const WEIGHT_MMR_THRESHOLD: f32 = 1400.0;
-
-/// Maximum extra weight for the highest-MMR samples. With this value an SSL
-/// sample (~1941 MMR) gets a raw weight of ~3.45× before normalization.
-const WEIGHT_BOOST: f32 = 3.0;
-
-/// Computes per-sample loss weights from mean target MMR.
+/// Approximate center of the MMR distribution (roughly Gold 1 / low Plat).
 ///
-/// Applies a smooth quadratic ramp starting at [`WEIGHT_MMR_THRESHOLD`] so the
-/// model invests more capacity in distinguishing the top of the rank ladder.
-/// Weights are normalised to mean 1.0 so the effective learning rate is unchanged.
+/// This is where the per-rank RMSE is consistently lowest, so the model already
+/// handles this region well without extra weighting.
+const WEIGHT_CENTER_MMR: f32 = 800.0;
+
+/// Maximum extra weight applied at each tail (Bronze 1 and SSL).
+///
+/// With these values:
+///   Bronze 1 (~200 MMR)  → distance ≈ 0.75 → raw weight ≈ 2.69×
+///   Gold 1   (~800 MMR)  → distance  = 0.0  → raw weight  = 1.0× (min)
+///   SSL      (~1941 MMR) → distance ≈ 1.0   → raw weight ≈ 3.5×
+const WEIGHT_BOOST: f32 = 3.5;
+
+/// Computes per-sample loss weights from mean target MMR using a symmetric
+/// U-shaped curve centred on [`WEIGHT_CENTER_MMR`].
+///
+/// Both tails (low Bronze and SSL) receive elevated weights so the model is
+/// pushed to represent the full rank ladder rather than collapsing toward the
+/// centre of the distribution.  Weights are normalised to mean 1.0 so the
+/// effective learning rate is unchanged.
 fn compute_mmr_weights<B: Backend>(mean_mmr: Tensor<B, 2>) -> Tensor<B, 2> {
-    let range = MMR_SCALE - WEIGHT_MMR_THRESHOLD;
-    let above_threshold = (mean_mmr - WEIGHT_MMR_THRESHOLD).clamp_min(0.0) / range;
-    let raw_weights = above_threshold.powf_scalar(2.0) * WEIGHT_BOOST + 1.0;
+    // Normalised distance from centre: 0 at WEIGHT_CENTER_MMR, 1 at the farther tail.
+    let max_distance = (MMR_SCALE - WEIGHT_CENTER_MMR).max(WEIGHT_CENTER_MMR);
+    let distance = (mean_mmr - WEIGHT_CENTER_MMR).abs() / max_distance;
+    let raw_weights = distance.powf_scalar(2.0) * WEIGHT_BOOST + 1.0;
 
     let mean_weight: f32 = raw_weights
         .clone()
@@ -201,7 +222,9 @@ where
         "Batch size: {}, Learning rate: {}, Segment length: {}, Prefetch: {}",
         config.batch_size, config.learning_rate, config.sequence_length, PREFETCH_COUNT
     );
-    info!("MMR loss weighting enabled: threshold={WEIGHT_MMR_THRESHOLD}, boost={WEIGHT_BOOST}");
+    info!(
+        "MMR loss weighting enabled: center={WEIGHT_CENTER_MMR}, boost={WEIGHT_BOOST} (symmetric U-shape)"
+    );
     if start_epoch > 0 {
         info!("Resuming from epoch {}", start_epoch + 1);
     }
@@ -388,14 +411,15 @@ where
             let valid_batcher =
                 SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length);
 
-            let valid_loss =
+            let validation_result =
                 compute_validation_loss(&inner_model, valid_ds, &valid_batcher, config.batch_size);
             let validation_time = valid_start.elapsed();
-            state.current_valid_loss = Some(valid_loss);
+            state.current_valid_loss = Some(validation_result.loss);
+            state.last_validation_rank_rmse = Some(validation_result.rank_rmse_entries);
 
             // Early stopping check
-            if valid_loss < state.best_valid_loss {
-                state.best_valid_loss = valid_loss;
+            if validation_result.loss < state.best_valid_loss {
+                state.best_valid_loss = validation_result.loss;
                 state.epochs_without_improvement = 0;
                 improved = true;
             } else {
@@ -412,9 +436,7 @@ where
 
                     if let Some(ckpt_cfg) = &checkpoint_config {
                         let path = format!("{}_final", ckpt_cfg.path_prefix);
-                        let validation_metrics = state
-                            .current_valid_loss
-                            .map(CheckpointValidationMetrics::from_validation_loss);
+                        let validation_metrics = checkpoint_validation_metrics_from_state(&state);
                         if let Ok(_ckpt) = save_checkpoint(model, &path, config, validation_metrics)
                         {
                             info!("Saved final checkpoint: {path}");
@@ -454,9 +476,7 @@ where
                 };
                 let path = format!("{}_{}", ckpt_cfg.path_prefix, suffix);
 
-                let validation_metrics = state
-                    .current_valid_loss
-                    .map(CheckpointValidationMetrics::from_validation_loss);
+                let validation_metrics = checkpoint_validation_metrics_from_state(&state);
                 match save_checkpoint(model, &path, config, validation_metrics) {
                     Ok(_ckpt) => {
                         info!("Saved checkpoint: {path}");
@@ -473,9 +493,7 @@ where
     // Save final checkpoint
     if let Some(ckpt_cfg) = &checkpoint_config {
         let path = format!("{}_final", ckpt_cfg.path_prefix);
-        let validation_metrics = state
-            .current_valid_loss
-            .map(CheckpointValidationMetrics::from_validation_loss);
+        let validation_metrics = checkpoint_validation_metrics_from_state(&state);
         if let Ok(_ckpt) = save_checkpoint(model, &path, config, validation_metrics) {
             info!("Saved final checkpoint: {path}");
             checkpoint_paths.push(path);
@@ -542,6 +560,33 @@ fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>
     }
 }
 
+/// Builds ordered per-rank RMSE entries for checkpoint JSON (same order as logs).
+fn validation_rank_rmse_entries_from_stats(
+    stats: &std::collections::HashMap<Rank, PerRankErrors>,
+) -> Vec<ValidationRankRmseEntry> {
+    let mut entries = Vec::new();
+    for rank in Rank::all_ranked() {
+        if let Some(per_rank) = stats.get(&rank)
+            && per_rank.count > 0
+        {
+            entries.push(ValidationRankRmseEntry {
+                rank: rank.as_api_string().to_string(),
+                rmse_mmr: f64::from(per_rank.rmse()),
+                sample_count: per_rank.count as u64,
+            });
+        }
+    }
+    entries
+}
+
+/// Result of one full validation pass: aggregate loss and per-rank RMSE.
+struct ValidationLossResult {
+    /// Mean validation loss (normalized Huber / MSE-style aggregate).
+    pub loss: f32,
+    /// Per-rank RMSE in MMR units, ladder order.
+    pub rank_rmse_entries: Vec<ValidationRankRmseEntry>,
+}
+
 /// Computes validation loss on a segment dataset.
 ///
 /// Also logs a per-rank-tier RMSE breakdown for diagnostics.
@@ -550,10 +595,13 @@ fn compute_validation_loss<B: Backend>(
     dataset: &Arc<SegmentStore>,
     batcher: &SequenceBatcher<B>,
     batch_size: usize,
-) -> f32 {
+) -> ValidationLossResult {
     let num_segments = dataset.len();
     if num_segments == 0 {
-        return 0.0;
+        return ValidationLossResult {
+            loss: 0.0,
+            rank_rmse_entries: Vec::new(),
+        };
     }
 
     let mut total_loss = 0.0;
@@ -619,10 +667,17 @@ fn compute_validation_loss<B: Backend>(
 
     log_per_rank_breakdown(&rank_stats);
 
-    if total_samples > 0 {
+    let rank_rmse_entries = validation_rank_rmse_entries_from_stats(&rank_stats);
+
+    let loss = if total_samples > 0 {
         (total_loss / total_samples as f64) as f32
     } else {
         0.0
+    };
+
+    ValidationLossResult {
+        loss,
+        rank_rmse_entries,
     }
 }
 

@@ -294,7 +294,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     phase: AnalysisTimelinePhase::InferenceInProgress,
                                     num_segments,
                                     global_ranks: None,
-                                }
+                                };
                                 tracing::info!("[replay] building results");
                                 Some(timeline_snapshot)
                             } else {
