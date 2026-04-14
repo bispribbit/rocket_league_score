@@ -5,11 +5,9 @@ use std::path::Path;
 use burn::config::Config;
 use burn::module::Module;
 use burn::prelude::*;
-use burn::record::FullPrecisionSettings;
-use burn::record::NamedMpkFileRecorder;
-use serde_json::json;
-
+use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use ml_model::{MMR_SCALE, ModelConfig, SequenceModel, TrainingConfig};
+use serde_json::json;
 
 /// Validation metrics merged into the checkpoint `.config.json`.
 ///

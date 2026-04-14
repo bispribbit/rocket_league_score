@@ -1,0 +1,5 @@
+# Matches import grouping used by rust-analyzer; requires nightly rustfmt:
+# cargo +nightly fmt --all
+unstable_features = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"

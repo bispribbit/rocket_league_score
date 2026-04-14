@@ -149,9 +149,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                     "Click or drop a "
                     span { class: "text-blue-400", ".replay" }
                 }
-                p { class: "text-gray-500 text-sm mt-1",
-                    "Ranked 3v3 Rocket League replay file"
-                }
+                p { class: "text-gray-500 text-sm mt-1", "Ranked 3v3 Rocket League replay file" }
 
                 input {
                     id: "replay-file-input",
@@ -176,118 +174,117 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 return;
                             };
                             let filename = file.name();
-                            tracing::info!("[replay] reading file: {}, size: {} bytes", filename, file.size());
-
-                            local_processing.set(Some(LocalProcessing {
-                                filename: filename.clone(),
-                                progress: ProgressState {
-                                    reading_file: StepStatus::Processing,
-                                    copying_into_memory: StepStatus::Pending,
-                                    parsing: StepStatus::Pending,
-                                    loading_model: StepStatus::Pending,
-                                    segments: vec![],
-                                    timeline: None,
-                                },
-                                results: None,
-                            }));
+                            tracing::info!(
+                                "[replay] reading file: {}, size: {} bytes", filename, file.size()
+                            );
+                            local_processing
+                                .set(
+                                    Some(LocalProcessing {
+                                        filename: filename.clone(),
+                                        progress: ProgressState {
+                                            reading_file: StepStatus::Processing,
+                                            copying_into_memory: StepStatus::Pending,
+                                            parsing: StepStatus::Pending,
+                                            loading_model: StepStatus::Pending,
+                                            segments: vec![],
+                                            timeline: None,
+                                        },
+                                        results: None,
+                                    }),
+                                );
                             yield_to_ui().await;
-
                             let array_buffer = match JsFuture::from(file.array_buffer()).await {
                                 Ok(buffer) => buffer,
                                 Err(error) => {
                                     tracing::info!("[replay] array_buffer() error: {:?}", error);
-                                    state.set(AppState::Error(format!(
-                                        "Could not read file: {error:?}"
-                                    )));
+                                    state
+                                        .set(AppState::Error(format!("Could not read file: {error:?}")));
                                     return;
                                 }
                             };
-
-                            // Browser read is done; `to_vec()` is synchronous and can take seconds.
-                            local_processing.set(Some(LocalProcessing {
-                                filename: filename.clone(),
-                                progress: ProgressState {
-                                    reading_file: StepStatus::Done("Done".to_string()),
-                                    copying_into_memory: StepStatus::Processing,
-                                    parsing: StepStatus::Pending,
-                                    loading_model: StepStatus::Pending,
-                                    segments: vec![],
-                                    timeline: None,
-                                },
-                                results: None,
-                            }));
+                            local_processing
+                                .set(
+                                    Some(LocalProcessing {
+                                        filename: filename.clone(),
+                                        progress: ProgressState {
+                                            reading_file: StepStatus::Done("Done".to_string()),
+                                            copying_into_memory: StepStatus::Processing,
+                                            parsing: StepStatus::Pending,
+                                            loading_model: StepStatus::Pending,
+                                            segments: vec![],
+                                            timeline: None,
+                                        },
+                                        results: None,
+                                    }),
+                                );
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
-
                             let uint8_array = js_sys::Uint8Array::new(&array_buffer);
                             let data: Vec<u8> = uint8_array.to_vec();
                             tracing::info!("[replay] file read ok, {} bytes", data.len());
-
-                            local_processing.set(Some(LocalProcessing {
-                                filename: filename.clone(),
-                                progress: ProgressState {
-                                    reading_file: StepStatus::Done("Done".to_string()),
-                                    copying_into_memory: StepStatus::Done("Done".to_string()),
-                                    parsing: StepStatus::Processing,
-                                    loading_model: StepStatus::Pending,
-                                    segments: vec![],
-                                    timeline: None,
-                                },
-                                results: None,
-                            }));
+                            local_processing
+                                .set(
+                                    Some(LocalProcessing {
+                                        filename: filename.clone(),
+                                        progress: ProgressState {
+                                            reading_file: StepStatus::Done("Done".to_string()),
+                                            copying_into_memory: StepStatus::Done("Done".to_string()),
+                                            parsing: StepStatus::Processing,
+                                            loading_model: StepStatus::Pending,
+                                            segments: vec![],
+                                            timeline: None,
+                                        },
+                                        results: None,
+                                    }),
+                                );
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
-
-                            // ---- Step 3: parse replay ------------------------------------------
                             tracing::info!("[replay] parse_replay_from_bytes starting");
                             let parsed = match parse_replay_from_bytes(&data) {
                                 Ok(parsed) => parsed,
                                 Err(ReplayAcceptanceError::Unsupported(details)) => {
                                     tracing::info!(
-                                        "[replay] unsupported match: {}",
-                                        details.detected_mode_label
+                                        "[replay] unsupported match: {}", details.detected_mode_label
                                     );
                                     state.set(AppState::UnsupportedReplay(details));
                                     return;
                                 }
                                 Err(ReplayAcceptanceError::Parse(error)) => {
                                     tracing::info!("[replay] parse error: {}", error);
-                                    state.set(AppState::Error(format!(
-                                        "Replay parsing error: {error}"
-                                    )));
+                                    state.set(AppState::Error(format!("Replay parsing error: {error}")));
                                     return;
                                 }
                             };
                             tracing::info!("[replay] parse ok, {} frames", parsed.frames.len());
                             if parsed.frames.is_empty() {
-                                state.set(AppState::Error(
-                                    "No frames found in the replay.".to_string(),
-                                ));
+                                state.set(AppState::Error("No frames found in the replay.".to_string()));
                                 return;
                             }
                             let sequence_length = sequence_length_from_embedded_config();
                             let extracted = ExtractedSegmentFeatures::from_frames(&parsed.frames);
                             let num_segments = extracted.segment_count(sequence_length);
-                            let mut segment_steps =
-                                segment_step_infos(&parsed.frames, sequence_length, num_segments);
-                            let (timeline_player_names, timeline_player_teams) =
-                                prepare_players_for_timeline(&parsed);
+                            let mut segment_steps = segment_step_infos(
+                                &parsed.frames,
+                                sequence_length,
+                                num_segments,
+                            );
+                            let (timeline_player_names, timeline_player_teams) = prepare_players_for_timeline(
+                                &parsed,
+                            );
                             let goal_markers = build_goal_markers(&parsed, &timeline_player_names);
                             let match_duration_seconds = parsed
                                 .frames
                                 .last()
                                 .map_or(1.0_f32, |frame| frame.time)
                                 .max(0.001);
-                            let boundary_times_seconds =
-                                compute_segment_boundary_times(&segment_steps);
-                            let boundary_play_times_seconds =
-                                compute_segment_boundary_play_times(
-                                    &parsed.frames,
-                                    &segment_steps,
-                                    sequence_length,
-                                );
+                            let boundary_times_seconds = compute_segment_boundary_times(&segment_steps);
+                            let boundary_play_times_seconds = compute_segment_boundary_play_times(
+                                &parsed.frames,
+                                &segment_steps,
+                                sequence_length,
+                            );
                             let mut timeline_snapshot = if num_segments > 0 {
-                                Some(TimelineTrackState {
+                                let timeline_snapshot = TimelineTrackState {
                                     match_duration_seconds,
                                     boundary_times_seconds,
                                     boundary_play_times_seconds,
@@ -297,37 +294,38 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     phase: AnalysisTimelinePhase::InferenceInProgress,
                                     num_segments,
                                     global_ranks: None,
-                                })
+                                }
+                                tracing::info!("[replay] building results");
+                                Some(timeline_snapshot)
                             } else {
                                 None
                             };
-                            local_processing.set(Some(LocalProcessing {
-                                filename: filename.clone(),
-                                progress: ProgressState {
-                                    reading_file: StepStatus::Done("Done".to_string()),
-                                    copying_into_memory: StepStatus::Done("Done".to_string()),
-                                    parsing: StepStatus::Done("Done".to_string()),
-                                    loading_model: StepStatus::Processing,
-                                    segments: segment_steps.clone(),
-                                    timeline: timeline_snapshot.clone(),
-                                },
-                                results: None,
-                            }));
+                            local_processing
+                                .set(
+                                    Some(LocalProcessing {
+                                        filename: filename.clone(),
+                                        progress: ProgressState {
+                                            reading_file: StepStatus::Done("Done".to_string()),
+                                            copying_into_memory: StepStatus::Done("Done".to_string()),
+                                            parsing: StepStatus::Done("Done".to_string()),
+                                            loading_model: StepStatus::Processing,
+                                            segments: segment_steps.clone(),
+                                            timeline: timeline_snapshot.clone(),
+                                        },
+                                        results: None,
+                                    }),
+                                );
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
-
-                            // ---- Step 4: load model --------------------------------------------
                             tracing::info!(
-                                "[replay] load_checkpoint_from_bytes starting (backend = {})",
-                                if cfg!(target_arch = "wasm32") {
-                                    "NdArray"
-                                } else {
-                                    "Wgpu"
-                                }
+                                "[replay] load_checkpoint_from_bytes starting (backend = {})", if
+                                cfg!(target_arch = "wasm32") { "NdArray" } else { "Wgpu" }
                             );
                             let device = InferenceDevice::default();
                             let model: SequenceModel<InferenceBackend> = match load_checkpoint_from_bytes(
-                                MODEL_BYTES, MODEL_CONFIG, &device,
+                                MODEL_BYTES,
+                                MODEL_CONFIG,
+                                &device,
                             ) {
                                 Ok(model) => {
                                     tracing::info!("[replay] model loaded ok");
@@ -335,102 +333,18 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 }
                                 Err(error) => {
                                     tracing::info!("[replay] model load error: {}", error);
-                                    state.set(AppState::Error(format!(
-                                        "Model loading error: {error}"
-                                    )));
+                                    state.set(AppState::Error(format!("Model loading error: {error}")));
                                     return;
                                 }
                             };
-
-                            // ---- Step 5: run inference per segment ------------------------------
                             tracing::info!("[replay] {} segments, starting inference", num_segments);
                             if let Some(first_segment_step) = segment_steps.first_mut() {
                                 first_segment_step.status = StepStatus::Processing;
                             }
-                            local_processing.set(Some(LocalProcessing {
-                                filename: filename.clone(),
-                                progress: ProgressState {
-                                    reading_file: StepStatus::Done("Done".to_string()),
-                                    copying_into_memory: StepStatus::Done("Done".to_string()),
-                                    parsing: StepStatus::Done("Done".to_string()),
-                                    loading_model: StepStatus::Done("Done".to_string()),
-                                    segments: segment_steps.clone(),
-                                    timeline: timeline_snapshot.clone(),
-                                },
-                                results: None,
-                            }));
-                            yield_to_ui().await;
-                            yield_for_dom_paint().await;
-
-                            let mut segment_predictions = Vec::with_capacity(num_segments);
-                            for seg_idx in 0..num_segments {
-                                let Some(prediction) = extracted
-                                    .predict_single_segment(
-                                        &model,
-                                        &device,
-                                        sequence_length,
-                                        seg_idx,
-                                    )
-                                    .await
-                                else {
-                                    break;
-                                };
-                                let segment_player_ranks =
-                                    ranks_from_player_predictions(&prediction.player_predictions);
-                                segment_predictions.push(prediction);
-                                if let Some(completed_step) = segment_steps.get_mut(seg_idx) {
-                                    completed_step.player_segment_ranks = Some(segment_player_ranks);
-                                    completed_step.status =
-                                        StepStatus::Done("Complete".to_string());
-                                }
-                                if let Some(next_step) = segment_steps.get_mut(seg_idx + 1) {
-                                    next_step.status = StepStatus::Processing;
-                                }
-                                local_processing.set(Some(LocalProcessing {
-                                    filename: filename.clone(),
-                                    progress: ProgressState {
-                                        reading_file: StepStatus::Done("Done".to_string()),
-                                        copying_into_memory: StepStatus::Done("Done".to_string()),
-                                        parsing: StepStatus::Done("Done".to_string()),
-                                        loading_model: StepStatus::Done("Done".to_string()),
-                                        segments: segment_steps.clone(),
-                                        timeline: timeline_snapshot.clone(),
-                                    },
-                                    results: None,
-                                }));
-                                yield_to_ui().await;
-                            }
-
-                            // ---- Step 6: global rank reveal, then results -----------------------
-                            tracing::info!("[replay] all segments done, revealing global ranks");
-                            let global_ranks_array =
-                                global_ranks_from_predictions(&segment_predictions);
-                            if let Some(track) = timeline_snapshot.as_mut() {
-                                track.phase = AnalysisTimelinePhase::RevealingGlobalRanks;
-                                track.global_ranks = Some(global_ranks_array);
-                            }
-                            local_processing.set(Some(LocalProcessing {
-                                filename: filename.clone(),
-                                progress: ProgressState {
-                                    reading_file: StepStatus::Done("Done".to_string()),
-                                    copying_into_memory: StepStatus::Done("Done".to_string()),
-                                    parsing: StepStatus::Done("Done".to_string()),
-                                    loading_model: StepStatus::Done("Done".to_string()),
-                                    segments: segment_steps.clone(),
-                                    timeline: timeline_snapshot.clone(),
-                                },
-                                results: None,
-                            }));
-                            yield_to_ui().await;
-                            if timeline_snapshot.is_some() {
-                                sleep_milliseconds(850).await;
-                            }
-
-                            tracing::info!("[replay] building results");
-                            match build_prediction_results(&parsed, segment_predictions) {
-                                Ok(results) => {
-                                    local_processing.set(Some(LocalProcessing {
-                                        filename,
+                            local_processing
+                                .set(
+                                    Some(LocalProcessing {
+                                        filename: filename.clone(),
                                         progress: ProgressState {
                                             reading_file: StepStatus::Done("Done".to_string()),
                                             copying_into_memory: StepStatus::Done("Done".to_string()),
@@ -439,8 +353,89 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                             segments: segment_steps.clone(),
                                             timeline: timeline_snapshot.clone(),
                                         },
-                                        results: Some(results),
-                                    }));
+                                        results: None,
+                                    }),
+                                );
+                            yield_to_ui().await;
+                            yield_for_dom_paint().await;
+                            let mut segment_predictions = Vec::with_capacity(num_segments);
+                            for seg_idx in 0..num_segments {
+                                let Some(prediction) = extracted
+                                    .predict_single_segment(&model, &device, sequence_length, seg_idx)
+                                    .await else {
+                                    break;
+                                };
+                                let segment_player_ranks = ranks_from_player_predictions(
+                                    &prediction.player_predictions,
+                                );
+                                segment_predictions.push(prediction);
+                                if let Some(completed_step) = segment_steps.get_mut(seg_idx) {
+                                    completed_step.player_segment_ranks = Some(segment_player_ranks);
+                                    completed_step.status = StepStatus::Done("Complete".to_string());
+                                }
+                                if let Some(next_step) = segment_steps.get_mut(seg_idx + 1) {
+                                    next_step.status = StepStatus::Processing;
+                                }
+                                local_processing
+                                    .set(
+                                        Some(LocalProcessing {
+                                            filename: filename.clone(),
+                                            progress: ProgressState {
+                                                reading_file: StepStatus::Done("Done".to_string()),
+                                                copying_into_memory: StepStatus::Done("Done".to_string()),
+                                                parsing: StepStatus::Done("Done".to_string()),
+                                                loading_model: StepStatus::Done("Done".to_string()),
+                                                segments: segment_steps.clone(),
+                                                timeline: timeline_snapshot.clone(),
+                                            },
+                                            results: None,
+                                        }),
+                                    );
+                                yield_to_ui().await;
+                            }
+                            tracing::info!("[replay] all segments done, revealing global ranks");
+                            let global_ranks_array = global_ranks_from_predictions(&segment_predictions);
+                            if let Some(track) = timeline_snapshot.as_mut() {
+                                track.phase = AnalysisTimelinePhase::RevealingGlobalRanks;
+                                track.global_ranks = Some(global_ranks_array);
+                            }
+                            local_processing
+                                .set(
+                                    Some(LocalProcessing {
+                                        filename: filename.clone(),
+                                        progress: ProgressState {
+                                            reading_file: StepStatus::Done("Done".to_string()),
+                                            copying_into_memory: StepStatus::Done("Done".to_string()),
+                                            parsing: StepStatus::Done("Done".to_string()),
+                                            loading_model: StepStatus::Done("Done".to_string()),
+                                            segments: segment_steps.clone(),
+                                            timeline: timeline_snapshot.clone(),
+                                        },
+                                        results: None,
+                                    }),
+                                );
+                            yield_to_ui().await;
+                            if timeline_snapshot.is_some() {
+                                sleep_milliseconds(850).await;
+                            }
+                            tracing::info!("[replay] building results");
+                            match build_prediction_results(&parsed, segment_predictions) {
+                                Ok(results) => {
+                                    local_processing
+                                        .set(
+                                            Some(LocalProcessing {
+                                                filename,
+                                                progress: ProgressState {
+                                                    reading_file: StepStatus::Done("Done".to_string()),
+                                                    copying_into_memory: StepStatus::Done("Done".to_string()),
+                                                    parsing: StepStatus::Done("Done".to_string()),
+                                                    loading_model: StepStatus::Done("Done".to_string()),
+                                                    segments: segment_steps.clone(),
+                                                    timeline: timeline_snapshot.clone(),
+                                                },
+                                                results: Some(results),
+                                            }),
+                                        );
                                 }
                                 Err(message) => {
                                     state.set(AppState::Error(message));

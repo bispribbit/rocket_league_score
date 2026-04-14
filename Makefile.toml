@@ -9,6 +9,18 @@ skip_rust_env_info = true
 # Skips loading the current crate related environment variables
 skip_crate_env_info = true
 
+# Format the workspace with nightly rustfmt (see rustfmt.toml; unstable import options).
+[tasks.fmt]
+dependencies = ["fmt-dx", "fmt-cargo"]
+
+[tasks.fmt-dx]
+command = "dx"
+args = ["fmt"]
+
+[tasks.fmt-cargo]
+command = "rustup"
+args = ["run", "nightly", "cargo", "fmt", "--all"]
+
 [tasks.sqlx-offline]
 command = "cargo"
 args = ["sqlx", "prepare", "--workspace"]

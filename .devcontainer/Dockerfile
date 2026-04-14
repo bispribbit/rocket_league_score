@@ -27,8 +27,11 @@ RUN apt-get update && apt-get install -y \
 RUN npm install -g @tailwindcss/cli@4.1.3
 
 # Install rust components and WebAssembly target (e.g. Dioxus web)
+# Nightly rustfmt is used for rustfmt.toml unstable options (cargo make fmt).
 RUN rustup component add rustfmt clippy rust-src llvm-tools \
-    && rustup target add wasm32-unknown-unknown
+    && rustup target add wasm32-unknown-unknown \
+    && rustup toolchain install nightly \
+    && rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
 
 # Install cargo-binstall
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash

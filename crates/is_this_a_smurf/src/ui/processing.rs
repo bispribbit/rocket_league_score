@@ -165,143 +165,140 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                     div { class: "relative flex-1 flex flex-col rounded-lg bg-gray-950/80 border border-gray-800 overflow-visible min-h-[336px]",
                         // Lanes + overlays (match time uses the left MATCH_TRACK_WIDTH_PERCENT of this area)
                         div { class: "relative h-72 min-h-72 shrink-0",
-                        // Full-height overlays: boundaries + goal markers
-                        div { class: "absolute inset-0 pointer-events-none z-[1]",
-                            for boundary_index in 0..track.boundary_times_seconds.len() {
-                                {
-                                    let boundary_left = boundary_index as f32 / num_segments * 100.0;
-                                    let boundary_count = track.boundary_times_seconds.len();
-                                    let is_last_boundary =
-                                        boundary_count > 0 && boundary_index == boundary_count - 1;
-                                    let boundary_style = if is_last_boundary {
-                                        format!(
-                                            "left: {boundary_left:.2}%; height: 100%; transform: translateX(-100%);",
-                                        )
-                                    } else {
-                                        format!("left: {boundary_left:.2}%; height: 100%;")
-                                    };
-                                    rsx! {
-                                        div {
-                                            key: "boundary-{boundary_index}",
-                                            class: "absolute top-0 w-1.5 bg-zinc-950 ring-1 ring-zinc-700 z-[2]",
-                                            style: "{boundary_style}",
+                            // Full-height overlays: boundaries + goal markers
+                            div { class: "absolute inset-0 pointer-events-none z-[1]",
+                                for boundary_index in 0..track.boundary_times_seconds.len() {
+                                    {
+                                        let boundary_left = boundary_index as f32 / num_segments * 100.0;
+                                        let boundary_count = track.boundary_times_seconds.len();
+                                        let is_last_boundary =
+                                            boundary_count > 0 && boundary_index == boundary_count - 1;
+                                            && boundary_index == boundary_count - 1;
+                                        let boundary_style = if is_last_boundary {
+                                            format!(
+                                                "left: {boundary_left:.2}%; height: 100%; transform: translateX(-100%);",
+                                            )
+                                        } else {
+                                            format!("left: {boundary_left:.2}%; height: 100%;")
                                         }
-                                    }
-                                }
-                            }
-                            for (goal_index, entry) in goal_entries.iter().enumerate() {
-                                {
-                                    let goal_left = goal_index_position(entry.time_seconds);
-                                    let dash_color = if entry.team == Team::Blue {
-                                        "border-blue-400"
-                                    } else {
-                                        "border-orange-400"
-                                    };
-                                    let goal_column_style =
-                                        format!("left: {goal_left:.2}%; height: 100%;");
-                                    let score_color = if entry.team == Team::Blue {
-                                        "text-blue-300"
-                                    } else {
-                                        "text-orange-300"
-                                    };
-                                    let score_label = entry.score_label.clone();
-                                    rsx! {
-                                        div {
-                                            key: "goal-line-{goal_index}",
-                                            class: "absolute top-0 z-[3] flex flex-col items-center -translate-x-1/2",
-                                            style: "{goal_column_style}",
-                                            div { class: "absolute top-0 left-1/2 -translate-x-1/2 -translate-y-full pb-0.5 whitespace-nowrap text-[10px] font-mono font-bold {score_color} drop-shadow-sm text-center",
-                                                "{score_label}"
-                                            }
+                                        rsx! {
                                             div {
-                                                class: "flex-1 w-0 border-l-2 border-dashed {dash_color} opacity-80",
+                                                key: "boundary-{boundary_index}",
+                                                class: "absolute top-0 w-1.5 bg-zinc-950 ring-1 ring-zinc-700 z-[2]",
+                                                style: "{boundary_style}",
+                                            }
+                                        }
+                                    }
+                                }
+                                for (goal_index, entry) in goal_entries.iter().enumerate() {
+                                    {
+                                        let goal_left = goal_index_position(entry.time_seconds);
+                                        let dash_color = if entry.team == Team::Blue {
+                                            "border-blue-400"
+                                        } else {
+                                            "border-orange-400"
+                                        };
+                                        let goal_column_style =
+                                            format!("left: {goal_left:.2}%; height: 100%;");
+                                        let score_color = if entry.team == Team::Blue {
+                                            "text-blue-300"
+                                        } else {
+                                            "text-orange-300"
+                                        };
+                                        let score_label = entry.score_label.clone();
+                                        rsx! {
+                                            div {
+                                                key: "goal-line-{goal_index}",
+                                                class: "absolute top-0 z-[3] flex flex-col items-center -translate-x-1/2",
+                                                style: "{goal_column_style}",
+                                                div { class: "absolute top-0 left-1/2 -translate-x-1/2 -translate-y-full pb-0.5 whitespace-nowrap text-[10px] font-mono font-bold {score_color} drop-shadow-sm text-center",
+                                                    "{score_label}"
+                                                }
+                                                div { class: "flex-1 w-0 border-l-2 border-dashed {dash_color} opacity-80" }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Lanes (segment ranks); fixed row height matches name column.
-                        div { class: "relative z-[5] flex flex-col h-72 shrink-0",
-                            for player_lane_index in 0..TOTAL_PLAYERS {
-                                {
-                                    let team = track
-                                        .player_teams
-                                        .get(player_lane_index)
-                                        .copied()
-                                        .unwrap_or(Team::Blue);
-                                    let lane_bg = if team == Team::Blue {
-                                        "bg-blue-500/10"
-                                    } else {
-                                        "bg-orange-500/10"
-                                    };
-                                    rsx! {
-                                        div {
-                                            key: "lane-{player_lane_index}",
-                                            class: "relative h-11 shrink-0 overflow-visible border-b border-gray-800/60 {lane_bg}",
-                                            for segment_index in 0..track.num_segments {
-                                                {
-                                                    let segment_left = segment_index as f32 / num_segments * 100.0;
-                                                    let segment_width = 100.0 / num_segments;
-                                                    let segment_style = format!(
-                                                        "left: {segment_left:.4}%; width: {segment_width:.4}%;",
-                                                    );
-                                                    let rank_visible = progress
-                                                        .segments
-                                                        .get(segment_index)
-                                                        .and_then(|step| step.player_segment_ranks.as_ref())
-                                                        .is_some();
-                                                    let segment_rank = progress.segments.get(segment_index).and_then(
-                                                        |step| {
-                                                            step.player_segment_ranks
-                                                                .as_ref()
-                                                                .and_then(|ranks| ranks.get(player_lane_index).copied())
-                                                        },
-                                                    );
-                                                    let opacity_class = if rank_visible {
-                                                        "opacity-100"
-                                                    } else {
-                                                        "opacity-0"
-                                                    };
-                                                                    rsx! {
-                                                                        div {
-                                                                            key: "seg-badge-{player_lane_index}-{segment_index}",
-                                                                            class: "absolute inset-x-0 top-0 bottom-0 flex items-end justify-center px-0 pb-px pt-0 leading-none transition-opacity duration-500 {opacity_class}",
-                                                                            style: "{segment_style}",
-                                                            if let Some(division) = segment_rank {
-                                                                img {
-                                                                    src: rank_division_icon_asset(division),
-                                                                    alt: "",
-                                                                    title: division.to_string(),
-                                                                    class: "block h-10 w-10 max-h-[calc(100%-2px)] shrink-0 object-contain object-bottom drop-shadow-sm",
-                                                                }
-                                                            } else {
-                                                                span { class: "block h-10 w-10 max-h-[calc(100%-2px)] shrink-0" }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            for (goal_index, entry) in goal_entries.iter().enumerate() {
-                                                {
-                                                    let marker_left = goal_index_position(entry.time_seconds);
-                                                    let marker_style = format!(
-                                                        "left: {marker_left:.2}%; top: 50%; transform: translate(-50%, -50%);",
-                                                    );
-                                                    let show_on_this_lane =
-                                                        entry.player_lane_index == Some(player_lane_index);
-                                                    if show_on_this_lane {
+                            // Lanes (segment ranks); fixed row height matches name column.
+                            div { class: "relative z-[5] flex flex-col h-72 shrink-0",
+                                for player_lane_index in 0..TOTAL_PLAYERS {
+                                    {
+                                        let team = track
+                                            .player_teams
+                                            .get(player_lane_index)
+                                            .copied()
+                                            .unwrap_or(Team::Blue);
+                                        let lane_bg = if team == Team::Blue {
+                                            "bg-blue-500/10"
+                                        } else {
+                                            "bg-orange-500/10"
+                                        };
+                                        rsx! {
+                                            div {
+                                                key: "lane-{player_lane_index}",
+                                                class: "relative h-11 shrink-0 overflow-visible border-b border-gray-800/60 {lane_bg}",
+                                                for segment_index in 0..track.num_segments {
+                                                    {
+                                                        let segment_left = segment_index as f32 / num_segments * 100.0;
+                                                        let segment_width = 100.0 / num_segments;
+                                                        let segment_style = format!(
+                                                            "left: {segment_left:.4}%; width: {segment_width:.4}%;",
+                                                        );
+                                                        let rank_visible = progress
+                                                            .segments
+                                                            .get(segment_index)
+                                                            .and_then(|step| step.player_segment_ranks.as_ref())
+                                                            .is_some();
+                                                        let segment_rank = progress
+                                                            .segments
+                                                            .get(segment_index)
+                                                            .and_then(|step| {
+                                                                step.player_segment_ranks
+                                                                    .as_ref()
+                                                                    .and_then(|ranks| ranks.get(player_lane_index).copied())
+                                                            });
+                                                        let opacity_class = if rank_visible { "opacity-100" } else { "opacity-0" };
                                                         rsx! {
                                                             div {
-                                                                key: "goal-tri-{player_lane_index}-{goal_index}",
-                                                                class: "absolute z-[8] flex h-8 w-8 shrink-0 items-center justify-center pointer-events-none leading-none",
-                                                                style: "{marker_style}",
-                                                                span { class: "block text-2xl text-yellow-400", "▲" }
+                                                                key: "seg-badge-{player_lane_index}-{segment_index}",
+                                                                class: "absolute inset-x-0 top-0 bottom-0 flex items-end justify-center px-0 pb-px pt-0 leading-none transition-opacity duration-500 {opacity_class}",
+                                                                style: "{segment_style}",
+                                                                if let Some(division) = segment_rank {
+                                                                    img {
+                                                                        src: rank_division_icon_asset(division),
+                                                                        alt: "",
+                                                                        title: division.to_string(),
+                                                                        class: "block h-10 w-10 max-h-[calc(100%-2px)] shrink-0 object-contain object-bottom drop-shadow-sm",
+                                                                    }
+                                                                } else {
+                                                                    span { class: "block h-10 w-10 max-h-[calc(100%-2px)] shrink-0" }
+                                                                }
                                                             }
                                                         }
-                                                    } else {
-                                                        rsx! {}
+                                                    }
+                                                }
+                                                for (goal_index, entry) in goal_entries.iter().enumerate() {
+                                                    {
+                                                        let marker_left = goal_index_position(entry.time_seconds);
+                                                        let marker_style = format!(
+                                                            "left: {marker_left:.2}%; top: 50%; transform: translate(-50%, -50%);",
+                                                        );
+                                                        let show_on_this_lane =
+                                                            entry.player_lane_index == Some(player_lane_index);
+                                                        if show_on_this_lane {
+                                                            rsx! {
+                                                                div {
+                                                                    key: "goal-tri-{player_lane_index}-{goal_index}",
+                                                                    class: "absolute z-[8] flex h-8 w-8 shrink-0 items-center justify-center pointer-events-none leading-none",
+                                                                    style: "{marker_style}",
+                                                                    span { class: "block text-2xl text-yellow-400", "▲" }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            rsx! {}
+                                                        }
                                                     }
                                                 }
                                             }
@@ -309,7 +306,6 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                     }
                                 }
                             }
-                        }
                         }
 
                         // Bottom axis: one time label under each segment boundary.
@@ -321,14 +317,11 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                     let boundary_count = track.boundary_times_seconds.len();
                                     let is_last_boundary =
                                         boundary_count > 0 && boundary_index == boundary_count - 1;
+                                        && boundary_index == boundary_count - 1;
                                     let boundary_tick_style = if is_last_boundary {
-                                        format!(
-                                            "left: {boundary_left_percent:.2}%; transform: translateX(-100%);",
-                                        )
+                                        format!("left: {boundary_left_percent:.2}%; transform: translateX(-100%);")
                                     } else {
-                                        format!(
-                                            "left: {boundary_left_percent:.2}%; transform: translateX(-50%);",
-                                        )
+                                        format!("left: {boundary_left_percent:.2}%; transform: translateX(-50%);")
                                     };
                                     let fallback_time = track
                                         .boundary_times_seconds
@@ -340,8 +333,7 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                         .get(boundary_index)
                                         .copied()
                                         .unwrap_or(fallback_time);
-                                    let boundary_tick_label =
-                                        format_timeline_boundary_label(play_time);
+                                    let boundary_tick_label = format_timeline_boundary_label(play_time);
                                     rsx! {
                                         div {
                                             key: "boundary-time-{boundary_index}",

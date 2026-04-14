@@ -2,9 +2,8 @@
 
 use dioxus::prelude::*;
 use feature_extractor::TOTAL_PLAYERS;
-use replay_structs::{Team, UnsupportedReplayMatch};
-
 use rand::{RngExt, rng};
+use replay_structs::{Team, UnsupportedReplayMatch};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;
@@ -229,8 +228,7 @@ fn TeamSummaryCard(
                     if loading {
                         span { class: "text-gray-500 text-sm font-medium", "Calculating…" }
                     } else {
-                        span { "{roast_label}"
-                        }
+                        span { "{roast_label}" }
                     }
                 }
             }
@@ -243,7 +241,9 @@ fn TeamSummaryCard(
                     } else {
                         for name in player_names_loading {
                             div { class: "px-6 py-4 flex items-center min-h-[5.5rem]",
-                                p { class: "font-semibold text-gray-100 break-words", "{name}" }
+                                p { class: "font-semibold text-gray-100 break-words",
+                                    "{name}"
+                                }
                             }
                         }
                     }
@@ -251,7 +251,9 @@ fn TeamSummaryCard(
                     for player in &players_complete {
                         div { class: "px-6 py-4 flex items-center gap-3 min-h-[5.5rem]",
                             div { class: "min-w-0 flex-1 flex flex-col justify-center gap-1",
-                                p { class: "font-semibold text-gray-100 break-words", "{player.name}" }
+                                p { class: "font-semibold text-gray-100 break-words",
+                                    "{player.name}"
+                                }
                                 p { class: "text-sm text-gray-500", "{player.rank}" }
                             }
                             if player_looks_high_for_lobby(player.median_mmr, lobby_median_mmr) {

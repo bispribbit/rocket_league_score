@@ -2,11 +2,10 @@
 
 use dioxus::prelude::*;
 
-use crate::app_state::AppState;
-use crate::branding::SMURF_SUSPECT_BADGE;
-
 use super::results::{ErrorPage, UnsupportedReplayPage};
 use super::upload::UploadPage;
+use crate::app_state::AppState;
+use crate::branding::SMURF_SUSPECT_BADGE;
 
 /// Root application component.
 #[component]
