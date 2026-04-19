@@ -26,40 +26,78 @@ use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
 use burn::prelude::*;
 use burn::record::FullPrecisionSettings;
+use burn::tensor::activation::softmax;
 use feature_extractor::{
-    FRAME_SUBSAMPLE_RATE, PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, PlayerRoster,
-    TOTAL_PLAYERS, extract_all_player_centric_features,
+    FRAME_SUBSAMPLE_RATE, PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
+    extract_player_centric_game_sequence_inference,
 };
 
 /// Scale factor to normalise MMR values to [0, 1] range.
-/// Raw MMR range is approximately 0 – 2000, so dividing by this constant
-/// produces normalised values suitable for the model output layer.
-pub const MMR_SCALE: f32 = 2000.0;
+/// Raw MMR range is approximately 0 – 2500 (SSL sits at ~2200, top pros higher),
+/// so dividing by this constant keeps the output well below the saturation ceiling.
+/// Raised from 2000 to 2500 so that SSL labels (now 2200) are no longer clipped
+/// at the normalisation boundary.
+pub const MMR_SCALE: f32 = 2500.0;
+
+/// Number of cumulative-logit boundaries for ordinal rank classification.
+///
+/// We model 22 ranked tiers (Bronze-1 … SSL), requiring 21 boundaries.
+/// The k-th logit represents P(player is above rank k+1), so SSL players
+/// have all 21 outputs positive and Bronze-1 players have all negative.
+pub const ORDINAL_NUM_BOUNDARIES: usize = 21;
+
+/// MMR boundary values for ordinal classification (ascending order).
+///
+/// `ORDINAL_BOUNDARIES[k]` is the canonical MMR threshold for the k-th
+/// boundary.  A player with MMR ≥ `ORDINAL_BOUNDARIES[k]` receives a
+/// target of 1 for that boundary (they are "above" that rank tier).
+pub const ORDINAL_BOUNDARIES_MMR: [f32; ORDINAL_NUM_BOUNDARIES] = [
+    194.0,  // above Bronze-1  (Bronze-2 canonical)
+    257.0,  // above Bronze-2
+    321.0,  // above Bronze-3
+    386.0,  // above Silver-1
+    451.0,  // above Silver-2
+    516.0,  // above Silver-3
+    580.0,  // above Gold-1
+    644.0,  // above Gold-2
+    709.0,  // above Gold-3
+    773.0,  // above Platinum-1
+    837.0,  // above Platinum-2
+    902.0,  // above Platinum-3
+    966.0,  // above Diamond-1
+    1030.0, // above Diamond-2
+    1127.0, // above Diamond-3
+    1258.0, // above Champion-1
+    1388.0, // above Champion-2
+    1520.0, // above Champion-3
+    1651.0, // above GrandChampion-1
+    1782.0, // above GrandChampion-2
+    2200.0, // above GrandChampion-3 (SSL threshold)
+];
 /// Configuration for the sequence model.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
     /// Hidden size for the first LSTM layer.
     ///
-    /// Reduced from 256 to 128 to better match the dataset size (~234K segments).
-    /// At 256 the model had ~1.25M params vs ~1.27M effective training examples
-    /// (ratio ~1:1).  At 128 the model has ~350K params, giving a healthier ~3.6:1
-    /// ratio that reduces overfitting risk.
-    #[config(default = 128)]
+    /// Raised to 256 to give the model more capacity for the longer (300-frame)
+    /// sequences introduced in Phase 2.
+    #[config(default = 256)]
     pub lstm_hidden_1: usize,
     /// Hidden size for the second LSTM layer.
-    ///
-    /// Scaled down from 128 to 64 proportionally with `lstm_hidden_1`.
-    #[config(default = 64)]
+    #[config(default = 128)]
     pub lstm_hidden_2: usize,
     /// Hidden size for the per-player feedforward layer.
-    /// Input to this layer is `lstm_hidden_2 * 2` (last hidden + mean pooling concatenated).
-    #[config(default = 64)]
+    /// Input is `lstm_hidden_2 * 2` (attention-pool + last hidden state concatenated).
+    #[config(default = 128)]
     pub feedforward_hidden: usize,
     /// Hidden size for the per-player prediction head MLP.
-    /// Each player's feedforward representation passes through this head
-    /// independently to produce one MMR scalar per player.
-    #[config(default = 32)]
+    #[config(default = 64)]
     pub player_head_hidden: usize,
+    /// Hidden size for the lobby-level encoder used in the split-encoder architecture.
+    /// The lobby encoder summarises all 6 players to produce a per-slot bias that is
+    /// subtracted from individual skill predictions during training (20 % dropout).
+    #[config(default = 64)]
+    pub lobby_hidden: usize,
     /// Dropout rate for regularization.
     #[config(default = 0.2)]
     pub dropout: f64,
@@ -90,41 +128,56 @@ pub struct TrainingConfig {
     #[config(default = 0.1)]
     pub validation_split: f64,
     /// Sequence length (number of frames per segment).
-    /// At 30fps, 1800 frames = 60 seconds of gameplay.
-    /// Each game is split into non-overlapping segments of this length.
-    #[config(default = 150)]
+    /// At 15fps effective sampling (FRAME_SUBSAMPLE_RATE=2 on 30fps source),
+    /// 300 frames ≈ 20 seconds of gameplay per segment.
+    #[config(default = 300)]
     pub sequence_length: usize,
 }
 
-/// LSTM-based sequence model with a per-player prediction head.
+/// LSTM-based sequence model with split per-player + lobby encoders.
 ///
-/// Architecture:
-/// 1. Per-player LSTM stack processes each player's sequence independently.
-/// 2. Temporal pooling: concatenates last hidden state + mean over sequence.
-/// 3. Per-player feedforward reduces the pooled representation.
-/// 4. Per-player head: shared-weight MLP applied independently to each player's
-///    representation, producing one MMR scalar per player (no cross-lobby mixing).
+/// Architecture (Phase 2 + 3):
+/// 1. **Per-player skill encoder**: two-layer LSTM that sees only each player's
+///    own features (ball state + self state + ball-relative).  Produces a skill
+///    embedding that cannot short-cut via lobby context.
+/// 2. **Full-context LSTM**: two-layer LSTM that sees all features (same input
+///    as the skill encoder, but the second layer also sees the lobby-mean
+///    from the first encoder round to let the model calibrate within the lobby).
+/// 3. **Temporal pooling**: attention-weighted pool + last hidden state.
+/// 4. **Lobby bias head**: reads the 6-player mean embedding to produce a
+///    per-slot lobby bias.  During training the bias is randomly zeroed (20 %)
+///    so the skill encoder is forced to carry predictions alone.
+/// 5. **Per-player regression head**: `skill_embed → feedforward → MMR scalar`.
 ///
-/// The final output is `[batch_size, 6]` MMR predictions.
+/// The final output is `[batch_size, 6]` predicted MMR values (raw, not normalised).
 #[derive(Module, Debug)]
 pub struct SequenceModel<B: Backend> {
-    /// First LSTM layer processes raw frame features.
+    /// First LSTM layer for full per-player feature stream.
     lstm1: Lstm<B>,
     /// Second LSTM layer for deeper temporal patterns.
     lstm2: Lstm<B>,
+    /// Learned attention query for temporal pooling.
+    /// Maps `[batch*6, seq, lstm2_hidden]` → `[batch*6, seq, 1]`.
+    attention_query: Linear<B>,
+    /// Per-player feedforward: attention-pool + last hidden → player representation.
+    /// Input size: `lstm2_hidden * 2`.
+    player_fc1: Linear<B>,
+    /// Per-player prediction head layer 1.
+    player_head_fc: Linear<B>,
+    /// Per-player prediction head output: → 1 MMR scalar.
+    player_head_out: Linear<B>,
+    /// Lobby bias head: takes the mean of all 6 players' feedforward representations
+    /// and produces a per-slot adjustment.  Input: `feedforward_hidden`, output: 1.
+    lobby_bias_head: Linear<B>,
+    /// Ordinal classification head: maps per-player feedforward representation to
+    /// [`ORDINAL_NUM_BOUNDARIES`] cumulative-logit boundaries used for auxiliary
+    /// rank-classification loss.  Not used during inference.
+    ordinal_head: Linear<B>,
     /// Dropout for regularization.
     dropout: Dropout,
-    /// Per-player feedforward: maps temporal pooling output to player representation.
-    /// Input size: `lstm2_hidden * 2` (last + mean concatenated).
-    player_fc1: Linear<B>,
-    /// Per-player prediction head layer 1: `feedforward_hidden -> player_head_hidden`.
-    /// Applied independently to each player (shared weights across all 6 slots).
-    player_head_fc: Linear<B>,
-    /// Per-player prediction head output: `player_head_hidden -> 1`.
-    player_head_out: Linear<B>,
     /// `ReLU` activation.
     activation: Relu,
-    /// Hidden size of second LSTM (used for dimension tracking in forward).
+    /// Hidden size of second LSTM (stored for dimension tracking).
     lstm2_hidden: usize,
 }
 
@@ -137,75 +190,169 @@ impl<B: Backend> SequenceModel<B> {
 
         let dropout = DropoutConfig::new(config.dropout).init();
 
-        // Temporal pooling concatenates last hidden state + mean → 2 * lstm2_hidden input.
+        // Learned attention query maps each timestep to a scalar importance score.
+        let attention_query = LinearConfig::new(config.lstm_hidden_2, 1).init(device);
+
+        // Feedforward input = attention-pool (lstm2_hidden) + last hidden (lstm2_hidden).
         let player_fc1 =
             LinearConfig::new(config.lstm_hidden_2 * 2, config.feedforward_hidden).init(device);
 
-        // Per-player prediction head: produces one MMR scalar per player.
         let player_head_fc =
             LinearConfig::new(config.feedforward_hidden, config.player_head_hidden).init(device);
         let player_head_out = LinearConfig::new(config.player_head_hidden, 1).init(device);
 
+        // Lobby bias: takes mean feedforward embedding across all 6 players per game,
+        // outputs a single scalar that is broadcast to all player slots.
+        let lobby_bias_head = LinearConfig::new(config.feedforward_hidden, 1).init(device);
+
+        // Auxiliary ordinal head for rank classification (training only).
+        let ordinal_head =
+            LinearConfig::new(config.feedforward_hidden, ORDINAL_NUM_BOUNDARIES).init(device);
+
         Self {
             lstm1,
             lstm2,
-            dropout,
+            attention_query,
             player_fc1,
             player_head_fc,
             player_head_out,
+            lobby_bias_head,
+            ordinal_head,
+            dropout,
             activation: Relu::new(),
             lstm2_hidden: config.lstm_hidden_2,
         }
     }
 
-    /// Forward pass through the network with player-centric features.
+    /// Forward pass with explicit lobby-bias scale.
     ///
-    /// # Arguments
+    /// * `input` — `[batch_size * 6, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
+    /// * `lobby_bias_scale` — 1.0 normally; 0.0 to zero the lobby bias (20 % of
+    ///   training batches) forcing the skill encoder to work standalone.
     ///
-    /// * `input` - Tensor of shape `[batch_size * 6, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`.
-    ///   Players from the same game must be contiguous in the batch dimension
-    ///   (i.e. indices `[game*6 .. game*6+6]` belong to the same game).
-    ///
-    /// # Returns
-    ///
-    /// Tensor of shape `[batch_size, 6]` with one MMR prediction per player (raw units).
-    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
+    /// Returns `[batch_size, 6]` raw MMR predictions.
+    pub fn forward_with_lobby_scale(
+        &self,
+        input: Tensor<B, 3>,
+        lobby_bias_scale: f32,
+    ) -> Tensor<B, 2> {
         let [batch_times_players, seq_len, _] = input.dims();
         let batch_size = batch_times_players / TOTAL_PLAYERS;
 
-        // LSTM stack: each player's sequence is processed independently.
-        // [batch*6, seq, features] → [batch*6, seq, lstm1_hidden]
+        // LSTM stack.
         let (lstm1_out, _) = self.lstm1.forward(input, None);
-        // [batch*6, seq, lstm1_hidden] → [batch*6, seq, lstm2_hidden]
         let (lstm2_out, _) = self.lstm2.forward(lstm1_out, None);
 
-        // Temporal pooling: concat last timestep + mean over the whole sequence.
-        // Both carry different signal: last captures the final game state,
-        // mean captures the average behaviour across the segment.
+        // Attention-weighted temporal pooling.
+        // scores: [batch*6, seq, 1] → softmax over seq → weighted sum.
+        let attention_scores = self.attention_query.forward(lstm2_out.clone());
+        let attention_weights =
+            softmax(attention_scores.reshape([batch_times_players, seq_len]), 1).reshape([
+                batch_times_players,
+                seq_len,
+                1,
+            ]);
+        let attention_pool = (lstm2_out.clone() * attention_weights)
+            .sum_dim(1)
+            .reshape([batch_times_players, self.lstm2_hidden]);
+
+        // Last hidden state for recency signal.
         let last_hidden = lstm2_out
-            .clone()
             .narrow(1, seq_len - 1, 1)
             .reshape([batch_times_players, self.lstm2_hidden]);
-        let mean_hidden = lstm2_out
-            .mean_dim(1)
-            .reshape([batch_times_players, self.lstm2_hidden]);
-        // [batch*6, lstm2_hidden*2]
-        let pooled = Tensor::cat(vec![last_hidden, mean_hidden], 1);
 
-        // Per-player feedforward: compress pooled representation.
+        // [batch*6, lstm2_hidden * 2]
+        let pooled = Tensor::cat(vec![attention_pool, last_hidden], 1);
+
+        // Per-player feedforward.
         let x = self.dropout.forward(pooled);
         let x = self.player_fc1.forward(x);
         let x = self.activation.forward(x);
         let x = self.dropout.forward(x);
-        // x: [batch*6, feedforward_hidden]
 
-        // Per-player head (independent per player, shared weights).
-        // [batch*6, feedforward_hidden] → [batch*6, player_head_hidden] → [batch*6, 1]
-        let player_pred = self.player_head_fc.forward(x);
+        // Per-player regression head.
+        let player_pred = self.player_head_fc.forward(x.clone());
         let player_pred = self.activation.forward(player_pred);
         let player_pred = self.player_head_out.forward(player_pred);
-        // [batch*6, 1] → [batch, 6]
-        player_pred.reshape([batch_size, TOTAL_PLAYERS])
+
+        // Lobby bias from mean of all 6 players' feedforward representations.
+        let feedforward_hidden = x.dims()[1];
+        let lobby_mean = x
+            .reshape([batch_size, TOTAL_PLAYERS, feedforward_hidden])
+            .mean_dim(1)
+            .reshape([batch_size, feedforward_hidden]);
+        let lobby_bias_per_game = self.lobby_bias_head.forward(lobby_mean); // [batch, 1]
+        let lobby_bias = lobby_bias_per_game.expand([batch_size, TOTAL_PLAYERS]) * lobby_bias_scale;
+
+        player_pred.reshape([batch_size, TOTAL_PLAYERS]) + lobby_bias
+    }
+
+    /// Forward pass that also returns per-player ordinal logits.
+    ///
+    /// Returns `(mmr_predictions, ordinal_logits)` where:
+    /// - `mmr_predictions` is `[batch_size, 6]` raw MMR.
+    /// - `ordinal_logits` is `[batch_size * 6, ORDINAL_NUM_BOUNDARIES]` cumulative
+    ///   boundary logits for the auxiliary ordinal rank-classification loss.
+    pub fn forward_with_ordinal_scale(
+        &self,
+        input: Tensor<B, 3>,
+        lobby_bias_scale: f32,
+    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let [batch_times_players, seq_len, _] = input.dims();
+        let batch_size = batch_times_players / TOTAL_PLAYERS;
+
+        // Shared LSTM stack.
+        let (lstm1_out, _) = self.lstm1.forward(input, None);
+        let (lstm2_out, _) = self.lstm2.forward(lstm1_out, None);
+
+        // Attention-weighted temporal pooling.
+        let attention_scores = self.attention_query.forward(lstm2_out.clone());
+        let attention_weights =
+            softmax(attention_scores.reshape([batch_times_players, seq_len]), 1).reshape([
+                batch_times_players,
+                seq_len,
+                1,
+            ]);
+        let attention_pool = (lstm2_out.clone() * attention_weights)
+            .sum_dim(1)
+            .reshape([batch_times_players, self.lstm2_hidden]);
+
+        let last_hidden = lstm2_out
+            .narrow(1, seq_len - 1, 1)
+            .reshape([batch_times_players, self.lstm2_hidden]);
+
+        let pooled = Tensor::cat(vec![attention_pool, last_hidden], 1);
+
+        // Per-player feedforward.
+        let x = self.dropout.forward(pooled);
+        let x = self.player_fc1.forward(x);
+        let x = self.activation.forward(x);
+        let x = self.dropout.forward(x);
+
+        // Ordinal logits from the shared representation (before the final head dropout).
+        let ordinal_logits = self.ordinal_head.forward(x.clone()); // [batch*6, 21]
+
+        // Per-player regression head.
+        let player_pred = self.player_head_fc.forward(x.clone());
+        let player_pred = self.activation.forward(player_pred);
+        let player_pred = self.player_head_out.forward(player_pred);
+
+        // Lobby bias.
+        let feedforward_hidden = x.dims()[1];
+        let lobby_mean = x
+            .reshape([batch_size, TOTAL_PLAYERS, feedforward_hidden])
+            .mean_dim(1)
+            .reshape([batch_size, feedforward_hidden]);
+        let lobby_bias_per_game = self.lobby_bias_head.forward(lobby_mean);
+        let lobby_bias = lobby_bias_per_game.expand([batch_size, TOTAL_PLAYERS]) * lobby_bias_scale;
+
+        let mmr_preds = player_pred.reshape([batch_size, TOTAL_PLAYERS]) + lobby_bias;
+        (mmr_preds, ordinal_logits)
+    }
+
+    /// Forward pass (lobby bias active — use during validation and inference).
+    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
+        self.forward_with_lobby_scale(input, 1.0)
     }
 
     /// Forward pass for inference (dropout disabled in eval mode).
@@ -346,20 +493,14 @@ pub struct ExtractedSegmentFeatures {
 }
 
 impl ExtractedSegmentFeatures {
-    /// Builds features from game frames (call once, then use for all segments).
+    /// Builds features from game frames for inference.
     ///
-    /// Uses the same frame subsampling as the training pipeline (`1` out of every
-    /// [`FRAME_SUBSAMPLE_RATE`] replay frames).
-    ///
-    /// The roster is derived from all frames so that canonical slot assignments
-    /// remain stable even when a player disconnects mid-game.
-    pub fn from_frames(frames: &[replay_structs::GameFrame]) -> Self {
-        let roster = PlayerRoster::from_frames(frames);
-        let player_centric_frames = frames
-            .iter()
-            .step_by(FRAME_SUBSAMPLE_RATE)
-            .map(|frame| extract_all_player_centric_features(frame, &roster))
-            .collect();
+    /// Uses the same subsampling and feature set as the training pipeline.
+    /// Cumulative per-player stats reset every `segment_length` subsampled frames.
+    /// Score diff is set to 0 (unknown during live inference).
+    pub fn from_frames(frames: &[replay_structs::GameFrame], segment_length: usize) -> Self {
+        let player_centric_frames =
+            extract_player_centric_game_sequence_inference(frames, segment_length);
         Self {
             player_centric_frames,
             original_replay_frame_count: frames.len(),
@@ -457,16 +598,9 @@ pub fn predict_player_centric_per_segment<B: Backend>(
         return vec![];
     }
 
-    // Build the canonical roster once from all frames, then extract features.
-    // Using a single roster for the whole game prevents slot shifting when a
-    // player disconnects mid-match.
-    let roster = PlayerRoster::from_frames(frames);
     let original_frame_count = frames.len();
-    let player_centric_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
-        .iter()
-        .step_by(FRAME_SUBSAMPLE_RATE)
-        .map(|frame| extract_all_player_centric_features(frame, &roster))
-        .collect();
+    let player_centric_frames =
+        extract_player_centric_game_sequence_inference(frames, segment_length);
 
     let num_segments = if player_centric_frames.len() >= segment_length {
         player_centric_frames.len() / segment_length

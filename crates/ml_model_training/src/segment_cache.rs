@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use bytemuck::{cast_slice, try_cast_vec};
 use feature_extractor::{PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS};
+use replay_structs::{Rank, RankDivision};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -58,7 +59,9 @@ pub const fn compute_segment_count(total_frames: usize, segment_length: usize) -
 
 /// Cache format version. Bump this when the player ordering or feature layout changes
 /// to force automatic regeneration of all cached segments.
-const CACHE_VERSION: &str = "v5";
+/// v6: goal-replay trimming, new cumulative/game-context/role features (105 total),
+///     FRAME_SUBSAMPLE_RATE 3→2, sequence_length 300.
+const CACHE_VERSION: &str = "v6";
 
 /// Generates the directory path for a replay's segments.
 ///
@@ -336,6 +339,9 @@ struct SegmentEntry {
     path: PathBuf,
     /// Target MMR for this segment.
     target_mmr: [f32; TOTAL_PLAYERS],
+    /// Numeric rank index of the lobby's mean known MMR (for oversampling).
+    /// Maps to `replay_structs::Rank::as_numeric_index()` (0 = Unranked, 22 = SSL).
+    primary_rank_index: u8,
 }
 
 /// Converts bytes to f32 Vec, using zero-copy when possible.
@@ -408,14 +414,15 @@ impl SegmentStore {
         segment_files: &[SegmentFileInfo],
         target_mmr: [f32; TOTAL_PLAYERS],
     ) -> usize {
+        let primary_rank_index = primary_rank_index_from_mmr_array(&target_mmr);
         let mut added = 0;
         for segment_file in segment_files {
-            // Verify file exists and has correct size
             if let Ok(metadata) = fs::metadata(&segment_file.path) {
                 if metadata.len() == self.size_bytes as u64 {
                     self.entries.push(SegmentEntry {
                         path: segment_file.path.clone(),
                         target_mmr,
+                        primary_rank_index,
                     });
                     added += 1;
                 } else {
@@ -429,6 +436,65 @@ impl SegmentStore {
             }
         }
         added
+    }
+
+    /// Returns the primary rank index for a segment (for oversampling).
+    #[must_use]
+    pub fn get_primary_rank_index(&self, index: usize) -> Option<u8> {
+        self.entries.get(index).map(|e| e.primary_rank_index)
+    }
+
+    /// Builds a vec of segment indices with rare ranks oversampled.
+    ///
+    /// `target_count_per_rank` is the minimum per-rank count to achieve (typically
+    /// the median rank count).  Rare ranks are duplicated to reach this count.
+    /// All indices are shuffled together so batches remain diverse.
+    #[must_use]
+    pub fn build_oversampled_indices(&self, seed: u64) -> Vec<usize> {
+        // Count segments per rank.
+        let mut rank_counts = [0usize; 23];
+        for entry in &self.entries {
+            let idx = entry.primary_rank_index as usize;
+            if idx < 23 {
+                rank_counts[idx] += 1;
+            }
+        }
+
+        // Compute the median non-zero count as the target.
+        let mut non_zero: Vec<usize> = rank_counts.iter().copied().filter(|&c| c > 0).collect();
+        non_zero.sort_unstable();
+        let median = if non_zero.is_empty() {
+            1
+        } else {
+            non_zero[non_zero.len() / 2]
+        };
+
+        // For each rank, compute repeat factor (capped at 4× to avoid overfitting a tiny class).
+        let repeat_factor: Vec<usize> = rank_counts
+            .iter()
+            .map(|&count| {
+                if count == 0 {
+                    0
+                } else {
+                    (median / count).clamp(1, 4)
+                }
+            })
+            .collect();
+
+        let mut indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, entry)| {
+                let factor = *repeat_factor
+                    .get(entry.primary_rank_index as usize)
+                    .unwrap_or(&1);
+                std::iter::repeat_n(idx, factor)
+            })
+            .collect();
+
+        shuffle_indices_lcg(&mut indices, seed);
+        indices
     }
 
     /// Loads segment data from disk.
@@ -739,6 +805,33 @@ impl SegmentStoreBuilder {
             self.replays_cached,
             self.segments_loaded,
         )
+    }
+}
+
+// =============================================================================
+// Helper utilities
+// =============================================================================
+
+/// Derives the primary rank index from the mean of known (non-zero) player MMR targets.
+fn primary_rank_index_from_mmr_array(target_mmr: &[f32; TOTAL_PLAYERS]) -> u8 {
+    let known: Vec<f32> = target_mmr.iter().copied().filter(|&v| v > 0.0).collect();
+    if known.is_empty() {
+        return 0;
+    }
+    let mean_mmr = known.iter().sum::<f32>() / known.len() as f32;
+    let rank_division = RankDivision::from(mean_mmr as i32);
+    Rank::from(rank_division).as_numeric_index() as u8
+}
+
+/// Simple LCG Fisher-Yates shuffle (mirrors the one in training.rs).
+fn shuffle_indices_lcg(indices: &mut [usize], seed: u64) {
+    let mut state = seed.wrapping_add(12345);
+    for i in (1..indices.len()).rev() {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let j = ((state >> 33) as usize) % (i + 1);
+        indices.swap(i, j);
     }
 }
 

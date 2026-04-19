@@ -7,10 +7,15 @@ use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
+use burn::tensor::Distribution;
+use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
-use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
+use feature_extractor::TOTAL_PLAYERS;
+use ml_model::{
+    MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES, SequenceModel, TrainingConfig,
+};
 use replay_structs::{Rank, RankDivision};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
 use crate::segment_cache::SegmentStore;
@@ -102,51 +107,149 @@ pub struct TrainingOutput {
 }
 
 /// Number of batches to prefetch ahead (keep GPU fed while loading next batches).
-/// Increased to allow more time for parallel I/O loading.
 const PREFETCH_COUNT: usize = 8;
 
 /// How often to sync with GPU to extract loss value (every N batches).
-/// Higher values = better GPU utilization but less frequent progress updates.
 const LOSS_SYNC_INTERVAL: usize = 10;
 
-/// Approximate center of the MMR distribution (roughly Gold 1 / low Plat).
+/// Standard deviation of Gaussian label jitter applied to training targets (MMR units).
+/// Breaking exact same-rank-lobby ties regularises the model against using lobby
+/// MMR as a shortcut and encourages it to discriminate within a lobby.
+const LABEL_JITTER_STD: f64 = 75.0;
+
+/// Asymmetric quantile (pinball) loss weight for under-predictions at high rank.
+/// Adds to the Huber loss to push the model to predict SSL rather than regressing
+/// toward the lobby mean.
+const PINBALL_WEIGHT: f32 = 0.3;
+/// Quantile for the pinball term: 0.9 means under-prediction is penalised 9×.
+const PINBALL_TAU: f32 = 0.9;
+/// MMR threshold above which the pinball term is activated.
+const PINBALL_THRESHOLD_MMR: f32 = 1400.0;
+
+/// Epoch at which EMA-based smurf masking kicks in.
+const SMURF_MASK_START_EPOCH: usize = 5;
+/// Number of consecutive epochs a segment must be in the top-1 % before masking.
+const SMURF_MASK_SUSTAIN_EPOCHS: usize = 3;
+/// EMA decay factor for per-segment loss tracking (α for new value).
+const SMURF_EMA_ALPHA: f32 = 0.3;
+
+/// Weight of the auxiliary ordinal (cumulative-logit) classification loss.
+const ORDINAL_LOSS_WEIGHT: f32 = 0.2;
+
+/// Weight of the within-batch pairwise ranking loss.
+const PAIRWISE_LOSS_WEIGHT: f32 = 0.1;
+
+/// Per-segment smurf-masking state.
+#[derive(Default)]
+struct SmurfMaskState {
+    /// Exponential moving average of per-segment loss.
+    ema_loss: Vec<f32>,
+    /// Number of consecutive epochs each segment has been in the top-1 % EMA.
+    high_ema_epochs: Vec<u32>,
+    /// Final boolean mask: true = include in training, false = masked out.
+    active: Vec<bool>,
+}
+
+impl SmurfMaskState {
+    fn new(num_segments: usize) -> Self {
+        Self {
+            ema_loss: vec![0.0; num_segments],
+            high_ema_epochs: vec![0; num_segments],
+            active: vec![true; num_segments],
+        }
+    }
+
+    /// Updates EMA from a batch of (segment_index, loss) pairs.
+    fn update_ema(&mut self, pairs: &[(usize, f32)]) {
+        for &(idx, loss) in pairs {
+            if let Some(ema) = self.ema_loss.get_mut(idx) {
+                *ema = SMURF_EMA_ALPHA.mul_add(loss, (1.0 - SMURF_EMA_ALPHA) * *ema);
+            }
+        }
+    }
+
+    /// Refreshes the per-epoch high-EMA counters and active mask.
+    ///
+    /// Called once per epoch after the EMA has been updated for all batches.
+    fn refresh_masks(&mut self) {
+        let n = self.ema_loss.len();
+        if n == 0 {
+            return;
+        }
+        let mut sorted_ema = self.ema_loss.clone();
+        sorted_ema.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold_idx = (n as f32 * 0.99) as usize;
+        let threshold = sorted_ema.get(threshold_idx).copied().unwrap_or(f32::MAX);
+
+        let mut masked_count = 0usize;
+        for ((ema, high_epochs), active) in self
+            .ema_loss
+            .iter()
+            .zip(self.high_ema_epochs.iter_mut())
+            .zip(self.active.iter_mut())
+        {
+            if *ema >= threshold {
+                *high_epochs += 1;
+            } else {
+                *high_epochs = 0;
+            }
+            if *high_epochs >= SMURF_MASK_SUSTAIN_EPOCHS as u32 {
+                *active = false;
+                masked_count += 1;
+            }
+        }
+        if masked_count > 0 {
+            warn!(
+                smurf_masked_count = masked_count,
+                total_segments = n,
+                "Smurf masking: permanently masked high-EMA-loss segments this epoch"
+            );
+        }
+    }
+}
+
+/// Precomputes inverse-frequency per-rank weights from the training segment store.
 ///
-/// This is where the per-rank RMSE is consistently lowest, so the model already
-/// handles this region well without extra weighting.
-const WEIGHT_CENTER_MMR: f32 = 800.0;
+/// Returns a 23-element vec indexed by `Rank::as_numeric_index()`.
+/// Values are clipped to `[0.5, 5.0]` and normalised so the mean is 1.0.
+fn compute_inverse_frequency_weights(dataset: &SegmentStore) -> Vec<f32> {
+    let mut rank_counts = [0u32; 23];
+    for idx in 0..dataset.len() {
+        let rank_idx = dataset.get_primary_rank_index(idx).unwrap_or(0) as usize;
+        if let Some(count) = rank_counts.get_mut(rank_idx) {
+            *count += 1;
+        }
+    }
+    let max_count = rank_counts.iter().copied().max().unwrap_or(1).max(1) as f32;
+    let weights: Vec<f32> = rank_counts
+        .iter()
+        .map(|&count| {
+            if count == 0 {
+                1.0f32
+            } else {
+                (max_count / count as f32).clamp(0.5, 5.0)
+            }
+        })
+        .collect();
+    let mean_weight = weights.iter().sum::<f32>() / weights.len() as f32;
+    weights.iter().map(|w| w / mean_weight).collect()
+}
 
-/// Maximum extra weight applied at each tail (Bronze 1 and SSL).
+/// Looks up per-sample inverse-frequency weights on CPU and returns them as a Vec.
 ///
-/// With these values:
-///   Bronze 1 (~200 MMR)  → distance ≈ 0.75 → raw weight ≈ 2.69×
-///   Gold 1   (~800 MMR)  → distance  = 0.0  → raw weight  = 1.0× (min)
-///   SSL      (~1941 MMR) → distance ≈ 1.0   → raw weight ≈ 3.5×
-const WEIGHT_BOOST: f32 = 3.5;
-
-/// Computes per-sample loss weights from mean target MMR using a symmetric
-/// U-shaped curve centred on [`WEIGHT_CENTER_MMR`].
-///
-/// Both tails (low Bronze and SSL) receive elevated weights so the model is
-/// pushed to represent the full rank ladder rather than collapsing toward the
-/// centre of the distribution.  Weights are normalised to mean 1.0 so the
-/// effective learning rate is unchanged.
-fn compute_mmr_weights<B: Backend>(mean_mmr: Tensor<B, 2>) -> Tensor<B, 2> {
-    // Normalised distance from centre: 0 at WEIGHT_CENTER_MMR, 1 at the farther tail.
-    let max_distance = (MMR_SCALE - WEIGHT_CENTER_MMR).max(WEIGHT_CENTER_MMR);
-    let distance = (mean_mmr - WEIGHT_CENTER_MMR).abs() / max_distance;
-    let raw_weights = distance.powf_scalar(2.0) * WEIGHT_BOOST + 1.0;
-
-    let mean_weight: f32 = raw_weights
-        .clone()
-        .mean()
-        .into_data()
-        .to_vec()
-        .unwrap_or_else(|_| vec![1.0])
-        .first()
-        .copied()
-        .unwrap_or(1.0);
-
-    raw_weights / mean_weight
+/// `mean_target_mmr` is in raw MMR units (not normalised).
+fn lookup_rank_weights(mean_target_mmr_slice: &[f32], rank_weights: &[f32]) -> Vec<f32> {
+    mean_target_mmr_slice
+        .iter()
+        .map(|&mmr| {
+            if mmr <= 0.0 {
+                return 1.0f32;
+            }
+            let rank = Rank::from(RankDivision::from(mmr as i32));
+            let idx = rank.as_numeric_index() as usize;
+            rank_weights.get(idx).copied().unwrap_or(1.0)
+        })
+        .collect()
 }
 
 /// Trains the sequence model using cached segment data.
@@ -188,58 +291,51 @@ where
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
-    // Huber loss on normalised [0,1] targets (raw MMR / 2000).
-    //
-    // Overfit sweep (100 segments, 30 epochs, lr=1e-2, no clip):
-    //   delta=0.1 → FLAT  (+1.7 MMR, gradient ±0.1 too weak for 1.25M params)
-    //   delta=0.5 → OK    (820→309 MMR RMSE)
-    //   delta=1.0 → BEST  (867→307 MMR RMSE, fastest convergence)   <-- chosen
-    //
-    // delta=1.0 in normalised space = 2000 MMR, so virtually all errors stay in
-    // the quadratic regime.  This makes the loss behave like MSE for typical
-    // predictions while still capping the gradient for extreme outliers (e.g.
-    // corrupt replays with wildly wrong MMR labels).
-    //
-    // Computed element-wise (not via HuberLoss struct) so we can apply
-    // per-sample MMR-based weights before reduction.
+    // Huber loss (delta=1.0 in normalised space ≈ 2500 MMR → all errors quadratic).
     let huber_delta = 1.0_f32;
 
-    let mut checkpoint_paths = Vec::new();
+    // Precompute inverse-frequency per-rank weights once.
+    let rank_weights = compute_inverse_frequency_weights(&train_dataset);
+    info!(
+        "Inverse-frequency rank weights: {:?}",
+        rank_weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| format!("rank{i}={w:.2}"))
+            .collect::<Vec<_>>()
+    );
 
-    // Initialize training state
+    let mut checkpoint_paths = Vec::new();
     let mut state = start_state.unwrap_or_else(|| TrainingState::new(0));
     let start_epoch = state.current_epoch;
+    let num_samples = train_dataset.len();
+
+    // Smurf-masking state (activated after SMURF_MASK_START_EPOCH).
+    let mut smurf_state = SmurfMaskState::new(num_samples);
 
     const EARLY_STOPPING_PATIENCE: usize = 10;
 
     let valid_segments = valid_dataset.map_or(0, |ds| ds.len());
     info!(
-        "Starting training with {} train segments, {} valid segments",
-        train_dataset.len(),
-        valid_segments
-    );
-    info!(
-        "Batch size: {}, Learning rate: {}, Segment length: {}, Prefetch: {}",
-        config.batch_size, config.learning_rate, config.sequence_length, PREFETCH_COUNT
-    );
-    info!(
-        "MMR loss weighting enabled: center={WEIGHT_CENTER_MMR}, boost={WEIGHT_BOOST} (symmetric U-shape)"
+        "Starting training: {} train segs, {} valid segs, lr={}, seq_len={}, prefetch={}",
+        num_samples, valid_segments, config.learning_rate, config.sequence_length, PREFETCH_COUNT
     );
     if start_epoch > 0 {
         info!("Resuming from epoch {}", start_epoch + 1);
     }
 
-    let num_samples = train_dataset.len();
-
     for epoch in start_epoch..config.epochs {
         let epoch_start = Instant::now();
         let mut batch_count = 0;
 
-        // Create shuffled indices for this epoch
-        let mut indices: Vec<usize> = (0..num_samples).collect();
-        shuffle_indices(&mut indices, epoch as u64);
+        // Epoch indices: oversampled for rare ranks.
+        let oversampled_indices = train_dataset.build_oversampled_indices(epoch as u64);
+        // Apply smurf mask: drop segments that are permanently excluded.
+        let indices: Vec<usize> = oversampled_indices
+            .into_iter()
+            .filter(|&idx| smurf_state.active.get(idx).copied().unwrap_or(true))
+            .collect();
 
-        // Create prefetcher for this epoch - batches will be loaded in background
         let mut prefetcher = BatchPrefetcher::new(
             train_dataset.clone(),
             indices,
@@ -250,43 +346,52 @@ where
 
         let total_batches = prefetcher.total_batches();
 
-        // Cosine learning rate decay: starts at base_lr and decays to ~0 by the last epoch.
+        // Cosine learning-rate decay.
         let lr = cosine_lr(config.learning_rate, epoch, start_epoch, config.epochs);
 
-        // Accumulate loss on GPU to avoid sync on every batch
+        // Randomly zero lobby bias for 20 % of batches (Phase 3 training).
+        // We decide per-batch using a deterministic hash of epoch+batch_idx.
+        let lobby_zero_fraction = 0.2_f32;
+
         let mut accumulated_loss: Option<Tensor<B, 1>> = None;
         let mut accumulated_count = 0;
         let mut epoch_loss_sum = 0.0f64;
         let mut epoch_loss_count = 0usize;
 
-        // Timing accumulators (in microseconds)
+        // EMA updates for smurf masking (batch_idx → (segment_idx, loss_scalar) pairs).
+        let mut smurf_ema_updates: Vec<(usize, f32)> = Vec::new();
+
         let mut time_prefetch_wait_us = 0u64;
         let mut time_to_gpu_us = 0u64;
         let mut time_forward_us = 0u64;
         let mut time_backward_us = 0u64;
         let mut time_optimizer_us = 0u64;
 
-        // Process batches from prefetcher
         loop {
-            // Time waiting for prefetcher
             let t_prefetch_start = Instant::now();
             let Some(preloaded_batch) = prefetcher.next_batch() else {
                 break;
             };
             time_prefetch_wait_us += t_prefetch_start.elapsed().as_micros() as u64;
 
-            // Time converting to GPU tensors
             let t_to_gpu_start = Instant::now();
             let batch = preloaded_batch.to_batch::<B>(&device);
             time_to_gpu_us += t_to_gpu_start.elapsed().as_micros() as u64;
 
-            // Time for forward pass
             let t_forward_start = Instant::now();
-            let predictions = model.forward(batch.inputs);
 
-            // Mask: 1.0 where the target is known (> 0), 0.0 for sentinel slots.
-            // This prevents unknown-rank players from contributing any gradient.
-            let mask = batch.targets.clone().greater_elem(0.0).float(); // [batch, 6]
+            // 20 % lobby-bias dropout.
+            let lobby_scale =
+                if pseudo_random_f32(epoch as u64, batch_count as u64) < lobby_zero_fraction {
+                    0.0_f32
+                } else {
+                    1.0_f32
+                };
+            let (predictions, ordinal_logits) =
+                model.forward_with_ordinal_scale(batch.inputs, lobby_scale);
+
+            // Known-rank mask: 1.0 where target > 0.
+            let mask = batch.targets.clone().greater_elem(0.0).float();
             let known_count = mask
                 .clone()
                 .sum()
@@ -298,27 +403,163 @@ where
                 .unwrap_or(1.0f32)
                 .max(1.0f32);
 
-            // Per-sample weights based on mean MMR of *known* slots only.
+            // Per-sample inverse-frequency weights (computed on CPU).
             let known_per_row = mask.clone().sum_dim(1).clamp_min(1.0); // [batch, 1]
-            let masked_targets = batch.targets.clone() * mask.clone();
-            let mean_target_mmr = masked_targets.clone().sum_dim(1) / known_per_row; // [batch, 1]
-            let weights = compute_mmr_weights::<B>(mean_target_mmr); // [batch, 1]
+            let masked_targets_sum = (batch.targets.clone() * mask.clone()).sum_dim(1); // [batch, 1]
+            let mean_target_mmr_vec: Vec<f32> = (masked_targets_sum.clone()
+                / known_per_row.clone())
+            .into_data()
+            .to_vec()
+            .unwrap_or_default();
 
-            let targets_norm = batch.targets / MMR_SCALE;
+            let weights_vec = lookup_rank_weights(&mean_target_mmr_vec, &rank_weights);
+            let weights = Tensor::<B, 1>::from_floats(weights_vec.as_slice(), &device)
+                .reshape([mean_target_mmr_vec.len(), 1]); // [batch, 1]
+
+            // ±75 MMR Gaussian label jitter (train only, not validation).
+            // Applied in normalised space; only shifts known-rank slots.
+            let jitter_norm = Tensor::<B, 2>::random(
+                [weights_vec.len(), TOTAL_PLAYERS],
+                Distribution::Normal(0.0, LABEL_JITTER_STD / MMR_SCALE as f64),
+                &device,
+            );
+            let raw_targets = batch.targets.clone();
+            let raw_predictions = predictions.clone();
+            let targets_norm = batch.targets / MMR_SCALE + jitter_norm * mask.clone();
             let predictions_norm = predictions / MMR_SCALE;
 
-            let diff = predictions_norm - targets_norm;
+            let diff = predictions_norm.clone() - targets_norm.clone();
             let abs_diff = diff.clone().abs();
             let clamped = abs_diff.clone().clamp_min(0.0).clamp_max(huber_delta);
-            let element_loss =
-                clamped.clone().powf_scalar(2.0) * 0.5 + (abs_diff - clamped) * huber_delta;
+            let huber_loss =
+                clamped.clone().powf_scalar(2.0) * 0.5 + (abs_diff.clone() - clamped) * huber_delta;
 
-            // Zero out loss for unknown-rank slots, apply per-sample weights, then
-            // average over the number of *known* elements (not total elements).
-            let loss = (element_loss * mask * weights).sum() / known_count;
+            // Asymmetric pinball term for high-rank targets (τ = 0.9).
+            // Penalises under-prediction more than over-prediction above the threshold.
+            let high_rank_mask = targets_norm
+                .clone()
+                .greater_elem(PINBALL_THRESHOLD_MMR / MMR_SCALE)
+                .float();
+            let pinball =
+                (diff.clone() * PINBALL_TAU - diff.clone().clamp_max(0.0)) * high_rank_mask;
+
+            let element_loss = huber_loss + pinball * PINBALL_WEIGHT;
+
+            let regression_loss = (element_loss * mask.clone() * weights).sum() / known_count;
+
+            // --- Auxiliary ordinal classification loss ---
+            // For each player slot (batch*6 rows), build binary targets: 1 if true MMR
+            // is above boundary k, 0 otherwise.  Use BCE with logits, masked to known slots.
+            let flat_mask = mask
+                .clone()
+                .reshape([raw_targets.dims()[0] * TOTAL_PLAYERS]);
+            let flat_targets_mmr =
+                (raw_targets.clone() * MMR_SCALE).reshape([raw_targets.dims()[0] * TOTAL_PLAYERS]);
+
+            let boundaries_vec: Vec<f32> = ORDINAL_BOUNDARIES_MMR.to_vec();
+            let boundaries = Tensor::<B, 1>::from_floats(boundaries_vec.as_slice(), &device)
+                .unsqueeze::<2>() // [1, 21]
+                .transpose(); // [21, 1] — will broadcast
+
+            // ordinal_targets: [batch*6, 21] — 1.0 if player_mmr > boundary_k
+            let flat_targets_mmr_col = flat_targets_mmr.clone().unsqueeze::<2>(); // [batch*6, 1]
+            let ordinal_targets = flat_targets_mmr_col
+                .expand([flat_targets_mmr.dims()[0], ORDINAL_NUM_BOUNDARIES])
+                .greater(
+                    boundaries
+                        .transpose() // [1, 21]
+                        .expand([flat_targets_mmr.dims()[0], ORDINAL_NUM_BOUNDARIES]),
+                )
+                .float(); // [batch*6, 21]
+
+            // BCE with logits: L = -[y*log(σ(x)) + (1-y)*log(1-σ(x))]
+            let sigmoid_logits = activation::sigmoid(ordinal_logits.clone());
+            let bce = ordinal_targets.clone() * (sigmoid_logits.clone().clamp_min(1e-6).log())
+                + (ordinal_targets.clone().neg() + 1.0)
+                    * ((sigmoid_logits.clone().neg() + 1.0).clamp_min(1e-6).log());
+            let bce = bce.neg(); // [batch*6, 21]
+
+            // Mask out unknown-rank slots.
+            let ordinal_mask = flat_mask
+                .clone()
+                .unsqueeze::<2>()
+                .expand([flat_mask.dims()[0], ORDINAL_NUM_BOUNDARIES]);
+            let ordinal_known_count = ordinal_mask
+                .clone()
+                .sum()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default();
+            let ordinal_known_count = ordinal_known_count.first().copied().unwrap_or(1.0).max(1.0);
+            let ordinal_loss =
+                (bce * ordinal_mask).sum() / (ordinal_known_count * ORDINAL_NUM_BOUNDARIES as f32);
+
+            // --- Within-batch pairwise ranking loss ---
+            // For pairs of players in the same game where both ranks are known,
+            // penalise cases where the model inverts the correct ordering.
+            // Hinge: max(0, margin - (pred_i - pred_j)) when target_i > target_j.
+            let batch_size_local = raw_targets.dims()[0];
+            let preds_flat = raw_predictions.reshape([batch_size_local * TOTAL_PLAYERS]);
+            let targets_flat = raw_targets.reshape([batch_size_local * TOTAL_PLAYERS]);
+            // Reshape to [batch, 6] for per-lobby comparisons.
+            let preds_lobby = preds_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
+            let targets_lobby = targets_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
+            let mask_lobby = mask.clone().reshape([batch_size_local, TOTAL_PLAYERS]);
+
+            // For each lobby, compute outer difference: pred_i - pred_j and target_i - target_j.
+            let preds_i = preds_lobby.clone().unsqueeze_dim::<3>(2); // [B, 6, 1]
+            let preds_j = preds_lobby.clone().unsqueeze_dim::<3>(1); // [B, 1, 6]
+            let pred_diff = preds_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
+                - preds_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS]); // [B, 6, 6]
+
+            let targets_i = targets_lobby.clone().unsqueeze_dim::<3>(2);
+            let targets_j = targets_lobby.clone().unsqueeze_dim::<3>(1);
+            let target_diff = targets_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
+                - targets_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS]);
+
+            // Pair mask: both slots known and i strictly outranks j (in MMR units).
+            let mask_i = mask_lobby.clone().unsqueeze_dim::<3>(2);
+            let mask_j = mask_lobby.clone().unsqueeze_dim::<3>(1);
+            let pair_mask = mask_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
+                * mask_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
+                * target_diff
+                    .clone()
+                    .greater_elem(MMR_SCALE * 0.01) // at least 25 MMR difference
+                    .float();
+
+            let pairwise_hinge_margin: f32 = 50.0 / MMR_SCALE;
+            let pairwise_loss_elements =
+                (pair_mask.clone() * (pairwise_hinge_margin - pred_diff).clamp_min(0.0)).sum();
+            let pair_count = pair_mask
+                .sum()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default();
+            let pair_count = pair_count.first().copied().unwrap_or(1.0).max(1.0);
+            let pairwise_loss = pairwise_loss_elements / pair_count;
+
+            let loss = regression_loss
+                + ordinal_loss * ORDINAL_LOSS_WEIGHT
+                + pairwise_loss * PAIRWISE_LOSS_WEIGHT;
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
-            // Accumulate loss on GPU (no sync)
+            // Collect per-segment loss for smurf masking (after SMURF_MASK_START_EPOCH).
+            if epoch >= SMURF_MASK_START_EPOCH {
+                let per_sample_loss = (diff.clone().powf_scalar(2.0) * mask.clone())
+                    .sum_dim(1)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_default();
+                for (batch_pos, loss_val) in per_sample_loss.iter().enumerate() {
+                    let seg_idx = preloaded_batch
+                        .segment_indices
+                        .get(batch_pos)
+                        .copied()
+                        .unwrap_or(0);
+                    smurf_ema_updates.push((seg_idx, *loss_val));
+                }
+            }
+
             let loss_unsqueezed = loss.clone().unsqueeze::<1>();
             accumulated_loss = Some(match accumulated_loss {
                 Some(acc) => acc + loss_unsqueezed,
@@ -327,7 +568,6 @@ where
             accumulated_count += 1;
             batch_count += 1;
 
-            // Only sync with GPU periodically to get loss value
             if (accumulated_count >= LOSS_SYNC_INTERVAL || batch_count == total_batches)
                 && let Some(acc_loss) = accumulated_loss.take()
             {
@@ -344,7 +584,6 @@ where
                 epoch_loss_count += accumulated_count;
                 accumulated_count = 0;
 
-                // Log progress with timing breakdown
                 let avg_epoch_loss = epoch_loss_sum / epoch_loss_count as f64;
                 let approx_rmse = (avg_epoch_loss as f32).sqrt() * MMR_SCALE;
                 let n = batch_count as f64;
@@ -359,16 +598,20 @@ where
                 );
             }
 
-            // Time for backward pass
             let t_backward_start = Instant::now();
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, model);
             time_backward_us += t_backward_start.elapsed().as_micros() as u64;
 
-            // Time for optimizer step
             let t_optimizer_start = Instant::now();
             *model = optimizer.step(lr, model.clone(), grads);
             time_optimizer_us += t_optimizer_start.elapsed().as_micros() as u64;
+        }
+
+        // Update smurf EMA and refresh masks.
+        if epoch >= SMURF_MASK_START_EPOCH {
+            smurf_state.update_ema(&smurf_ema_updates);
+            smurf_state.refresh_masks();
         }
 
         // Log epoch timing summary
@@ -693,17 +936,19 @@ fn cosine_lr(base_lr: f64, current_epoch: usize, start_epoch: usize, total_epoch
     base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
 }
 
-/// Shuffles indices using a simple LCG-based shuffle.
-fn shuffle_indices(indices: &mut [usize], seed: u64) {
-    // Simple Fisher-Yates shuffle with LCG random
-    let mut rng_state = seed.wrapping_add(12345);
-
-    for i in (1..indices.len()).rev() {
-        // LCG: state = (a * state + c) mod m
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let j = ((rng_state >> 33) as usize) % (i + 1);
-        indices.swap(i, j);
-    }
+/// Returns a deterministic pseudo-random float in [0, 1) from two seeds.
+///
+/// Used for per-batch lobby-bias dropout decisions (reproducible across runs).
+fn pseudo_random_f32(seed_a: u64, seed_b: u64) -> f32 {
+    let mut state = seed_a.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(
+        seed_b
+            .wrapping_mul(1_442_695_040_888_963_407)
+            .wrapping_add(1),
+    );
+    state ^= state >> 33;
+    state = state.wrapping_mul(0xff51afd7ed558ccd);
+    state ^= state >> 33;
+    ((state >> 11) as f32) / (1u64 << 53) as f32
 }
 
 /// Logs training progress.
@@ -729,17 +974,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_shuffle_indices() {
-        let mut indices: Vec<usize> = (0..10).collect();
-        let original = indices.clone();
-
-        shuffle_indices(&mut indices, 42);
-
-        // Should be permuted (very unlikely to be the same)
-        assert_ne!(indices, original, "Shuffle should change order");
-
-        // Should contain the same elements
-        indices.sort_unstable();
-        assert_eq!(indices, original, "Shuffle should preserve elements");
+    fn test_pseudo_random_f32_range() {
+        for a in 0u64..5 {
+            for b in 0u64..5 {
+                let v = pseudo_random_f32(a, b);
+                assert!(
+                    (0.0..1.0).contains(&v),
+                    "pseudo_random_f32 out of [0,1): {v}"
+                );
+            }
+        }
+        // Different seeds should produce different values.
+        let v0 = pseudo_random_f32(0, 0);
+        let v1 = pseudo_random_f32(1, 0);
+        assert!((v0 - v1).abs() > f32::EPSILON);
     }
 }

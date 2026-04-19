@@ -16,14 +16,8 @@
 //! steps. Moving compute to a worker would be a larger architectural change (model + tensors in the
 //! worker, progress messages back to the main thread).
 
-#[cfg(target_arch = "wasm32")]
 use burn::backend::NdArray;
-#[cfg(not(target_arch = "wasm32"))]
-use burn::backend::Wgpu;
-#[cfg(target_arch = "wasm32")]
 use burn::backend::ndarray::NdArrayDevice;
-#[cfg(not(target_arch = "wasm32"))]
-use burn::backend::wgpu::WgpuDevice;
 use dioxus::prelude::*;
 use ml_model::{ExtractedSegmentFeatures, SequenceModel, load_checkpoint_from_bytes};
 use replay_parser::{ReplayAcceptanceError, parse_replay_from_bytes};
@@ -44,17 +38,13 @@ use crate::prediction::{
     ranks_from_player_predictions, segment_step_infos,
 };
 
-/// Burn backend for inference: WGPU on native hosts, pure CPU ndarray on WASM (WGPU checkpoint
-/// load and sync tensor reads panic on WASM — see cubecl-common `reader`).
-#[cfg(target_arch = "wasm32")]
+/// Burn backend for inference. The website runs inference on pure CPU
+/// (`ndarray`) on every target: WASM needs it because cubecl-wgpu's sync
+/// tensor reads panic in-browser, and native desktop builds use the same
+/// backend so "what ships" matches "what we test". Bulk GPU inference
+/// (flag_smurfs, predict) is handled by a separate CLI that targets CUDA.
 type InferenceBackend = NdArray;
-#[cfg(target_arch = "wasm32")]
 type InferenceDevice = NdArrayDevice;
-
-#[cfg(not(target_arch = "wasm32"))]
-type InferenceBackend = Wgpu;
-#[cfg(not(target_arch = "wasm32"))]
-type InferenceDevice = WgpuDevice;
 
 /// Upload page with a centered drag-and-drop area.
 ///
@@ -261,7 +251,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 return;
                             }
                             let sequence_length = sequence_length_from_embedded_config();
-                            let extracted = ExtractedSegmentFeatures::from_frames(&parsed.frames);
+                            let extracted = ExtractedSegmentFeatures::from_frames(&parsed.frames, sequence_length);
                             let num_segments = extracted.segment_count(sequence_length);
                             let mut segment_steps = segment_step_infos(
                                 &parsed.frames,
@@ -317,10 +307,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 );
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
-                            tracing::info!(
-                                "[replay] load_checkpoint_from_bytes starting (backend = {})", if
-                                cfg!(target_arch = "wasm32") { "NdArray" } else { "Wgpu" }
-                            );
+                            tracing::info!("[replay] load_checkpoint_from_bytes starting (backend = NdArray)");
                             let device = InferenceDevice::default();
                             let model: SequenceModel<InferenceBackend> = match load_checkpoint_from_bytes(
                                 MODEL_BYTES,

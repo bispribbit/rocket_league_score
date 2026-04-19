@@ -6,6 +6,7 @@
 mod checkpoint;
 mod dataset;
 pub mod segment_cache;
+pub mod tch_model;
 mod training;
 
 pub use checkpoint::{

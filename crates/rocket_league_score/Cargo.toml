@@ -27,7 +27,7 @@ replay_structs = { workspace = true, features = ["database"] }
 
 # External dependencies
 anyhow.workspace = true
-burn = { workspace = true, features = ["train"] }
+burn = { workspace = true, features = ["train", "cuda", "fusion", "autotune"] }
 chrono.workspace = true
 clap.workspace = true
 csv.workspace = true

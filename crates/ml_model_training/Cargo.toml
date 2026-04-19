@@ -19,7 +19,10 @@ workspace = true
 ml_model = { path = "../ml_model", default-features = false }
 feature_extractor = { path = "../feature_extractor" }
 replay_structs = { path = "../replay_structs" }
+# Training is now done via tch (LibTorch / cuDNN-fused LSTM).
+# Burn is kept only for data batching (NdArray CPU) and checkpoint serialisation.
 burn = { workspace = true, features = ["train"] }
+tch.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
