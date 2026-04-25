@@ -455,8 +455,8 @@ impl SegmentStore {
         let mut rank_counts = [0usize; 23];
         for entry in &self.entries {
             let idx = entry.primary_rank_index as usize;
-            if idx < 23 {
-                rank_counts[idx] += 1;
+            if let Some(count) = rank_counts.get_mut(idx) {
+                *count += 1;
             }
         }
 
@@ -466,17 +466,17 @@ impl SegmentStore {
         let median = if non_zero.is_empty() {
             1
         } else {
-            non_zero[non_zero.len() / 2]
+            non_zero.get(non_zero.len() / 2).copied().unwrap_or(1)
         };
 
         // For each rank, compute repeat factor (capped at 4× to avoid overfitting a tiny class).
         let repeat_factor: Vec<usize> = rank_counts
             .iter()
             .map(|&count| {
-                if count == 0 {
-                    0
+                if let Some(result) = median.checked_div(count) {
+                    result.clamp(1, 4)
                 } else {
-                    (median / count).clamp(1, 4)
+                    0
                 }
             })
             .collect();

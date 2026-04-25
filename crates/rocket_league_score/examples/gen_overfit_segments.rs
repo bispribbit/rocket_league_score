@@ -31,8 +31,12 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let n_per_rank: usize = args
         .windows(2)
-        .find(|w| w[0] == "--n-per-rank")
-        .and_then(|w| w[1].parse().ok())
+        .find_map(|w| {
+            w.first()
+                .map(String::as_str)
+                .is_some_and(|flag| flag == "--n-per-rank")
+                .then_some(w.get(1).and_then(|s| s.parse().ok()).unwrap_or(3))
+        })
         .unwrap_or(3);
 
     let sequence_length: usize = 300; // matches TrainingConfig sequence_length
@@ -88,8 +92,7 @@ async fn main() -> Result<()> {
         info!("Processing {} replays for {rank:?}", sample.len());
 
         for replay in &sample {
-            let db_players =
-                database::list_replay_players_by_replay(replay.id).await?;
+            let db_players = database::list_replay_players_by_replay(replay.id).await?;
 
             if db_players.is_empty() {
                 warn!(replay_id = %replay.id, "No players in DB, skipping");
@@ -107,12 +110,9 @@ async fn main() -> Result<()> {
             // Skip if already cached.
             {
                 use ml_model_training::segment_cache::segment_directory;
-                let seg_dir =
-                    segment_directory(&base_path, &replay.file_path, replay.id);
+                let seg_dir = segment_directory(&base_path, &replay.file_path, replay.id);
                 if seg_dir.exists()
-                    && std::fs::read_dir(&seg_dir)
-                        .map(|mut d| d.next().is_some())
-                        .unwrap_or(false)
+                    && std::fs::read_dir(&seg_dir).is_ok_and(|mut d| d.next().is_some())
                 {
                     info!(replay_id = %replay.id, "Already cached, skipping");
                     total_cached += 1;
@@ -162,11 +162,8 @@ async fn main() -> Result<()> {
                 })
                 .collect();
 
-            let game_sequence = extract_player_centric_game_sequence(
-                &parsed,
-                &player_ratings,
-                sequence_length,
-            );
+            let game_sequence =
+                extract_player_centric_game_sequence(&parsed, &player_ratings, sequence_length);
 
             if let Err(e) = builder.ensure_player_centric_segments_cached(
                 &replay.file_path,
@@ -186,9 +183,7 @@ async fn main() -> Result<()> {
 
     info!(
         total_cached,
-        total_skipped,
-        total_errors,
-        "Done — segment cache generation complete"
+        total_skipped, total_errors, "Done — segment cache generation complete"
     );
     Ok(())
 }

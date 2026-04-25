@@ -4,7 +4,6 @@ use std::path::Path;
 
 use burn::config::Config;
 use burn::module::Module;
-use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use ml_model::{MMR_SCALE, ModelConfig, SequenceModel, TrainingConfig};
 use serde::Serialize;
@@ -111,7 +110,7 @@ pub struct ModelCheckpoint {
 /// # Errors
 ///
 /// Returns an error if the checkpoint cannot be saved.
-pub fn save_checkpoint<B: Backend>(
+pub fn save_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
     model: &SequenceModel<B>,
     path: &str,
     config: &TrainingConfig,
@@ -149,7 +148,10 @@ pub fn save_checkpoint<B: Backend>(
 /// # Errors
 ///
 /// Returns an error if the checkpoint cannot be saved.
-pub fn save_checkpoint_bin<B: Backend>(model: &SequenceModel<B>, path: &str) -> anyhow::Result<()> {
+pub fn save_checkpoint_bin<B: ml_model::fused_lstm::FusedLstmBackend>(
+    model: &SequenceModel<B>,
+    path: &str,
+) -> anyhow::Result<()> {
     use burn::record::BinFileRecorder;
 
     if let Some(parent) = Path::new(path).parent() {
@@ -175,7 +177,7 @@ pub fn save_checkpoint_bin<B: Backend>(model: &SequenceModel<B>, path: &str) -> 
 /// # Errors
 ///
 /// Returns an error if the checkpoint cannot be loaded.
-pub fn load_checkpoint<B: Backend>(
+pub fn load_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
     path: &str,
     device: &B::Device,
 ) -> anyhow::Result<SequenceModel<B>> {

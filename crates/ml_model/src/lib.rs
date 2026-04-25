@@ -21,9 +21,11 @@
 //! This enables the model to learn individual skill patterns and produce
 //! different predictions for each player.
 
+pub mod fused_lstm;
+
 use burn::config::Config;
 use burn::module::Module;
-use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Lstm, LstmConfig, Relu};
+use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Relu};
 use burn::prelude::*;
 use burn::record::FullPrecisionSettings;
 use burn::tensor::activation::softmax;
@@ -31,8 +33,10 @@ use feature_extractor::{
     FRAME_SUBSAMPLE_RATE, PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
     extract_player_centric_game_sequence_inference,
 };
+use fused_lstm::{FusedLstm, FusedLstmBackend, FusedLstmConfig};
 
 /// Scale factor to normalise MMR values to [0, 1] range.
+///
 /// Raw MMR range is approximately 0 – 2500 (SSL sits at ~2200, top pros higher),
 /// so dividing by this constant keeps the output well below the saturation ceiling.
 /// Raised from 2000 to 2500 so that SSL labels (now 2200) are no longer clipped
@@ -153,9 +157,9 @@ pub struct TrainingConfig {
 #[derive(Module, Debug)]
 pub struct SequenceModel<B: Backend> {
     /// First LSTM layer for full per-player feature stream.
-    lstm1: Lstm<B>,
+    lstm1: FusedLstm<B>,
     /// Second LSTM layer for deeper temporal patterns.
-    lstm2: Lstm<B>,
+    lstm2: FusedLstm<B>,
     /// Learned attention query for temporal pooling.
     /// Maps `[batch*6, seq, lstm2_hidden]` → `[batch*6, seq, 1]`.
     attention_query: Linear<B>,
@@ -181,12 +185,13 @@ pub struct SequenceModel<B: Backend> {
     lstm2_hidden: usize,
 }
 
-impl<B: Backend> SequenceModel<B> {
+impl<B: FusedLstmBackend> SequenceModel<B> {
     /// Creates a new sequence model with the given configuration.
     pub fn new(device: &B::Device, config: &ModelConfig) -> Self {
-        let lstm1 =
-            LstmConfig::new(PLAYER_CENTRIC_FEATURE_COUNT, config.lstm_hidden_1, true).init(device);
-        let lstm2 = LstmConfig::new(config.lstm_hidden_1, config.lstm_hidden_2, true).init(device);
+        let lstm1 = FusedLstmConfig::new(PLAYER_CENTRIC_FEATURE_COUNT, config.lstm_hidden_1, true)
+            .init(device);
+        let lstm2 =
+            FusedLstmConfig::new(config.lstm_hidden_1, config.lstm_hidden_2, true).init(device);
 
         let dropout = DropoutConfig::new(config.dropout).init();
 
@@ -443,7 +448,10 @@ impl PlayerCentricSequenceTrainingData {
 }
 
 /// Creates a new sequence model with the given configuration.
-pub fn create_model<B: Backend>(device: &B::Device, config: &ModelConfig) -> SequenceModel<B> {
+pub fn create_model<B: FusedLstmBackend>(
+    device: &B::Device,
+    config: &ModelConfig,
+) -> SequenceModel<B> {
     SequenceModel::new(device, config)
 }
 
@@ -521,7 +529,7 @@ impl ExtractedSegmentFeatures {
     /// This method is `async` so GPU backends (for example WGPU) can read outputs with
     /// [`Tensor::into_data_async`] on targets such as WASM where synchronous reads are not supported.
     #[expect(clippy::future_not_send)]
-    pub async fn predict_single_segment<B: Backend>(
+    pub async fn predict_single_segment<B: FusedLstmBackend>(
         &self,
         model: &SequenceModel<B>,
         device: &B::Device,
@@ -588,7 +596,7 @@ impl ExtractedSegmentFeatures {
 /// # Returns
 ///
 /// A vector of per-segment predictions.
-pub fn predict_player_centric_per_segment<B: Backend>(
+pub fn predict_player_centric_per_segment<B: FusedLstmBackend>(
     model: &SequenceModel<B>,
     frames: &[replay_structs::GameFrame],
     device: &B::Device,
@@ -674,7 +682,7 @@ pub fn predict_player_centric_per_segment<B: Backend>(
 /// # Returns
 ///
 /// Array of predicted MMR values for each of the 6 players (averaged across segments).
-pub fn predict_player_centric<B: Backend>(
+pub fn predict_player_centric<B: FusedLstmBackend>(
     model: &SequenceModel<B>,
     frames: &[replay_structs::GameFrame],
     device: &B::Device,
@@ -745,7 +753,7 @@ fn get_segment_player_frames(
 /// # Errors
 ///
 /// Returns an error if the model cannot be loaded from bytes.
-pub fn load_checkpoint_from_bytes<B: Backend>(
+pub fn load_checkpoint_from_bytes<B: FusedLstmBackend>(
     model_bytes: &[u8],
     config_json: &str,
     device: &B::Device,

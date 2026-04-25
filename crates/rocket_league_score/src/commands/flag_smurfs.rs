@@ -20,7 +20,7 @@
 //! ```
 
 use anyhow::{Context, Result};
-use burn::backend::Cuda;
+use burn::backend::Wgpu;
 use config::{OBJECT_STORE, get_base_path};
 use database::{
     bulk_update_smurf_scores, initialize_pool, list_downloaded_replays,
@@ -34,7 +34,7 @@ use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
 use tracing::{info, warn};
 
-type InferenceBackend = Cuda;
+type InferenceBackend = Wgpu;
 
 /// Default sequence length (must match the checkpoint).
 const DEFAULT_SEQUENCE_LENGTH: usize = 300;
@@ -176,15 +176,14 @@ pub async fn run(config: &FlagSmurfsConfig) -> Result<()> {
                 frame
                     .players
                     .iter()
-                    .map(|p| p.name.as_ref().to_string())
+                    .map(|p| p.name.as_ref().clone())
                     .collect()
             })
             .unwrap_or_default();
 
         for (slot_idx, player_name) in player_names.iter().enumerate().take(TOTAL_PLAYERS) {
-            let predicted_mmr = match sum_preds.get(slot_idx) {
-                Some(&v) => v,
-                None => continue,
+            let Some(&predicted_mmr) = sum_preds.get(slot_idx) else {
+                continue;
             };
             let Some(&label_mmr) = label_mmr_map.get(player_name) else {
                 continue;

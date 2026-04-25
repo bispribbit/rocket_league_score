@@ -9,20 +9,21 @@ name = "convert_model_to_bin"
 path = "src/bin/convert_model_to_bin.rs"
 
 [[bin]]
-name = "overfit_test"
-path = "src/bin/overfit_test.rs"
+name = "overfit_wgpu"
+path = "src/bin/overfit_wgpu.rs"
+
+[[bin]]
+name = "mixed_rank_eval"
+path = "src/bin/mixed_rank_eval.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
-ml_model = { path = "../ml_model", default-features = false }
+ml_model = { path = "../ml_model" }
 feature_extractor = { path = "../feature_extractor" }
 replay_structs = { path = "../replay_structs" }
-# Training is now done via tch (LibTorch / cuDNN-fused LSTM).
-# Burn is kept only for data batching (NdArray CPU) and checkpoint serialisation.
-burn = { workspace = true, features = ["train"] }
-tch.workspace = true
+burn = { workspace = true, features = ["train", "wgpu", "autotune"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

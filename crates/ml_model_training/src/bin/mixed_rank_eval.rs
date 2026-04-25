@@ -27,15 +27,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use burn::backend::Cuda;
+use burn::backend::NdArray;
+use burn::backend::ndarray::NdArrayDevice;
 use burn::prelude::*;
 use feature_extractor::PLAYER_CENTRIC_FEATURE_COUNT;
 use ml_model::SequenceModel;
 use ml_model_training::load_checkpoint;
 use replay_structs::Rank;
 
-type Backend = Cuda;
-type BackendDevice = <Cuda as burn::prelude::Backend>::Device;
+// Eval-only path: NdArray on CPU is plenty for ~500 lobbies and avoids
+// pulling the conflicting LibTorch dep into the crate.
+type Backend = NdArray;
+type BackendDevice = NdArrayDevice;
 
 struct EvalConfig {
     model_path: PathBuf,
@@ -160,10 +163,7 @@ fn discover_all_segments(dir: &Path, sequence_length: usize) -> Vec<LabelledSegm
     collect_feature_files(dir, &mut files);
     let mut result = Vec::new();
     for path in files {
-        if std::fs::metadata(&path)
-            .map(|m| m.len() != expected_size as u64)
-            .unwrap_or(true)
-        {
+        if std::fs::metadata(&path).map_or(true, |m| m.len() != expected_size as u64) {
             continue;
         }
         let Some(rank) = rank_from_path(&path) else {
@@ -208,7 +208,7 @@ fn evaluate_mixed_lobbies(
     by_rank: &HashMap<Rank, Vec<&LabelledSegment>>,
     sequence_length: usize,
     num_lobbies: usize,
-    device: &BackendDevice,
+    device: BackendDevice,
 ) -> bool {
     // Pick 6 ranks with available segments to form a diverse lobby.
     let lobby_ranks: Vec<Rank> = {
@@ -278,7 +278,7 @@ fn evaluate_mixed_lobbies(
         }
 
         // Input shape: [num_slots, seq_len, features]
-        let input = Tensor::<Backend, 1>::from_floats(lobby_input.as_slice(), device).reshape([
+        let input = Tensor::<Backend, 1>::from_floats(lobby_input.as_slice(), &device).reshape([
             num_slots,
             sequence_length,
             PLAYER_CENTRIC_FEATURE_COUNT,
@@ -357,7 +357,7 @@ fn main() {
     println!("  Num lobbies: {}", config.num_lobbies);
     println!("  Seq len    : {}", config.sequence_length);
 
-    let device = BackendDevice::default();
+    let device = BackendDevice::Cpu;
 
     println!("\nLoading model...");
     let model_path_str = config.model_path.to_string_lossy();
@@ -393,7 +393,7 @@ fn main() {
         &by_rank,
         config.sequence_length,
         config.num_lobbies,
-        &device,
+        device,
     );
 
     println!("\n=== RESULT: {} ===", if pass { "PASS" } else { "FAIL" });

@@ -7,9 +7,8 @@ use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::tensor::Distribution;
-use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::{Distribution, activation};
 use feature_extractor::TOTAL_PLAYERS;
 use ml_model::{
     MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES, SequenceModel, TrainingConfig,
@@ -269,7 +268,7 @@ fn lookup_rank_weights(mean_target_mmr_slice: &[f32], rank_weights: &[f32]) -> V
 /// # Errors
 ///
 /// Returns an error if training fails.
-pub fn train<B: AutodiffBackend>(
+pub fn train<B: AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend>(
     model: &mut SequenceModel<B>,
     train_dataset: Arc<SegmentStore>,
     valid_dataset: Option<&Arc<SegmentStore>>,
@@ -279,6 +278,7 @@ pub fn train<B: AutodiffBackend>(
 ) -> anyhow::Result<TrainingOutput>
 where
     B::FloatElem: From<f32>,
+    B::InnerBackend: ml_model::fused_lstm::FusedLstmBackend,
 {
     if train_dataset.is_empty() {
         return Err(anyhow::anyhow!("No training data provided"));
@@ -833,7 +833,7 @@ struct ValidationLossResult {
 /// Computes validation loss on a segment dataset.
 ///
 /// Also logs a per-rank-tier RMSE breakdown for diagnostics.
-fn compute_validation_loss<B: Backend>(
+fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     model: &SequenceModel<B>,
     dataset: &Arc<SegmentStore>,
     batcher: &SequenceBatcher<B>,

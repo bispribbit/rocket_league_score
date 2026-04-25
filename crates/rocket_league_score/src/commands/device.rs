@@ -1,14 +1,12 @@
-use burn::backend::cuda::CudaDevice;
+use burn::backend::wgpu::WgpuDevice;
 use tracing::info;
 
-/// Initializes a CUDA device for GPU acceleration.
+/// Initializes a Wgpu device for GPU acceleration.
 ///
-/// Requires the CUDA toolkit (see `.devcontainer/Dockerfile`) and an NVIDIA
-/// GPU visible to the container.
-///
-/// This function only exists so the backend device can be swapped in a single
-/// place if we ever need to change it (e.g. for a CPU-only CI runner).
-pub fn init_device() -> CudaDevice {
-    info!("Initializing CUDA device...");
-    CudaDevice::default()
+/// Works on Windows (DX12/Vulkan), Linux (Vulkan), and macOS (Metal) without
+/// any extra runtime installation. Swap `WgpuDevice::default()` for
+/// `WgpuDevice::DiscreteGpu(0)` if you need to pin a specific adapter.
+pub fn init_device() -> WgpuDevice {
+    info!("Initializing Wgpu device...");
+    WgpuDevice::default()
 }

@@ -589,7 +589,8 @@ fn write_opponent_state_to_slice(slice: &mut [f32], player: &PlayerState) {
 /// Builds the name → state map once, then extracts each slot using roster-based
 /// lookup.  Players absent from the frame (disconnected) produce all-zero feature
 /// vectors; all other slots keep their canonical positions unchanged.
-pub fn extract_all_player_centric_features(
+#[cfg(test)]
+fn extract_all_player_centric_features(
     frame: &GameFrame,
     roster: &PlayerRoster,
     cumulatives: &[CumulativePlayerState; TOTAL_PLAYERS],
@@ -795,7 +796,7 @@ fn precompute_cumulative_score(goals: &[GoalEvent], num_frames: usize) -> Vec<(u
     let mut sorted_goals: Vec<&GoalEvent> = goals.iter().collect();
     sorted_goals.sort_by_key(|g| g.frame);
 
-    for frame_idx in 0..num_frames {
+    for (frame_idx, score_slot) in scores.iter_mut().enumerate() {
         while goal_idx < sorted_goals.len() && sorted_goals[goal_idx].frame <= frame_idx {
             match sorted_goals[goal_idx].player_team {
                 Team::Blue => blue += 1,
@@ -803,7 +804,7 @@ fn precompute_cumulative_score(goals: &[GoalEvent], num_frames: usize) -> Vec<(u
             }
             goal_idx += 1;
         }
-        scores[frame_idx] = (blue, orange);
+        *score_slot = (blue, orange);
     }
     scores
 }

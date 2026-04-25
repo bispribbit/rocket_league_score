@@ -16,3 +16,14 @@ anyhow.workspace = true
 burn.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+# CubeCL GPU deps — compiled for every non-WASM target (training + server
+# inference). The WASM build (is_this_a_smurf) gets only NdArray, which is
+# already in the workspace `burn` dep.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+burn-cubecl = { version = "0.20.1" }
+burn-wgpu = { version = "0.20.1", default-features = false }
+cubecl = { version = "0.9.0", default-features = false }
+
+[features]
+default = []
