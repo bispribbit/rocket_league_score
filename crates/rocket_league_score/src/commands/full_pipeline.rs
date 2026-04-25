@@ -554,7 +554,7 @@ async fn load_training_data_cached(
                 .collect();
 
             let game_sequence =
-                extract_player_centric_game_sequence(&parsed.frames, &player_ratings);
+                extract_player_centric_game_sequence(&parsed, &player_ratings, segment_length);
 
             // Ensure segments are cached, then add replay
             if let Err(e) = builder.ensure_player_centric_segments_cached(
@@ -724,7 +724,7 @@ async fn load_validation_data_cached(
                 .collect();
 
             let game_sequence =
-                extract_player_centric_game_sequence(&parsed.frames, &player_ratings);
+                extract_player_centric_game_sequence(&parsed, &player_ratings, segment_length);
 
             // Ensure segments are cached, then add replay
             if let Err(e) = builder.ensure_player_centric_segments_cached(

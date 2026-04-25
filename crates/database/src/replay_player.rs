@@ -64,6 +64,71 @@ pub async fn list_replay_players_by_replay(
     .await
 }
 
+/// Updates the `smurf_score` for a specific player in a replay.
+///
+/// `smurf_score` = predicted_mmr − mmr_middle(rank_division).
+/// A large positive value indicates above-rank performance.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn update_smurf_score(
+    replay_id: Uuid,
+    player_name: &str,
+    smurf_score: f32,
+) -> Result<(), sqlx::Error> {
+    let pool = get_pool();
+    sqlx::query!(
+        r#"
+        UPDATE replay_players
+        SET smurf_score = $3
+        WHERE replay_id = $1 AND player_name = $2
+        "#,
+        replay_id,
+        player_name,
+        smurf_score as f64,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Bulk-update smurf scores for many players in a single statement.
+///
+/// `updates` is a slice of `(replay_id, player_name, smurf_score)` triples.
+///
+/// # Errors
+///
+/// Returns an error if the database operation fails.
+pub async fn bulk_update_smurf_scores(updates: &[(Uuid, String, f32)]) -> Result<(), sqlx::Error> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let pool = get_pool();
+    let replay_ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
+    let player_names: Vec<String> = updates.iter().map(|(_, name, _)| name.clone()).collect();
+    let scores: Vec<f64> = updates
+        .iter()
+        .map(|(_, _, score)| f64::from(*score))
+        .collect();
+
+    sqlx::query!(
+        r#"
+        UPDATE replay_players AS rp
+        SET smurf_score = data.score
+        FROM unnest($1::uuid[], $2::text[], $3::float8[]) AS data(replay_id, player_name, score)
+        WHERE rp.replay_id = data.replay_id AND rp.player_name = data.player_name
+        "#,
+        &replay_ids as &[Uuid],
+        &player_names as &[String],
+        &scores as &[f64],
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// Gets the average skill rating for a replay.
 ///
 /// Uses the middle MMR value of each player's rank division.

@@ -20,14 +20,14 @@ workspace = true
 config.workspace = true
 database.workspace = true
 feature_extractor.workspace = true
-ml_model.workspace = true
-ml_model_training.workspace = true
+ml_model = { workspace = true }
+ml_model_training = { workspace = true }
 replay_parser.workspace = true
 replay_structs = { workspace = true, features = ["database"] }
 
 # External dependencies
 anyhow.workspace = true
-burn = { workspace = true, features = ["train"] }
+burn = { workspace = true, features = ["train", "wgpu", "autotune"] }
 chrono.workspace = true
 clap.workspace = true
 csv.workspace = true

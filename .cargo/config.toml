@@ -1,3 +1,16 @@
+[env]
+# cudarc (via burn-cuda / cubecl-cuda) uses `cuda-version-from-build-system` with
+# `fallback-latest`. If `nvcc` is not on PATH when dependencies build, that fallback
+# selects CUDA 13.1 bindings, which resolve extra driver exports in `nvcuda.dll`. Older
+# NVIDIA drivers then fail at runtime with `GetProcAddress` / error 127.
+#
+# Pin the CUDA *driver* API level cudarc compiles against (see cudarc `build.rs`).
+# This must match what `nvidia-smi` lists as "CUDA Version" (your driver), not the
+# standalone CUDA toolkit you installed. Toolkit 13.x does not replace `nvcuda.dll`.
+# `12060` is CUDA 12.6 and stays below a typical 12.7 driver cap. The devcontainer sets
+# the same in the environment.
+CUDARC_CUDA_VERSION = "12060"
+
 [cargo-new]
 name = "Your name"
 email = "name@example.com"

@@ -6,14 +6,33 @@ services:
     volumes:
       - ..:/workspace:cached
       - cargo-registry:/usr/local/cargo/registry
+      # WSL vGPU userspace (libd3d12core.so, libdxcore.so, libdirectml.so, …).
+      # Required for Mesa's dzn Vulkan-on-D3D12 driver to reach the Windows
+      # NVIDIA driver. See:
+      # https://github.com/microsoft/wslg/blob/main/samples/container/Containers.md
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+    devices:
+      # DirectX-on-Linux device node, used by both the CUDA WDDM path and by
+      # dzn to talk to the host GPU through /dev/dxg.
+      - /dev/dxg:/dev/dxg
     environment:
       - DATABASE_URL=postgres://postgres:postgres@db:5432/postgres
       - RUST_BACKTRACE=1
+      # Make the WSL vGPU libs discoverable by Mesa/dzn and CUDA.
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      # Prefer the discrete NVIDIA GPU when multiple D3D12 adapters are present
+      # (e.g. laptops with integrated Intel graphics). See:
+      # https://github.com/microsoft/wslg/wiki/GPU-selection-in-WSLg
+      - MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+      # Force wgpu to pick the Vulkan backend (dzn) rather than falling back to
+      # GL over llvmpipe.
+      - WGPU_BACKEND=vulkan
     depends_on:
       db:
         condition: service_healthy
     command: sleep infinity
-    # GPU access for WSL2/Docker Desktop
+    # GPU access for WSL2/Docker Desktop. This exposes /usr/lib/wsl/drivers/
+    # (libcuda.so, libnvidia-ml.so) and /dev/dxg.
     deploy:
       resources:
         reservations:
@@ -42,4 +61,3 @@ services:
 volumes:
   cargo-registry:
   postgres-data:
-

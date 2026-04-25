@@ -16,7 +16,7 @@ config = { path = "crates/config" }
 database = { path = "crates/database" }
 replay_parser = { path = "crates/replay_parser" }
 feature_extractor = { path = "crates/feature_extractor" }
-ml_model = { path = "crates/ml_model", default-features = false }
+ml_model = { path = "crates/ml_model" }
 ml_model_training = { path = "crates/ml_model_training" }
 replay_structs = { path = "crates/replay_structs" }
 
@@ -25,7 +25,7 @@ anyhow = { version = "1.0.102" }
 backon = { version = "1.6.0" }
 base64 = { version = "0.22" }
 boxcars = { version = "0.10.11" }
-burn = { version = "0.20.1", default-features = false, features = ["wgpu", "ndarray", "std", "autodiff"] }
+burn = { version = "0.20.1", default-features = false, features = ["ndarray", "std", "autodiff"] }
 bytemuck = { version = "1.25.0" }
 bytes = { version = "1.11.1" }
 chrono = { version = "0.4.44", features = ["serde"] }

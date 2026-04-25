@@ -99,6 +99,9 @@ pub struct PreloadedBatchData {
     pub batch_size: usize,
     /// Sequence length for reshaping
     pub sequence_length: usize,
+    /// Original segment indices (into the SegmentStore) for this batch.
+    /// Used by the smurf-masking EMA to track per-segment loss.
+    pub segment_indices: Vec<usize>,
 }
 
 impl PreloadedBatchData {
@@ -222,6 +225,7 @@ impl BatchPrefetcher {
                 target_data,
                 batch_size: actual_batch_size,
                 sequence_length,
+                segment_indices: batch_indices.to_vec(),
             };
 
             // Send to the training thread (blocks if buffer is full - this is intentional backpressure)

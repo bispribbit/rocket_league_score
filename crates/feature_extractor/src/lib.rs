@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
+use replay_structs::{GameFrame, GoalEvent, ParsedReplay, PlayerState, Quaternion, Team, Vector3};
 
 /// Feature count for player-centric representation.
 ///
@@ -18,6 +18,8 @@ use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
 /// - Ball state: 7
 /// - This player state: 13
 /// - This player ball relationship: 2
+/// - Per-player cumulative segment stats: 5
+///   (boost_collected, boost_spent, airborne_fraction, supersonic_fraction, demo_received_fraction)
 /// - Teammate 1 state: 13
 /// - Teammate 2 state: 13
 /// - Teammate relationships: 4
@@ -25,9 +27,17 @@ use replay_structs::{GameFrame, PlayerState, Quaternion, Team, Vector3};
 /// - Opponent 2 state: 12 (no boost)
 /// - Opponent 3 state: 12 (no boost)
 /// - Opponent relationships: 6
-/// - Game context: 1
-/// - Total: 95
-pub const PLAYER_CENTRIC_FEATURE_COUNT: usize = 95;
+/// - Game context: 1 (ball-to-goal distance)
+/// - Score + time context: 3 (score_diff_normalized, seconds_remaining_normalized, is_overtime)
+/// - Role indicators: 3 (closest/second/third to ball on team)
+/// - Total: 106
+pub const PLAYER_CENTRIC_FEATURE_COUNT: usize = 106;
+
+/// Number of features that belong solely to the focal player (ball + self + ball-relative + cumulative).
+///
+/// These are the features used by the per-player skill encoder in the split-encoder architecture.
+/// Indices 0 .. SELF_PLAYER_FEATURE_COUNT.
+pub const SELF_PLAYER_FEATURE_COUNT: usize = 7 + 13 + 2 + 5; // = 27
 
 /// Number of players expected in a 3v3 match.
 pub const PLAYERS_PER_TEAM: usize = 3;
@@ -61,6 +71,47 @@ pub struct PlayerRating {
     pub player_name: String,
     pub mmr: i32,
     pub team: i16,
+}
+
+/// Cumulative per-player state tracked within a segment.
+///
+/// All values are reset to zero at each segment boundary.
+#[derive(Debug, Clone, Default)]
+struct CumulativePlayerState {
+    /// Total boost gained (in boost units, 0-100 scale, clamped).
+    boost_collected: f32,
+    /// Total boost spent (boost units).
+    boost_spent: f32,
+    /// Number of subsampled frames spent airborne (z > `AIRBORNE_Z_THRESHOLD`).
+    frames_airborne: u32,
+    /// Number of subsampled frames at supersonic speed (> `SUPERSONIC_SPEED`).
+    frames_supersonic: u32,
+    /// Number of subsampled frames where this player was demolished.
+    frames_demolished: u32,
+    /// Total subsampled frames in segment so far (for computing fractions).
+    total_frames: u32,
+    /// Previous frame's boost amount (for detecting changes).
+    prev_boost: f32,
+}
+
+/// Minimum player height above the ground to count as airborne (Rocket League units).
+const AIRBORNE_Z_THRESHOLD: f32 = 25.0;
+
+/// Minimum speed to count as supersonic (Rocket League units per second).
+const SUPERSONIC_SPEED: f32 = 2200.0;
+
+/// Game context extracted for a single frame (shared across all 6 player views).
+#[derive(Debug, Clone, Default)]
+struct FrameGameContext {
+    /// Normalised score differential from the focal player's perspective:
+    /// positive = focal player's team is winning, negative = losing.
+    /// Value = (own_team_score - opponent_score) / 5.0, clamped to [-1, 1].
+    score_diff_normalized: f32,
+    /// Remaining match time normalised to [0, 1]: `seconds_remaining / 300`.
+    /// Saturates at 0.0 during overtime (clock does not go negative).
+    seconds_remaining_normalized: f32,
+    /// 1.0 if the game is in overtime (`seconds_remaining <= 0`), else 0.0.
+    is_overtime: f32,
 }
 
 /// Player-centric feature vector focused on one specific player.
@@ -292,11 +343,17 @@ fn build_target_mmr_array(player_ratings: &[PlayerRating]) -> [f32; TOTAL_PLAYER
 /// * `player_index` - Canonical slot (0-2 blue, 3-5 orange).
 /// * `roster` - The fixed canonical name list for this match.
 /// * `player_map` - Pre-built `name → &PlayerState` map for the current frame.
+/// * `cumulative` - Cumulative per-player stats accumulated since segment start.
+/// * `game_ctx` - Per-frame game context (score diff, time remaining).
+/// * `role_closest` - Whether this player is closest/second/third to ball on team.
 pub(crate) fn extract_player_centric_frame_features(
     frame: &GameFrame,
     player_index: usize,
     roster: &PlayerRoster,
     player_map: &HashMap<&str, &PlayerState>,
+    cumulative: &CumulativePlayerState,
+    game_ctx: &FrameGameContext,
+    role_rank: u8,
 ) -> PlayerCentricFrameFeatures {
     let mut features = PlayerCentricFrameFeatures {
         features: [0.0; PLAYER_CENTRIC_FEATURE_COUNT],
@@ -366,19 +423,30 @@ pub(crate) fn extract_player_centric_frame_features(
     }
     idx += 2;
 
-    // 4. Teammate 1 state (13 features) — zeros if absent
+    // 4. Per-player cumulative segment stats (5 features)
+    //    These reset at each segment boundary so the model sees within-segment effort.
+    let seg_max_boost = 300.0_f32; // rough normalisation ceiling per segment
+    features.features[idx] = (cumulative.boost_collected / seg_max_boost).min(1.0);
+    features.features[idx + 1] = (cumulative.boost_spent / seg_max_boost).min(1.0);
+    let total = cumulative.total_frames.max(1) as f32;
+    features.features[idx + 2] = cumulative.frames_airborne as f32 / total;
+    features.features[idx + 3] = cumulative.frames_supersonic as f32 / total;
+    features.features[idx + 4] = cumulative.frames_demolished as f32 / total;
+    idx += 5;
+
+    // 5. Teammate 1 state (13 features) — zeros if absent
     if let Some(t1) = teammates.first().and_then(|t| *t) {
         write_player_state_to_slice(&mut features.features[idx..idx + 13], t1);
     }
     idx += 13;
 
-    // 5. Teammate 2 state (13 features) — zeros if absent
+    // 6. Teammate 2 state (13 features) — zeros if absent
     if let Some(t2) = teammates.get(1).and_then(|t| *t) {
         write_player_state_to_slice(&mut features.features[idx..idx + 13], t2);
     }
     idx += 13;
 
-    // 6. Teammate relationships (4 features)
+    // 7. Teammate relationships (4 features)
     if let Some(t1) = teammates.first().and_then(|t| *t)
         && !t1.actor_state.is_demolished
     {
@@ -397,7 +465,7 @@ pub(crate) fn extract_player_centric_frame_features(
     }
     idx += 4;
 
-    // 7–9. Opponent states (12 features each, NO BOOST)
+    // 8–10. Opponent states (12 features each, NO BOOST)
     for i in 0..3 {
         if let Some(opp) = opponents.get(i).and_then(|t| *t) {
             write_opponent_state_to_slice(&mut features.features[idx..idx + 12], opp);
@@ -405,7 +473,7 @@ pub(crate) fn extract_player_centric_frame_features(
         idx += 12;
     }
 
-    // 10. Opponent relationships (6 features)
+    // 11. Opponent relationships (6 features)
     for i in 0..3 {
         if let Some(opp) = opponents.get(i).and_then(|t| *t)
             && !opp.actor_state.is_demolished
@@ -419,7 +487,7 @@ pub(crate) fn extract_player_centric_frame_features(
         idx += 2;
     }
 
-    // 11. Game context (1 feature)
+    // 12. Ball-to-blue-goal distance (1 feature)
     let blue_goal = Vector3 {
         x: 0.0,
         y: field::BLUE_GOAL_Y,
@@ -427,6 +495,19 @@ pub(crate) fn extract_player_centric_frame_features(
     };
     features.features[idx] =
         (distance(&frame.ball.position, &blue_goal) / field::DIAGONAL).min(1.0);
+    idx += 1;
+
+    // 13. Score + time context (3 features)
+    features.features[idx] = game_ctx.score_diff_normalized;
+    features.features[idx + 1] = game_ctx.seconds_remaining_normalized;
+    features.features[idx + 2] = game_ctx.is_overtime;
+    idx += 3;
+
+    // 14. Role indicators (3 features): closest/second/third to ball on own team.
+    //     role_rank 0 = closest, 1 = second, 2 = third.
+    features.features[idx] = if role_rank == 0 { 1.0 } else { 0.0 };
+    features.features[idx + 1] = if role_rank == 1 { 1.0 } else { 0.0 };
+    features.features[idx + 2] = if role_rank == 2 { 1.0 } else { 0.0 };
 
     features
 }
@@ -508,14 +589,50 @@ fn write_opponent_state_to_slice(slice: &mut [f32], player: &PlayerState) {
 /// Builds the name → state map once, then extracts each slot using roster-based
 /// lookup.  Players absent from the frame (disconnected) produce all-zero feature
 /// vectors; all other slots keep their canonical positions unchanged.
-pub fn extract_all_player_centric_features(
+#[cfg(test)]
+fn extract_all_player_centric_features(
     frame: &GameFrame,
     roster: &PlayerRoster,
+    cumulatives: &[CumulativePlayerState; TOTAL_PLAYERS],
+    game_ctx: &FrameGameContext,
 ) -> [PlayerCentricFrameFeatures; TOTAL_PLAYERS] {
     let player_map: HashMap<&str, &PlayerState> =
         frame.players.iter().map(|p| (&**p.name, p)).collect();
 
-    core::array::from_fn(|i| extract_player_centric_frame_features(frame, i, roster, &player_map))
+    // Compute role rank (distance rank to ball) per player within each team.
+    // role_rank[i] = 0 if player i is closest to ball on their team, 1 second, 2 third.
+    let mut role_ranks = [2u8; TOTAL_PLAYERS];
+    for team_offset in [0usize, PLAYERS_PER_TEAM] {
+        let mut dists: Vec<(usize, f32)> = (team_offset..team_offset + PLAYERS_PER_TEAM)
+            .map(|slot| {
+                let dist = roster
+                    .names
+                    .get(slot)
+                    .and_then(|name| player_map.get(name.as_str()))
+                    .filter(|ps| !ps.actor_state.is_demolished)
+                    .map_or(f32::MAX, |ps| {
+                        distance(&ps.actor_state.position, &frame.ball.position)
+                    });
+                (slot, dist)
+            })
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (slot, _)) in dists.iter().enumerate() {
+            role_ranks[*slot] = rank as u8;
+        }
+    }
+
+    core::array::from_fn(|i| {
+        extract_player_centric_frame_features(
+            frame,
+            i,
+            roster,
+            &player_map,
+            &cumulatives[i],
+            game_ctx,
+            role_ranks[i],
+        )
+    })
 }
 
 /// A sequence sample with player-centric features.
@@ -530,45 +647,291 @@ pub struct PlayerCentricGameSequence {
 
 /// Frame subsampling rate: take 1 frame out of every N frames.
 ///
-/// At 30fps, taking 1/3 frames gives ~10fps effective sampling rate,
-/// which better captures the fast mechanical decisions that distinguish
-/// high-rank gameplay (speed flips, wavedashes, fast aerials).
-pub const FRAME_SUBSAMPLE_RATE: usize = 3;
+/// At 30fps, taking 1/2 frames gives ~15fps effective sampling rate,
+/// preserving finer mechanical timing while keeping sequences manageable.
+/// Raised from 3 to 2 (Phase 2) to give 20 s of context at 300 frames.
+pub const FRAME_SUBSAMPLE_RATE: usize = 2;
 
 /// Extracts a game sequence sample with player-centric features.
 ///
-/// Uses frame subsampling (1 frame out of every `FRAME_SUBSAMPLE_RATE` frames)
-/// to reduce data size while preserving gameplay patterns.
+/// Trims goal-replay windows (frames between a goal event and the next kickoff)
+/// so the model never sees the celebration / teleportation state.  Uses
+/// `FRAME_SUBSAMPLE_RATE` subsampling and tracks per-player cumulative stats
+/// that reset at every `segment_length` subsampled frames.
 ///
 /// # Arguments
 ///
-/// * `frames` - All frames from the replay
-/// * `player_ratings` - Player ratings with team assignments
+/// * `parsed` - The full parsed replay (frames + goal/kickoff metadata).
+/// * `player_ratings` - Player ratings with team assignments.
+/// * `segment_length` - Number of subsampled frames per training segment
+///   (used to reset cumulative stats at each segment boundary).
 ///
 /// # Returns
 ///
-/// A `PlayerCentricGameSequence` with features for all 6 players across subsampled frames
+/// A `PlayerCentricGameSequence` with features for all 6 players across live frames.
 pub fn extract_player_centric_game_sequence(
-    frames: &[GameFrame],
+    parsed: &ParsedReplay,
     player_ratings: &[PlayerRating],
+    segment_length: usize,
 ) -> PlayerCentricGameSequence {
     let target_mmr = build_target_mmr_array(player_ratings);
-
-    // Build the canonical roster once from ratings; the same roster is reused
-    // for every frame so that slot assignments never shift mid-game.
     let roster = PlayerRoster::from_player_ratings(player_ratings);
 
-    // Extract features for subsampled frames (1 out of every FRAME_SUBSAMPLE_RATE), all players
-    let player_frames: Vec<[PlayerCentricFrameFeatures; 6]> = frames
-        .iter()
-        .step_by(FRAME_SUBSAMPLE_RATE)
-        .map(|frame| extract_all_player_centric_features(frame, &roster))
-        .collect();
+    // Build the goal-replay exclusion mask (O(goals) space, O(frames) scan).
+    let excluded = build_goal_replay_excluded_set(&parsed.goal_frames, &parsed.kickoff_frames);
+
+    // Precompute cumulative scores per original frame index.
+    let cumulative_score = precompute_cumulative_score(&parsed.goals, parsed.frames.len());
+
+    let mut cumulatives = core::array::from_fn(|_| CumulativePlayerState::default());
+    let mut player_frames: Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> = Vec::new();
+    let mut subsampled_count = 0usize;
+
+    for (frame_idx, frame) in parsed.frames.iter().enumerate() {
+        if frame_idx % FRAME_SUBSAMPLE_RATE != 0 {
+            continue;
+        }
+        if excluded.contains(&frame_idx) {
+            continue;
+        }
+
+        // Reset cumulative state at segment boundaries.
+        if subsampled_count > 0 && subsampled_count.is_multiple_of(segment_length) {
+            for state in &mut cumulatives {
+                *state = CumulativePlayerState::default();
+            }
+        }
+
+        // Build per-frame player map for fast lookup.
+        let player_map: HashMap<&str, &PlayerState> =
+            frame.players.iter().map(|p| (&**p.name, p)).collect();
+
+        // Update cumulative state for each player slot.
+        update_cumulative_states(&mut cumulatives, &roster, &player_map);
+
+        // Compute score diff from the focal perspective (team-0 = blue).
+        let (blue_score, orange_score) = cumulative_score.get(frame_idx).copied().unwrap_or((0, 0));
+
+        let seconds_remaining_normalized = (frame.seconds_remaining as f32 / 300.0).clamp(0.0, 1.0);
+        let is_overtime = if frame.seconds_remaining <= 0 {
+            1.0
+        } else {
+            0.0
+        };
+        let game_ctx_blue = FrameGameContext {
+            score_diff_normalized: ((blue_score as f32 - orange_score as f32) / 5.0)
+                .clamp(-1.0, 1.0),
+            seconds_remaining_normalized,
+            is_overtime,
+        };
+        let game_ctx_orange = FrameGameContext {
+            score_diff_normalized: ((orange_score as f32 - blue_score as f32) / 5.0)
+                .clamp(-1.0, 1.0),
+            seconds_remaining_normalized,
+            is_overtime,
+        };
+
+        // Extract all 6 player feature vectors.
+        // Blue players (slots 0-2) use game_ctx_blue; orange (slots 3-5) use game_ctx_orange.
+        let role_ranks = compute_role_ranks(frame, &roster, &player_map);
+        let mut frame_features = core::array::from_fn(|_| PlayerCentricFrameFeatures::default());
+        for slot in 0..TOTAL_PLAYERS {
+            let ctx = if slot < PLAYERS_PER_TEAM {
+                &game_ctx_blue
+            } else {
+                &game_ctx_orange
+            };
+            frame_features[slot] = extract_player_centric_frame_features(
+                frame,
+                slot,
+                &roster,
+                &player_map,
+                &cumulatives[slot],
+                ctx,
+                role_ranks[slot],
+            );
+        }
+
+        player_frames.push(frame_features);
+        subsampled_count += 1;
+    }
 
     PlayerCentricGameSequence {
         player_frames,
         target_mmr,
     }
+}
+
+/// Builds the set of original frame indices that fall inside goal-replay windows.
+///
+/// A goal-replay window runs from the goal frame (exclusive) to the next kickoff
+/// frame (exclusive).  Frames inside these windows show the celebration camera,
+/// car teleportation, and paused clock — they are pure noise for skill prediction.
+fn build_goal_replay_excluded_set(
+    goal_frames: &[usize],
+    kickoff_frames: &[usize],
+) -> std::collections::HashSet<usize> {
+    let mut excluded = std::collections::HashSet::new();
+    for &goal in goal_frames {
+        // Find the first kickoff that comes AFTER this goal.
+        let next_kickoff = kickoff_frames
+            .iter()
+            .find(|&&kf| kf > goal)
+            .copied()
+            .unwrap_or(usize::MAX);
+        // Exclude [goal+1 .. next_kickoff).
+        for frame_idx in (goal + 1)..next_kickoff.min(goal + 600) {
+            excluded.insert(frame_idx);
+        }
+    }
+    excluded
+}
+
+/// Precomputes (blue_score, orange_score) for every original frame index.
+fn precompute_cumulative_score(goals: &[GoalEvent], num_frames: usize) -> Vec<(u32, u32)> {
+    let mut scores = vec![(0u32, 0u32); num_frames];
+    let mut blue = 0u32;
+    let mut orange = 0u32;
+    let mut goal_idx = 0;
+    let mut sorted_goals: Vec<&GoalEvent> = goals.iter().collect();
+    sorted_goals.sort_by_key(|g| g.frame);
+
+    for (frame_idx, score_slot) in scores.iter_mut().enumerate() {
+        while goal_idx < sorted_goals.len() && sorted_goals[goal_idx].frame <= frame_idx {
+            match sorted_goals[goal_idx].player_team {
+                Team::Blue => blue += 1,
+                Team::Orange => orange += 1,
+            }
+            goal_idx += 1;
+        }
+        *score_slot = (blue, orange);
+    }
+    scores
+}
+
+/// Updates cumulative per-player state from the current frame.
+fn update_cumulative_states(
+    cumulatives: &mut [CumulativePlayerState; TOTAL_PLAYERS],
+    roster: &PlayerRoster,
+    player_map: &HashMap<&str, &PlayerState>,
+) {
+    for (slot, state) in cumulatives.iter_mut().enumerate() {
+        let Some(name) = roster.names.get(slot) else {
+            continue;
+        };
+        let Some(&player) = player_map.get(name.as_str()) else {
+            continue;
+        };
+
+        state.total_frames += 1;
+
+        // Boost tracking: compare to previous frame's boost.
+        let current_boost = player.actor_state.boost * 100.0; // normalise to 0-100
+        if current_boost > state.prev_boost + 5.0 {
+            // Boost increased significantly → player collected a pad.
+            state.boost_collected += current_boost - state.prev_boost;
+        } else if current_boost < state.prev_boost - 1.0 {
+            // Boost decreased → player used boost.
+            state.boost_spent += state.prev_boost - current_boost;
+        }
+        state.prev_boost = current_boost;
+
+        // Airborne.
+        if player.actor_state.position.z > AIRBORNE_Z_THRESHOLD && !player.actor_state.is_demolished
+        {
+            state.frames_airborne += 1;
+        }
+
+        // Supersonic.
+        let speed = vector_magnitude(&player.actor_state.velocity);
+        if speed > SUPERSONIC_SPEED && !player.actor_state.is_demolished {
+            state.frames_supersonic += 1;
+        }
+
+        // Demolished.
+        if player.actor_state.is_demolished {
+            state.frames_demolished += 1;
+        }
+    }
+}
+
+/// Returns role-rank per slot (0 = closest to ball within own team).
+fn compute_role_ranks(
+    frame: &GameFrame,
+    roster: &PlayerRoster,
+    player_map: &HashMap<&str, &PlayerState>,
+) -> [u8; TOTAL_PLAYERS] {
+    let mut role_ranks = [2u8; TOTAL_PLAYERS];
+    for team_offset in [0usize, PLAYERS_PER_TEAM] {
+        let mut dists: Vec<(usize, f32)> = (team_offset..team_offset + PLAYERS_PER_TEAM)
+            .map(|slot| {
+                let dist = roster
+                    .names
+                    .get(slot)
+                    .and_then(|name| player_map.get(name.as_str()))
+                    .filter(|ps| !ps.actor_state.is_demolished)
+                    .map_or(f32::MAX, |ps| {
+                        distance(&ps.actor_state.position, &frame.ball.position)
+                    });
+                (slot, dist)
+            })
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (slot, _)) in dists.iter().enumerate() {
+            role_ranks[*slot] = rank as u8;
+        }
+    }
+    role_ranks
+}
+
+/// Simplified extraction for inference: no goal trimming, no cumulative state reset across games.
+///
+/// Cumulative stats still reset at every `segment_length` subsampled frames.
+/// Score diff is set to 0 (unknown during live inference).
+pub fn extract_player_centric_game_sequence_inference(
+    frames: &[GameFrame],
+    segment_length: usize,
+) -> Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> {
+    let roster = PlayerRoster::from_frames(frames);
+
+    let mut cumulatives = core::array::from_fn(|_| CumulativePlayerState::default());
+    let mut player_frames = Vec::new();
+    let mut subsampled_count = 0usize;
+    let game_ctx = FrameGameContext::default();
+
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        if frame_idx % FRAME_SUBSAMPLE_RATE != 0 {
+            continue;
+        }
+
+        if subsampled_count > 0 && subsampled_count.is_multiple_of(segment_length) {
+            for state in &mut cumulatives {
+                *state = CumulativePlayerState::default();
+            }
+        }
+
+        let player_map: HashMap<&str, &PlayerState> =
+            frame.players.iter().map(|p| (&**p.name, p)).collect();
+        update_cumulative_states(&mut cumulatives, &roster, &player_map);
+
+        let role_ranks = compute_role_ranks(frame, &roster, &player_map);
+        let mut frame_features = core::array::from_fn(|_| PlayerCentricFrameFeatures::default());
+        for slot in 0..TOTAL_PLAYERS {
+            frame_features[slot] = extract_player_centric_frame_features(
+                frame,
+                slot,
+                &roster,
+                &player_map,
+                &cumulatives[slot],
+                &game_ctx,
+                role_ranks[slot],
+            );
+        }
+        player_frames.push(frame_features);
+        subsampled_count += 1;
+    }
+
+    player_frames
 }
 
 #[cfg(test)]
@@ -582,6 +945,9 @@ mod tests {
     #[test]
     fn test_player_centric_features_differ() {
         // Create a frame with distinct players
+        let empty_cumulative: [CumulativePlayerState; TOTAL_PLAYERS] =
+            core::array::from_fn(|_| CumulativePlayerState::default());
+        let game_ctx = FrameGameContext::default();
         let frame = GameFrame {
             time: 100.0,
             delta: 0.03,
@@ -756,7 +1122,8 @@ mod tests {
 
         // Build roster from the single test frame, then extract features.
         let roster = PlayerRoster::from_frames(std::slice::from_ref(&frame));
-        let all_features = extract_all_player_centric_features(&frame, &roster);
+        let all_features =
+            extract_all_player_centric_features(&frame, &roster, &empty_cumulative, &game_ctx);
 
         // Verify we get 6 feature vectors
         assert_eq!(all_features.len(), 6);
@@ -787,12 +1154,12 @@ mod tests {
 
     #[test]
     fn test_player_centric_feature_count() {
-        // Verify the feature count calculation
         // Ball: 7, This player: 13, Ball relationship: 2
+        // Cumulative self stats: 5
         // Teammate 1: 13, Teammate 2: 13, Teammate relationships: 4
         // Opponent 1-3: 12×3, Opponent relationships: 6
-        // Game context: 1
-        let expected = 7 + 13 + 2 + 13 + 13 + 4 + 12 + 12 + 12 + 6 + 1;
+        // Ball-to-goal: 1, Score+time: 2, Role indicators: 3
+        let expected = 7 + 13 + 2 + 5 + 13 + 13 + 4 + 12 + 12 + 12 + 6 + 1 + 2 + 3;
         assert_eq!(expected, PLAYER_CENTRIC_FEATURE_COUNT);
     }
 

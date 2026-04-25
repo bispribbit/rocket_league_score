@@ -113,7 +113,7 @@ impl BallchasingClient {
     /// Returns an error if the HTTP client cannot be created.
     pub fn new() -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_mins(1))
             .build()
             .context("Failed to create HTTP client")?;
 
