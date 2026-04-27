@@ -10,7 +10,23 @@
 //!
 //! Usage:
 //!   cargo run --bin overfit_wgpu --release \
-//!       -- [SEGMENTS_DIR] [--epochs E] [--seq-len L] [--lr LR]
+//!       -- [SEGMENTS_DIR] [--epochs E] [--t1-epochs E1] [--t2-epochs E2] \
+//!          [--t3-epochs E3] [--seq-len L] [--lr LR] [--lr-floor F] [--mse-only]
+//!
+//! Per-tier epoch flags override `T1`/`T2`/`T3` after `--epochs` if they appear
+//! **later** on the command line (avoid `--epochs` after `--t2-epochs` or it
+//! resets all three).
+//!
+//! `--mse-only`: ablation (experiment 4 in `experiment.md`) — MSE on mean-zero
+//! jittered targets, **unit** rank weights, **no** pinball. Oversampling, lobby
+//! alternation, and learning-rate schedule stay on.
+//!
+//! In the default (non `--mse-only`) mode, the harness uses
+//! [`ml_model_training::minibatch_loss::production_training_minibatch_loss`], the same
+//! Huber+pinball+rank-weight+ordinal+pairwise path as [`ml_model_training::train`].
+//! With `--mse-only`, the harness uses [`mse_ablation_minibatch_loss`] (MSE on jitter,
+//! optional T3 high-MMR row boost; [`SequenceModel::forward_with_lobby_scale`] to match
+//! evaluation).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,8 +41,13 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use feature_extractor::{PLAYER_CENTRIC_FEATURE_COUNT, TOTAL_PLAYERS};
 use ml_model::{MMR_SCALE, ModelConfig, SequenceModel, create_model};
-use ml_model_training::SequenceBatcher;
+use ml_model_training::minibatch_loss::{
+    mse_ablation_minibatch_loss, production_training_minibatch_loss,
+};
 use ml_model_training::segment_cache::{SegmentFileInfo, SegmentStore};
+use ml_model_training::{
+    MseExtremeMmrRowBoost, SequenceBatcher, compute_inverse_frequency_weights, pseudo_random_f32,
+};
 use replay_structs::Rank;
 
 type TrainBackend = Autodiff<Wgpu>;
@@ -44,6 +65,10 @@ struct HarnessConfig {
     sequence_length: usize,
     batch_size: usize,
     learning_rate: f64,
+    /// Minimum multiplier on `learning_rate` after warmup (cosine tail). Default `0.05`.
+    cosine_lr_floor: f64,
+    /// When true: train with MSE only (no pinball, no inverse-frequency rank weights).
+    mse_only: bool,
 }
 
 impl Default for HarnessConfig {
@@ -56,6 +81,8 @@ impl Default for HarnessConfig {
             sequence_length: 300,
             batch_size: 32,
             learning_rate: 1e-2,
+            cosine_lr_floor: 0.05,
+            mse_only: false,
         }
     }
 }
@@ -76,6 +103,30 @@ fn parse_args() -> HarnessConfig {
                     config.t3_epochs = e;
                 }
             }
+            Some("--t1-epochs") => {
+                i += 1;
+                if let Some(val) = args.get(i)
+                    && let Ok(e) = val.parse::<usize>()
+                {
+                    config.t1_epochs = e;
+                }
+            }
+            Some("--t2-epochs") => {
+                i += 1;
+                if let Some(val) = args.get(i)
+                    && let Ok(e) = val.parse::<usize>()
+                {
+                    config.t2_epochs = e;
+                }
+            }
+            Some("--t3-epochs") => {
+                i += 1;
+                if let Some(val) = args.get(i)
+                    && let Ok(e) = val.parse::<usize>()
+                {
+                    config.t3_epochs = e;
+                }
+            }
             Some("--seq-len") => {
                 i += 1;
                 if let Some(val) = args.get(i)
@@ -91,6 +142,17 @@ fn parse_args() -> HarnessConfig {
                 {
                     config.learning_rate = v;
                 }
+            }
+            Some("--lr-floor") => {
+                i += 1;
+                if let Some(val) = args.get(i)
+                    && let Ok(v) = val.parse::<f64>()
+                {
+                    config.cosine_lr_floor = v.clamp(0.0, 1.0);
+                }
+            }
+            Some("--mse-only") => {
+                config.mse_only = true;
             }
             Some(path) if !path.starts_with("--") => {
                 config.segments_dir = PathBuf::from(path);
@@ -235,7 +297,7 @@ fn build_store_from_indices(
 }
 
 // =============================================================================
-// Training loop — pure Burn, runs on Autodiff<Wgpu>
+// Training loop — same minibatch loss as `train()` (or MSE ablation for `--mse-only`)
 // =============================================================================
 
 fn run_training(
@@ -245,22 +307,29 @@ fn run_training(
     batch_size: usize,
     sequence_length: usize,
     learning_rate: f64,
+    cosine_lr_floor: f64,
     label: &str,
     early_stop_target: Option<f32>,
+    mse_only: bool,
+    mse_extreme_mmr_boost: Option<MseExtremeMmrRowBoost>,
 ) -> Vec<f32> {
     let device = model.device();
+    // Match `train`: gradient clip 1.0; keep 5.0 for the historical `--mse-only` ablation.
+    let grad_clip = if mse_only { 5.0 } else { 1.0 };
     let mut optimizer = AdamConfig::new()
-        .with_grad_clipping(Some(GradientClippingConfig::Norm(5.0)))
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(grad_clip)))
         .init();
-    // Batcher lives on the same Wgpu device as the model — loading happens on
-    // CPU (burn-wgpu's tensor-from-data path) but the resulting tensor sits on
-    // the GPU, so the forward doesn't eat an upload on every batch.
-    let batcher = SequenceBatcher::<TrainBackend>::new(device, sequence_length);
-    let indices: Vec<usize> = (0..store.len()).collect();
+    let batcher = SequenceBatcher::<TrainBackend>::new(device.clone(), sequence_length);
+
+    let rank_weights: Vec<f32> = if mse_only {
+        Vec::new()
+    } else {
+        compute_inverse_frequency_weights(store)
+    };
 
     let mut rmse_history = Vec::with_capacity(epochs);
     let print_every = (epochs / 10).max(10);
-    let warmup_epochs = 5_usize.min(epochs / 4);
+    let warmup_epochs = (epochs / 4).min(20);
     let mut consecutive_below_target = 0_usize;
 
     let wall_start = Instant::now();
@@ -269,17 +338,24 @@ fn run_training(
         let epoch_start = Instant::now();
 
         let lr_scale = if epoch < warmup_epochs {
-            (epoch as f64 / warmup_epochs as f64).mul_add(0.9, 0.1)
+            (epoch as f64 / warmup_epochs.max(1) as f64).mul_add(0.9, 0.1)
         } else {
             let progress = (epoch - warmup_epochs) as f64 / (epochs - warmup_epochs).max(1) as f64;
-            0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+            (0.5 * (1.0 + (std::f64::consts::PI * progress).cos())).max(cosine_lr_floor)
         };
         let effective_lr = learning_rate * lr_scale;
 
+        let indices = store.build_oversampled_indices(epoch as u64);
+
         let mut epoch_sq_err_sum = 0.0f64;
-        let mut epoch_known_count = 0usize;
+        let mut epoch_known_count: f64 = 0.0;
         let mut batch_prep_total = Duration::ZERO;
         let mut gpu_plus_sync_total = Duration::ZERO;
+
+        let mut diag_pred_sum_mmr = 0.0f64;
+        let mut diag_target_sum_mmr = 0.0f64;
+
+        let mut batch_count = 0_usize;
 
         for chunk in indices.chunks(batch_size) {
             let t_prep = Instant::now();
@@ -290,27 +366,51 @@ fn run_training(
 
             let t_gpu = Instant::now();
 
-            let predictions = model.forward(batch.inputs);
+            let lobby_scale = if mse_only {
+                if batch_count.is_multiple_of(2) {
+                    1.0_f32
+                } else {
+                    0.0_f32
+                }
+            } else if pseudo_random_f32(epoch as u64, batch_count as u64) < 0.2 {
+                0.0_f32
+            } else {
+                1.0_f32
+            };
 
-            // Mask out unknown targets (encoded as 0.0).
-            let mask = batch.targets.clone().greater_elem(0.0).float();
-
-            let targets_norm = batch.targets / MMR_SCALE;
-            let preds_norm = predictions / MMR_SCALE;
-            let diff = preds_norm - targets_norm;
-            let abs_diff = diff.clone().abs();
-            let element_loss = abs_diff.powf_scalar(2.0) * 0.5 * mask.clone();
-            let known_tensor = mask.clone().sum();
-            let loss = element_loss.sum() / known_tensor.clone().clamp_min(1.0);
-
-            // One GPU→CPU sync per batch: pack [known_count, sq_err].
-            let sq_tensor = (diff.powf_scalar(2.0) * mask).sum();
-            let stats = Tensor::cat(vec![known_tensor, sq_tensor], 0);
-            let vals: Vec<f32> = stats.into_data().to_vec().unwrap_or_default();
-            let known_n = vals.first().copied().unwrap_or(0.0).max(0.0);
-            let sq = vals.get(1).copied().unwrap_or(0.0);
-            epoch_sq_err_sum += f64::from(sq) * f64::from(MMR_SCALE) * f64::from(MMR_SCALE);
-            epoch_known_count += known_n as usize;
+            let loss: Tensor<TrainBackend, 1> = if mse_only {
+                let out = mse_ablation_minibatch_loss(
+                    model,
+                    &batch,
+                    &device,
+                    lobby_scale,
+                    mse_extreme_mmr_boost.clone(),
+                );
+                epoch_sq_err_sum += f64::from(out.harness_sum_sq_error_norm)
+                    * f64::from(MMR_SCALE)
+                    * f64::from(MMR_SCALE);
+                epoch_known_count += f64::from(out.harness_known_slots);
+                diag_pred_sum_mmr += f64::from(out.harness_pred_sum_norm) * f64::from(MMR_SCALE);
+                diag_target_sum_mmr +=
+                    f64::from(out.harness_target_sum_norm) * f64::from(MMR_SCALE);
+                out.loss
+            } else {
+                let out = production_training_minibatch_loss(
+                    model,
+                    &batch,
+                    &device,
+                    &rank_weights,
+                    lobby_scale,
+                );
+                epoch_sq_err_sum += f64::from(out.harness_sum_sq_error_norm)
+                    * f64::from(MMR_SCALE)
+                    * f64::from(MMR_SCALE);
+                epoch_known_count += f64::from(out.harness_known_slots);
+                diag_pred_sum_mmr += f64::from(out.harness_pred_sum_norm) * f64::from(MMR_SCALE);
+                diag_target_sum_mmr +=
+                    f64::from(out.harness_target_sum_norm) * f64::from(MMR_SCALE);
+                out.loss
+            };
 
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, model);
@@ -318,10 +418,12 @@ fn run_training(
             *model = optimizer.step(effective_lr, model_snapshot, grads);
 
             gpu_plus_sync_total += t_gpu.elapsed();
+            batch_count = batch_count.saturating_add(1);
         }
 
-        let rmse = if epoch_known_count > 0 {
-            (epoch_sq_err_sum / epoch_known_count as f64).sqrt() as f32
+        let known_usize = epoch_known_count as usize;
+        let rmse = if known_usize > 0 {
+            (epoch_sq_err_sum / epoch_known_count).sqrt() as f32
         } else {
             f32::MAX
         };
@@ -340,11 +442,18 @@ fn run_training(
                 batch_prep_total.as_secs_f64(),
                 gpu_plus_sync_total.as_secs_f64(),
             );
+            if known_usize > 0 {
+                let pred_mean = (diag_pred_sum_mmr / epoch_known_count) as f32;
+                let target_mean = (diag_target_sum_mmr / epoch_known_count) as f32;
+                println!(
+                    "  [{label}] collapse-diag: pred_mean={pred_mean:.1}  target_mean={target_mean:.1} MMR"
+                );
+            }
         }
 
         if let Some(target) = early_stop_target {
             if rmse < target {
-                consecutive_below_target += 1;
+                consecutive_below_target = consecutive_below_target.saturating_add(1);
                 if consecutive_below_target >= 2 {
                     println!(
                         "  [{label}] early stop at epoch {}/{} — RMSE {:.1} < target {:.1} MMR",
@@ -475,8 +584,11 @@ fn run_t1(
         config.batch_size,
         config.sequence_length,
         config.learning_rate,
+        config.cosine_lr_floor,
         "T1",
         Some(50.0),
+        config.mse_only,
+        None,
     );
 
     let start = history.first().copied().unwrap_or(f32::MAX);
@@ -546,8 +658,11 @@ fn run_t2(
         config.batch_size,
         config.sequence_length,
         config.learning_rate,
+        config.cosine_lr_floor,
         "T2",
         Some(300.0),
+        config.mse_only,
+        None,
     );
 
     let start = history.first().copied().unwrap_or(f32::MAX);
@@ -603,15 +718,23 @@ fn run_t3(
     let mut no_dropout_cfg = model_config.clone();
     no_dropout_cfg.dropout = 0.0;
     let mut model: SequenceModel<TrainBackend> = create_model(device, &no_dropout_cfg);
+    let t3_learning_rate = config.learning_rate * 1.5;
+    let t3_cosine_lr_floor = config.cosine_lr_floor.max(0.15);
     let history = run_training(
         &mut model,
         &store,
         config.t3_epochs,
         config.batch_size,
         config.sequence_length,
-        config.learning_rate,
+        t3_learning_rate,
+        t3_cosine_lr_floor,
         "T3",
         None,
+        config.mse_only,
+        Some(MseExtremeMmrRowBoost {
+            threshold_mmr: 1800.0,
+            extra_multiplier: 10.0,
+        }),
     );
 
     let per_rank_rmse =
@@ -659,8 +782,20 @@ fn main() {
     println!("  Segments dir : {}", config.segments_dir.display());
     println!("  Sequence len : {}", config.sequence_length);
     println!("  Learning rate: {:.0e}", config.learning_rate);
+    let default_cosine_lr_floor = HarnessConfig::default().cosine_lr_floor;
+    if (config.cosine_lr_floor - default_cosine_lr_floor).abs() > 1e-9 {
+        println!(
+            "  Cosine lr floor (fraction of base lr): {:.4}",
+            config.cosine_lr_floor
+        );
+    }
     println!("  T1/T2 epochs : {}/{}", config.t1_epochs, config.t2_epochs);
     println!("  T3 epochs    : {}", config.t3_epochs);
+    if config.mse_only {
+        println!("  Loss mode    : MSE ablation (no pinball, unit rank weights)");
+    } else {
+        println!("  Loss mode    : MSE + pinball + inverse-frequency rank weights");
+    }
 
     let wall_start = Instant::now();
 
@@ -702,6 +837,7 @@ fn main() {
     // (provided `WGPU_BACKEND=vulkan` is set; see `.devcontainer/docker-
     // compose.yml`). On Windows natively, this is the DX12 NVIDIA adapter.
     let device = WgpuDevice::default();
+    Wgpu::<f32>::seed(&device, 42);
     println!("\nBackend: burn-wgpu (Vulkan / DX12 via wgpu) with FusedLstm CubeCL kernel");
 
     let model_config = ModelConfig::new();

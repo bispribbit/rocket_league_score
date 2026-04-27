@@ -8,15 +8,12 @@ use burn::module::AutodiffModule;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{Distribution, activation};
-use feature_extractor::TOTAL_PLAYERS;
-use ml_model::{
-    MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES, SequenceModel, TrainingConfig,
-};
+use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
 use replay_structs::{Rank, RankDivision};
 use tracing::{info, warn};
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
+use crate::minibatch_loss::production_training_minibatch_loss;
 use crate::segment_cache::SegmentStore;
 use crate::{CheckpointValidationMetrics, ValidationRankRmseEntry, save_checkpoint};
 
@@ -111,32 +108,12 @@ const PREFETCH_COUNT: usize = 8;
 /// How often to sync with GPU to extract loss value (every N batches).
 const LOSS_SYNC_INTERVAL: usize = 10;
 
-/// Standard deviation of Gaussian label jitter applied to training targets (MMR units).
-/// Breaking exact same-rank-lobby ties regularises the model against using lobby
-/// MMR as a shortcut and encourages it to discriminate within a lobby.
-const LABEL_JITTER_STD: f64 = 75.0;
-
-/// Asymmetric quantile (pinball) loss weight for under-predictions at high rank.
-/// Adds to the Huber loss to push the model to predict SSL rather than regressing
-/// toward the lobby mean.
-const PINBALL_WEIGHT: f32 = 0.3;
-/// Quantile for the pinball term: 0.9 means under-prediction is penalised 9×.
-const PINBALL_TAU: f32 = 0.9;
-/// MMR threshold above which the pinball term is activated.
-const PINBALL_THRESHOLD_MMR: f32 = 1400.0;
-
 /// Epoch at which EMA-based smurf masking kicks in.
 const SMURF_MASK_START_EPOCH: usize = 5;
 /// Number of consecutive epochs a segment must be in the top-1 % before masking.
 const SMURF_MASK_SUSTAIN_EPOCHS: usize = 3;
 /// EMA decay factor for per-segment loss tracking (α for new value).
 const SMURF_EMA_ALPHA: f32 = 0.3;
-
-/// Weight of the auxiliary ordinal (cumulative-logit) classification loss.
-const ORDINAL_LOSS_WEIGHT: f32 = 0.2;
-
-/// Weight of the within-batch pairwise ranking loss.
-const PAIRWISE_LOSS_WEIGHT: f32 = 0.1;
 
 /// Per-segment smurf-masking state.
 #[derive(Default)]
@@ -211,7 +188,7 @@ impl SmurfMaskState {
 ///
 /// Returns a 23-element vec indexed by `Rank::as_numeric_index()`.
 /// Values are clipped to `[0.5, 5.0]` and normalised so the mean is 1.0.
-fn compute_inverse_frequency_weights(dataset: &SegmentStore) -> Vec<f32> {
+pub fn compute_inverse_frequency_weights(dataset: &SegmentStore) -> Vec<f32> {
     let mut rank_counts = [0u32; 23];
     for idx in 0..dataset.len() {
         let rank_idx = dataset.get_primary_rank_index(idx).unwrap_or(0) as usize;
@@ -237,7 +214,7 @@ fn compute_inverse_frequency_weights(dataset: &SegmentStore) -> Vec<f32> {
 /// Looks up per-sample inverse-frequency weights on CPU and returns them as a Vec.
 ///
 /// `mean_target_mmr` is in raw MMR units (not normalised).
-fn lookup_rank_weights(mean_target_mmr_slice: &[f32], rank_weights: &[f32]) -> Vec<f32> {
+pub fn lookup_rank_weights(mean_target_mmr_slice: &[f32], rank_weights: &[f32]) -> Vec<f32> {
     mean_target_mmr_slice
         .iter()
         .map(|&mmr| {
@@ -290,9 +267,6 @@ where
     let mut optimizer = AdamConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
-
-    // Huber loss (delta=1.0 in normalised space ≈ 2500 MMR → all errors quadratic).
-    let huber_delta = 1.0_f32;
 
     // Precompute inverse-frequency per-rank weights once.
     let rank_weights = compute_inverse_frequency_weights(&train_dataset);
@@ -387,166 +361,20 @@ where
                 } else {
                     1.0_f32
                 };
-            let (predictions, ordinal_logits) =
-                model.forward_with_ordinal_scale(batch.inputs, lobby_scale);
-
-            // Known-rank mask: 1.0 where target > 0.
-            let mask = batch.targets.clone().greater_elem(0.0).float();
-            let known_count = mask
-                .clone()
-                .sum()
-                .into_data()
-                .to_vec()
-                .unwrap_or_else(|_| vec![1.0f32])
-                .first()
-                .copied()
-                .unwrap_or(1.0f32)
-                .max(1.0f32);
-
-            // Per-sample inverse-frequency weights (computed on CPU).
-            let known_per_row = mask.clone().sum_dim(1).clamp_min(1.0); // [batch, 1]
-            let masked_targets_sum = (batch.targets.clone() * mask.clone()).sum_dim(1); // [batch, 1]
-            let mean_target_mmr_vec: Vec<f32> = (masked_targets_sum.clone()
-                / known_per_row.clone())
-            .into_data()
-            .to_vec()
-            .unwrap_or_default();
-
-            let weights_vec = lookup_rank_weights(&mean_target_mmr_vec, &rank_weights);
-            let weights = Tensor::<B, 1>::from_floats(weights_vec.as_slice(), &device)
-                .reshape([mean_target_mmr_vec.len(), 1]); // [batch, 1]
-
-            // ±75 MMR Gaussian label jitter (train only, not validation).
-            // Applied in normalised space; only shifts known-rank slots.
-            let jitter_norm = Tensor::<B, 2>::random(
-                [weights_vec.len(), TOTAL_PLAYERS],
-                Distribution::Normal(0.0, LABEL_JITTER_STD / MMR_SCALE as f64),
+            let minibatch_out = production_training_minibatch_loss(
+                model,
+                &batch,
                 &device,
+                &rank_weights,
+                lobby_scale,
             );
-            let raw_targets = batch.targets.clone();
-            let raw_predictions = predictions.clone();
-            let targets_norm = batch.targets / MMR_SCALE + jitter_norm * mask.clone();
-            let predictions_norm = predictions / MMR_SCALE;
-
-            let diff = predictions_norm.clone() - targets_norm.clone();
-            let abs_diff = diff.clone().abs();
-            let clamped = abs_diff.clone().clamp_min(0.0).clamp_max(huber_delta);
-            let huber_loss =
-                clamped.clone().powf_scalar(2.0) * 0.5 + (abs_diff.clone() - clamped) * huber_delta;
-
-            // Asymmetric pinball term for high-rank targets (τ = 0.9).
-            // Penalises under-prediction more than over-prediction above the threshold.
-            let high_rank_mask = targets_norm
-                .clone()
-                .greater_elem(PINBALL_THRESHOLD_MMR / MMR_SCALE)
-                .float();
-            let pinball =
-                (diff.clone() * PINBALL_TAU - diff.clone().clamp_max(0.0)) * high_rank_mask;
-
-            let element_loss = huber_loss + pinball * PINBALL_WEIGHT;
-
-            let regression_loss = (element_loss * mask.clone() * weights).sum() / known_count;
-
-            // --- Auxiliary ordinal classification loss ---
-            // For each player slot (batch*6 rows), build binary targets: 1 if true MMR
-            // is above boundary k, 0 otherwise.  Use BCE with logits, masked to known slots.
-            let flat_mask = mask
-                .clone()
-                .reshape([raw_targets.dims()[0] * TOTAL_PLAYERS]);
-            let flat_targets_mmr =
-                (raw_targets.clone() * MMR_SCALE).reshape([raw_targets.dims()[0] * TOTAL_PLAYERS]);
-
-            let boundaries_vec: Vec<f32> = ORDINAL_BOUNDARIES_MMR.to_vec();
-            let boundaries = Tensor::<B, 1>::from_floats(boundaries_vec.as_slice(), &device)
-                .unsqueeze::<2>() // [1, 21]
-                .transpose(); // [21, 1] — will broadcast
-
-            // ordinal_targets: [batch*6, 21] — 1.0 if player_mmr > boundary_k
-            let flat_targets_mmr_col = flat_targets_mmr.clone().unsqueeze::<2>(); // [batch*6, 1]
-            let ordinal_targets = flat_targets_mmr_col
-                .expand([flat_targets_mmr.dims()[0], ORDINAL_NUM_BOUNDARIES])
-                .greater(
-                    boundaries
-                        .transpose() // [1, 21]
-                        .expand([flat_targets_mmr.dims()[0], ORDINAL_NUM_BOUNDARIES]),
-                )
-                .float(); // [batch*6, 21]
-
-            // BCE with logits: L = -[y*log(σ(x)) + (1-y)*log(1-σ(x))]
-            let sigmoid_logits = activation::sigmoid(ordinal_logits.clone());
-            let bce = ordinal_targets.clone() * (sigmoid_logits.clone().clamp_min(1e-6).log())
-                + (ordinal_targets.clone().neg() + 1.0)
-                    * ((sigmoid_logits.clone().neg() + 1.0).clamp_min(1e-6).log());
-            let bce = bce.neg(); // [batch*6, 21]
-
-            // Mask out unknown-rank slots.
-            let ordinal_mask = flat_mask
-                .clone()
-                .unsqueeze::<2>()
-                .expand([flat_mask.dims()[0], ORDINAL_NUM_BOUNDARIES]);
-            let ordinal_known_count = ordinal_mask
-                .clone()
-                .sum()
-                .into_data()
-                .to_vec::<f32>()
-                .unwrap_or_default();
-            let ordinal_known_count = ordinal_known_count.first().copied().unwrap_or(1.0).max(1.0);
-            let ordinal_loss =
-                (bce * ordinal_mask).sum() / (ordinal_known_count * ORDINAL_NUM_BOUNDARIES as f32);
-
-            // --- Within-batch pairwise ranking loss ---
-            // For pairs of players in the same game where both ranks are known,
-            // penalise cases where the model inverts the correct ordering.
-            // Hinge: max(0, margin - (pred_i - pred_j)) when target_i > target_j.
-            let batch_size_local = raw_targets.dims()[0];
-            let preds_flat = raw_predictions.reshape([batch_size_local * TOTAL_PLAYERS]);
-            let targets_flat = raw_targets.reshape([batch_size_local * TOTAL_PLAYERS]);
-            // Reshape to [batch, 6] for per-lobby comparisons.
-            let preds_lobby = preds_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
-            let targets_lobby = targets_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
-            let mask_lobby = mask.clone().reshape([batch_size_local, TOTAL_PLAYERS]);
-
-            // For each lobby, compute outer difference: pred_i - pred_j and target_i - target_j.
-            let preds_i = preds_lobby.clone().unsqueeze_dim::<3>(2); // [B, 6, 1]
-            let preds_j = preds_lobby.clone().unsqueeze_dim::<3>(1); // [B, 1, 6]
-            let pred_diff = preds_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
-                - preds_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS]); // [B, 6, 6]
-
-            let targets_i = targets_lobby.clone().unsqueeze_dim::<3>(2);
-            let targets_j = targets_lobby.clone().unsqueeze_dim::<3>(1);
-            let target_diff = targets_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
-                - targets_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS]);
-
-            // Pair mask: both slots known and i strictly outranks j (in MMR units).
-            let mask_i = mask_lobby.clone().unsqueeze_dim::<3>(2);
-            let mask_j = mask_lobby.clone().unsqueeze_dim::<3>(1);
-            let pair_mask = mask_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
-                * mask_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
-                * target_diff
-                    .clone()
-                    .greater_elem(MMR_SCALE * 0.01) // at least 25 MMR difference
-                    .float();
-
-            let pairwise_hinge_margin: f32 = 50.0 / MMR_SCALE;
-            let pairwise_loss_elements =
-                (pair_mask.clone() * (pairwise_hinge_margin - pred_diff).clamp_min(0.0)).sum();
-            let pair_count = pair_mask
-                .sum()
-                .into_data()
-                .to_vec::<f32>()
-                .unwrap_or_default();
-            let pair_count = pair_count.first().copied().unwrap_or(1.0).max(1.0);
-            let pairwise_loss = pairwise_loss_elements / pair_count;
-
-            let loss = regression_loss
-                + ordinal_loss * ORDINAL_LOSS_WEIGHT
-                + pairwise_loss * PAIRWISE_LOSS_WEIGHT;
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
-            // Collect per-segment loss for smurf masking (after SMURF_MASK_START_EPOCH).
+            let loss = minibatch_out.loss;
+
             if epoch >= SMURF_MASK_START_EPOCH {
-                let per_sample_loss = (diff.clone().powf_scalar(2.0) * mask.clone())
-                    .sum_dim(1)
+                let per_sample_loss = minibatch_out
+                    .per_row_mse_for_smurf
                     .into_data()
                     .to_vec::<f32>()
                     .unwrap_or_default();
@@ -560,10 +388,9 @@ where
                 }
             }
 
-            let loss_unsqueezed = loss.clone().unsqueeze::<1>();
             accumulated_loss = Some(match accumulated_loss {
-                Some(acc) => acc + loss_unsqueezed,
-                None => loss_unsqueezed,
+                Some(acc) => acc + loss.clone(),
+                None => loss.clone(),
             });
             accumulated_count += 1;
             batch_count += 1;
@@ -939,7 +766,7 @@ fn cosine_lr(base_lr: f64, current_epoch: usize, start_epoch: usize, total_epoch
 /// Returns a deterministic pseudo-random float in [0, 1) from two seeds.
 ///
 /// Used for per-batch lobby-bias dropout decisions (reproducible across runs).
-fn pseudo_random_f32(seed_a: u64, seed_b: u64) -> f32 {
+pub fn pseudo_random_f32(seed_a: u64, seed_b: u64) -> f32 {
     let mut state = seed_a.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(
         seed_b
             .wrapping_mul(1_442_695_040_888_963_407)
