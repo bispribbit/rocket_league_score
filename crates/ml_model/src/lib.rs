@@ -43,6 +43,14 @@ use fused_lstm::{FusedLstm, FusedLstmBackend, FusedLstmConfig};
 /// at the normalisation boundary.
 pub const MMR_SCALE: f32 = 2500.0;
 
+/// Output scale for the lobby-level bias in raw MMR units.
+///
+/// The `lobby_bias_head` is otherwise free to match any per-game mean from a
+/// single scalar, which lets the LSTM+per-player head stay under-used when
+/// all six training labels in a segment share the same MMR. Capping this
+/// path forces the per-player branch to own most of the signal.
+pub const LOBBY_BIAS_OUTPUT_SCALE: f32 = 0.0;
+
 /// Number of cumulative-logit boundaries for ordinal rank classification.
 ///
 /// We model 22 ranked tiers (Bronze-1 … SSL), requiring 21 boundaries.
@@ -287,7 +295,9 @@ impl<B: FusedLstmBackend> SequenceModel<B> {
             .mean_dim(1)
             .reshape([batch_size, feedforward_hidden]);
         let lobby_bias_per_game = self.lobby_bias_head.forward(lobby_mean); // [batch, 1]
-        let lobby_bias = lobby_bias_per_game.expand([batch_size, TOTAL_PLAYERS]) * lobby_bias_scale;
+        let lobby_bias = lobby_bias_per_game.expand([batch_size, TOTAL_PLAYERS])
+            * lobby_bias_scale
+            * LOBBY_BIAS_OUTPUT_SCALE;
 
         player_pred.reshape([batch_size, TOTAL_PLAYERS]) + lobby_bias
     }
@@ -349,7 +359,9 @@ impl<B: FusedLstmBackend> SequenceModel<B> {
             .mean_dim(1)
             .reshape([batch_size, feedforward_hidden]);
         let lobby_bias_per_game = self.lobby_bias_head.forward(lobby_mean);
-        let lobby_bias = lobby_bias_per_game.expand([batch_size, TOTAL_PLAYERS]) * lobby_bias_scale;
+        let lobby_bias = lobby_bias_per_game.expand([batch_size, TOTAL_PLAYERS])
+            * lobby_bias_scale
+            * LOBBY_BIAS_OUTPUT_SCALE;
 
         let mmr_preds = player_pred.reshape([batch_size, TOTAL_PLAYERS]) + lobby_bias;
         (mmr_preds, ordinal_logits)

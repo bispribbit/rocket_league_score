@@ -5,6 +5,7 @@
 
 mod checkpoint;
 mod dataset;
+pub mod minibatch_loss;
 pub mod segment_cache;
 mod training;
 
@@ -13,4 +14,8 @@ pub use checkpoint::{
     save_checkpoint, save_checkpoint_bin,
 };
 pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
-pub use training::{CheckpointConfig, TrainingOutput, TrainingState, train};
+pub use minibatch_loss::MseExtremeMmrRowBoost;
+pub use training::{
+    CheckpointConfig, TrainingOutput, TrainingState, compute_inverse_frequency_weights,
+    lookup_rank_weights, pseudo_random_f32, train,
+};
