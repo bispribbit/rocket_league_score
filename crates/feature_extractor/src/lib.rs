@@ -1158,8 +1158,8 @@ mod tests {
         // Cumulative self stats: 5
         // Teammate 1: 13, Teammate 2: 13, Teammate relationships: 4
         // Opponent 1-3: 12×3, Opponent relationships: 6
-        // Ball-to-goal: 1, Score+time: 2, Role indicators: 3
-        let expected = 7 + 13 + 2 + 5 + 13 + 13 + 4 + 12 + 12 + 12 + 6 + 1 + 2 + 3;
+        // Ball-to-goal: 1, Score+time: 3, Role indicators: 3
+        let expected = 7 + 13 + 2 + 5 + 13 + 13 + 4 + 12 + 12 + 12 + 6 + 1 + 3 + 3;
         assert_eq!(expected, PLAYER_CENTRIC_FEATURE_COUNT);
     }
 
