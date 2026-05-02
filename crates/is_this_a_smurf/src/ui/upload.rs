@@ -251,7 +251,10 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 return;
                             }
                             let sequence_length = sequence_length_from_embedded_config();
-                            let extracted = ExtractedSegmentFeatures::from_frames(&parsed.frames, sequence_length);
+                            let extracted = ExtractedSegmentFeatures::from_frames(
+                                &parsed.frames,
+                                sequence_length,
+                            );
                             let num_segments = extracted.segment_count(sequence_length);
                             let mut segment_steps = segment_step_infos(
                                 &parsed.frames,
@@ -307,7 +310,9 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 );
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
-                            tracing::info!("[replay] load_checkpoint_from_bytes starting (backend = NdArray)");
+                            tracing::info!(
+                                "[replay] load_checkpoint_from_bytes starting (backend = NdArray)"
+                            );
                             let device = InferenceDevice::default();
                             let model: SequenceModel<InferenceBackend> = match load_checkpoint_from_bytes(
                                 MODEL_BYTES,
@@ -324,6 +329,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                     return;
                                 }
                             };
+                            tracing::info!("[replay] building results");
                             tracing::info!("[replay] {} segments, starting inference", num_segments);
                             if let Some(first_segment_step) = segment_steps.first_mut() {
                                 first_segment_step.status = StepStatus::Processing;

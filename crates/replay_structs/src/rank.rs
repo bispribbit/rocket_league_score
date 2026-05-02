@@ -889,6 +889,8 @@ impl FromStr for RankDivision {
     }
 }
 
+type RankDivisionStringPatternEntry = (&'static str, fn(i32, i32) -> Option<RankDivision>);
+
 /// Parses short form ranks like `gc3d1`, `c2d3`, `d1d4`, `ssl`.
 #[expect(clippy::too_many_lines)]
 fn parse_short_form(s: &str) -> Option<RankDivision> {
@@ -925,7 +927,7 @@ fn parse_short_form(s: &str) -> Option<RankDivision> {
     // Pattern: <rank_prefix><tier>d<division>
     // gc = Grand Champion, c = Champion, d = Diamond, p = Platinum,
     // g = Gold, s = Silver, b = Bronze
-    let patterns: &[(&str, fn(i32, i32) -> Option<RankDivision>)] = &[
+    let patterns: &[RankDivisionStringPatternEntry] = &[
         ("gc", |tier, div| match (tier, div) {
             (3, 1) => Some(GrandChampionIIIDivision1),
             (3, 2) => Some(GrandChampionIIIDivision2),

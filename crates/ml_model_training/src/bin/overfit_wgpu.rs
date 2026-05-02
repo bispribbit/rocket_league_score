@@ -301,50 +301,62 @@ fn build_store_from_indices(
 // Training loop — same minibatch loss as `train()` (or MSE ablation for `--mse-only`)
 // =============================================================================
 
-fn run_training(
-    model: &mut SequenceModel<TrainBackend>,
-    store: &Arc<SegmentStore>,
+struct OverfitTrainingLoopConfiguration {
     epochs: usize,
     batch_size: usize,
     sequence_length: usize,
     learning_rate: f64,
     cosine_lr_floor: f64,
-    label: &str,
+    label: &'static str,
     early_stop_target: Option<f32>,
     mse_only: bool,
     mse_extreme_mmr_boost: Option<MseExtremeMmrRowBoost>,
+}
+
+fn run_training(
+    model: &mut SequenceModel<TrainBackend>,
+    store: &Arc<SegmentStore>,
+    loop_configuration: &OverfitTrainingLoopConfiguration,
 ) -> Vec<f32> {
+    let label = loop_configuration.label;
     let device = model.device();
     // Match `train`: gradient clip 1.0; keep 5.0 for the historical `--mse-only` ablation.
-    let grad_clip = if mse_only { 5.0 } else { 1.0 };
+    let grad_clip = if loop_configuration.mse_only {
+        5.0
+    } else {
+        1.0
+    };
     let mut optimizer = AdamConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Norm(grad_clip)))
         .init();
-    let batcher = SequenceBatcher::<TrainBackend>::new(device.clone(), sequence_length);
+    let batcher =
+        SequenceBatcher::<TrainBackend>::new(device.clone(), loop_configuration.sequence_length);
 
-    let rank_weights: Vec<f32> = if mse_only {
+    let rank_weights: Vec<f32> = if loop_configuration.mse_only {
         Vec::new()
     } else {
         compute_inverse_frequency_weights(store)
     };
 
-    let mut rmse_history = Vec::with_capacity(epochs);
-    let print_every = (epochs / 10).max(10);
-    let warmup_epochs = (epochs / 4).min(20);
+    let mut rmse_history = Vec::with_capacity(loop_configuration.epochs);
+    let print_every = (loop_configuration.epochs / 10).max(10);
+    let warmup_epochs = (loop_configuration.epochs / 4).min(20);
     let mut consecutive_below_target = 0_usize;
 
     let wall_start = Instant::now();
 
-    for epoch in 0..epochs {
+    for epoch in 0..loop_configuration.epochs {
         let epoch_start = Instant::now();
 
         let lr_scale = if epoch < warmup_epochs {
             (epoch as f64 / warmup_epochs.max(1) as f64).mul_add(0.9, 0.1)
         } else {
-            let progress = (epoch - warmup_epochs) as f64 / (epochs - warmup_epochs).max(1) as f64;
-            (0.5 * (1.0 + (std::f64::consts::PI * progress).cos())).max(cosine_lr_floor)
+            let progress = (epoch - warmup_epochs) as f64
+                / (loop_configuration.epochs - warmup_epochs).max(1) as f64;
+            (0.5 * (1.0 + (std::f64::consts::PI * progress).cos()))
+                .max(loop_configuration.cosine_lr_floor)
         };
-        let effective_lr = learning_rate * lr_scale;
+        let effective_lr = loop_configuration.learning_rate * lr_scale;
 
         let indices = store.build_oversampled_indices(epoch as u64);
 
@@ -358,7 +370,7 @@ fn run_training(
 
         let mut batch_count = 0_usize;
 
-        for chunk in indices.chunks(batch_size) {
+        for chunk in indices.chunks(loop_configuration.batch_size) {
             let t_prep = Instant::now();
             let Some(batch) = batcher.batch_from_indices(store, chunk) else {
                 continue;
@@ -367,7 +379,7 @@ fn run_training(
 
             let t_gpu = Instant::now();
 
-            let lobby_scale = if mse_only {
+            let lobby_scale = if loop_configuration.mse_only {
                 if batch_count.is_multiple_of(2) {
                     1.0_f32
                 } else {
@@ -379,13 +391,13 @@ fn run_training(
                 1.0_f32
             };
 
-            let loss: Tensor<TrainBackend, 1> = if mse_only {
+            let loss: Tensor<TrainBackend, 1> = if loop_configuration.mse_only {
                 let out = mse_ablation_minibatch_loss(
                     model,
                     &batch,
                     &device,
                     lobby_scale,
-                    mse_extreme_mmr_boost.clone(),
+                    loop_configuration.mse_extreme_mmr_boost.clone(),
                     LabelJitterStep {
                         epoch: epoch as u64,
                         batch_in_epoch: batch_count as u64,
@@ -440,11 +452,11 @@ fn run_training(
 
         let epoch_secs = epoch_start.elapsed().as_secs_f64();
 
-        if (epoch + 1) % print_every == 0 || epoch == 0 || epoch + 1 == epochs {
+        if (epoch + 1) % print_every == 0 || epoch == 0 || epoch + 1 == loop_configuration.epochs {
             println!(
                 "  [{label}] epoch {:>4}/{} — RMSE {:7.1} MMR  lr={:.2e}  ({:.2}s/epoch: prep={:.2}s gpu={:.2}s)",
                 epoch + 1,
-                epochs,
+                loop_configuration.epochs,
                 rmse,
                 effective_lr,
                 epoch_secs,
@@ -460,14 +472,14 @@ fn run_training(
             }
         }
 
-        if let Some(target) = early_stop_target {
+        if let Some(target) = loop_configuration.early_stop_target {
             if rmse < target {
                 consecutive_below_target = consecutive_below_target.saturating_add(1);
                 if consecutive_below_target >= 2 {
                     println!(
                         "  [{label}] early stop at epoch {}/{} — RMSE {:.1} < target {:.1} MMR",
                         epoch + 1,
-                        epochs,
+                        loop_configuration.epochs,
                         rmse,
                         target
                     );
@@ -589,15 +601,17 @@ fn run_t1(
     let history = run_training(
         &mut model,
         &store,
-        config.t1_epochs,
-        config.batch_size,
-        config.sequence_length,
-        config.learning_rate,
-        config.cosine_lr_floor,
-        "T1",
-        Some(50.0),
-        config.mse_only,
-        None,
+        &OverfitTrainingLoopConfiguration {
+            epochs: config.t1_epochs,
+            batch_size: config.batch_size,
+            sequence_length: config.sequence_length,
+            learning_rate: config.learning_rate,
+            cosine_lr_floor: config.cosine_lr_floor,
+            label: "T1",
+            early_stop_target: Some(50.0),
+            mse_only: config.mse_only,
+            mse_extreme_mmr_boost: None,
+        },
     );
 
     let start = history.first().copied().unwrap_or(f32::MAX);
@@ -663,15 +677,17 @@ fn run_t2(
     let history = run_training(
         &mut model,
         &store,
-        config.t2_epochs,
-        config.batch_size,
-        config.sequence_length,
-        config.learning_rate,
-        config.cosine_lr_floor,
-        "T2",
-        Some(300.0),
-        config.mse_only,
-        None,
+        &OverfitTrainingLoopConfiguration {
+            epochs: config.t2_epochs,
+            batch_size: config.batch_size,
+            sequence_length: config.sequence_length,
+            learning_rate: config.learning_rate,
+            cosine_lr_floor: config.cosine_lr_floor,
+            label: "T2",
+            early_stop_target: Some(300.0),
+            mse_only: config.mse_only,
+            mse_extreme_mmr_boost: None,
+        },
     );
 
     let start = history.first().copied().unwrap_or(f32::MAX);
@@ -732,18 +748,20 @@ fn run_t3(
     let history = run_training(
         &mut model,
         &store,
-        config.t3_epochs,
-        config.batch_size,
-        config.sequence_length,
-        t3_learning_rate,
-        t3_cosine_lr_floor,
-        "T3",
-        None,
-        config.mse_only,
-        Some(MseExtremeMmrRowBoost {
-            threshold_mmr: 1800.0,
-            extra_multiplier: 10.0,
-        }),
+        &OverfitTrainingLoopConfiguration {
+            epochs: config.t3_epochs,
+            batch_size: config.batch_size,
+            sequence_length: config.sequence_length,
+            learning_rate: t3_learning_rate,
+            cosine_lr_floor: t3_cosine_lr_floor,
+            label: "T3",
+            early_stop_target: None,
+            mse_only: config.mse_only,
+            mse_extreme_mmr_boost: Some(MseExtremeMmrRowBoost {
+                threshold_mmr: 1800.0,
+                extra_multiplier: 10.0,
+            }),
+        },
     );
 
     let per_rank_rmse =

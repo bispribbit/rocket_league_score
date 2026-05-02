@@ -1,8 +1,7 @@
 use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
 use burn::prelude::Backend;
-use tracing::info;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Environment variable: if set to a decimal `u64`, calls [`Wgpu::<f32>::seed`] so GPU-side
 /// randomness (e.g. label jitter, dropout masks) matches a chosen run. The `overfit_wgpu`

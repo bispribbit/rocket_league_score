@@ -11,6 +11,8 @@ use tracing::info;
 
 use crate::segment_cache::SegmentStore;
 
+type LoadedPlayerCentricSegment = Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])>;
+
 // =============================================================================
 // Batching
 // =============================================================================
@@ -194,7 +196,7 @@ impl BatchPrefetcher {
             let actual_batch_size = batch_indices.len();
 
             // Load segments in parallel using rayon
-            let segment_data: Vec<Option<(Arc<Vec<f32>>, [f32; TOTAL_PLAYERS])>> = batch_indices
+            let segment_data: Vec<LoadedPlayerCentricSegment> = batch_indices
                 .par_iter()
                 .map(|&idx| dataset.get_player_centric(idx))
                 .collect();

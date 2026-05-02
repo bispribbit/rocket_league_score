@@ -32,7 +32,9 @@ jobs:
 
     - name: Build Tailwind CSS
       working-directory: crates/is_this_a_smurf
-      run: npx --yes @tailwindcss/cli -i ./input.css -o ./assets/tailwind.css
+      run: |
+        npm ci
+        npm run tailwind:build
 
     - name: Cargo Fmt
       run: cargo fmt --all -- --check
