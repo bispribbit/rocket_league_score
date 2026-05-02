@@ -40,6 +40,45 @@ use super::init_device;
 /// Training requires Autodiff wrapper for automatic differentiation.
 type TrainBackend = Autodiff<Wgpu>;
 
+/// Soft memory budget for the largest fused LSTM projection buffer (`x_proj`) in bytes.
+///
+/// This budget intentionally stays below total VRAM to leave room for model weights,
+/// optimizer state, gradients, and other activations.
+const FUSED_LSTM_X_PROJECTION_BUDGET_BYTES: usize = 2_000_000_000;
+
+struct FusedProjectionEstimate {
+    bytes: usize,
+    max_safe_batch_size: usize,
+}
+
+fn estimate_fused_projection_memory(
+    batch_size: usize,
+    sequence_length: usize,
+    hidden_size: usize,
+) -> FusedProjectionEstimate {
+    let players_per_lobby = TOTAL_PLAYERS;
+    let four_hidden = hidden_size.saturating_mul(4);
+    let bytes_per_element = std::mem::size_of::<f32>();
+
+    let bytes = batch_size
+        .saturating_mul(players_per_lobby)
+        .saturating_mul(sequence_length)
+        .saturating_mul(four_hidden)
+        .saturating_mul(bytes_per_element);
+
+    let denominator = players_per_lobby
+        .saturating_mul(sequence_length)
+        .saturating_mul(four_hidden)
+        .saturating_mul(bytes_per_element)
+        .max(1);
+    let max_safe_batch_size = (FUSED_LSTM_X_PROJECTION_BUDGET_BYTES / denominator).max(1);
+
+    FusedProjectionEstimate {
+        bytes,
+        max_safe_batch_size,
+    }
+}
+
 /// Configuration for the full training pipeline.
 #[derive(Debug, Clone)]
 pub struct FullTrainConfig {
@@ -138,10 +177,31 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     );
 
     let model_config = ModelConfig::new();
-    let training_config = TrainingConfig::new(model_config.clone())
+    let mut training_config = TrainingConfig::new(model_config.clone())
         .with_learning_rate(config.learning_rate)
         .with_epochs(config.epochs)
         .with_batch_size(config.batch_size);
+
+    let fused_projection_estimate = estimate_fused_projection_memory(
+        training_config.batch_size,
+        training_config.sequence_length,
+        model_config.lstm_hidden_1,
+    );
+    if fused_projection_estimate.bytes > FUSED_LSTM_X_PROJECTION_BUDGET_BYTES {
+        let adjusted_batch_size = fused_projection_estimate.max_safe_batch_size;
+        warn!(
+            requested_batch_size = training_config.batch_size,
+            adjusted_batch_size,
+            estimated_projection_bytes = fused_projection_estimate.bytes,
+            estimated_projection_gib = fused_projection_estimate.bytes as f64 / 1024f64.powi(3),
+            projection_budget_bytes = FUSED_LSTM_X_PROJECTION_BUDGET_BYTES,
+            projection_budget_gib = FUSED_LSTM_X_PROJECTION_BUDGET_BYTES as f64 / 1024f64.powi(3),
+            hidden_size = model_config.lstm_hidden_1,
+            sequence_length = training_config.sequence_length,
+            "Batch size reduced to keep fused LSTM projection memory within budget"
+        );
+        training_config = training_config.with_batch_size(adjusted_batch_size);
+    }
 
     // Step 1: Assign dataset splits to unassigned replays (skip when using max_replays limit)
     let step1_start = Instant::now();

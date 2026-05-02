@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
     // Read configuration from environment
     let model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "lstm_v15".to_string());
     let train_ratio: f64 = get_env_or_default("TRAIN_RATIO", 0.9);
-    let epochs: usize = get_env_or_default("EPOCHS", 100);
-    let batch_size: usize = get_env_or_default("BATCH_SIZE", 1000);
+    let epochs: usize = get_env_or_default("EPOCHS", 500);
+    let batch_size: usize = get_env_or_default("BATCH_SIZE", 144);
     let learning_rate: f64 = get_env_or_default("LEARNING_RATE", 0.001);
     let resume: bool = get_env_or_default("RESUME", true);
     let max_replays: Option<usize> = std::env::var("MAX_REPLAYS")

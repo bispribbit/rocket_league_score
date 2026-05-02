@@ -1,5 +1,6 @@
 use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
+use burn::prelude::Backend;
 use tracing::info;
 use tracing::warn;
 

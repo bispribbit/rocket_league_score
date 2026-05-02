@@ -287,7 +287,7 @@ where
     // Smurf-masking state (activated after SMURF_MASK_START_EPOCH).
     let mut smurf_state = SmurfMaskState::new(num_samples);
 
-    const EARLY_STOPPING_PATIENCE: usize = 10;
+    const EARLY_STOPPING_PATIENCE: usize = 1000;
 
     let valid_segments = valid_dataset.map_or(0, |ds| ds.len());
     info!(
