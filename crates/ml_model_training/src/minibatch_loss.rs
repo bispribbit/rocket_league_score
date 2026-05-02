@@ -1,7 +1,10 @@
 //! Shared minibatch loss for production training and the `overfit_wgpu` harness.
 //!
-//! Production path: Huber, pinball, rank weights, ordinal, pairwise ([`production_training_minibatch_loss`]).
-//! `--mse-only` ablation: [`mse_ablation_minibatch_loss`] (not used by [`super::training::train`]).
+//! Production path: Huber, τ-averaged pinball, rank weights, ordinal, pairwise
+//! ([`production_training_minibatch_loss`]).
+//! Label jitter is **deterministic** per [`LabelJitterStep`] (epoch + batch index), not Wgpu `Tensor::random`.
+//! `--mse-only` ablation: [`mse_ablation_minibatch_loss`] (MSE + minibatch spread; not used by
+//! [`super::training::train`]).
 
 use burn::prelude::*;
 use burn::tensor::activation;
@@ -27,17 +30,36 @@ fn lookup_rank_weights_slice(mean_target_mmr_slice: &[f32], rank_weights: &[f32]
         .collect()
 }
 
-/// Asymmetric quantile (pinball) loss weight (same as [super::training]).
+/// Primary pinball term: average of [`PINBALL_QUANTILES`] on the high-rank mask only (same total
+/// scale as the previous single-τ pinball multiplied by this weight).
 const PINBALL_WEIGHT: f32 = 0.3;
-const PINBALL_TAU: f32 = 0.9;
+/// Weaker secondary pinball: same τ average on **all** known slots (Bronze through SSL).
+const PINBALL_FULL_BATCH_WEIGHT: f32 = 0.06;
+/// Quantiles for τ-averaged pinball: symmetric around 0.5, excluding 0.5 (pure MAE / median pull).
+const PINBALL_QUANTILES: [f32; 4] = [0.1, 0.25, 0.75, 0.9];
 const PINBALL_THRESHOLD_MMR: f32 = 1400.0;
 
 const ORDINAL_LOSS_WEIGHT: f32 = 0.2;
 const PAIRWISE_LOSS_WEIGHT: f32 = 0.1;
 
+/// Penalises minibatches whose **predicted** MMR spread (std of known slots, normalised space) is
+/// much **smaller** than the **target** spread. That discourages the shortcut where the model
+/// outputs a narrow “bell” around the batch mean instead of matching the width of the label
+/// distribution across players in the batch.
+const DISTRIBUTION_SPREAD_LOSS_WEIGHT: f32 = 0.2;
+/// Distribution spread uses `sqrt(variance)`; keep a **normalized** variance floor high enough that
+/// `1 / (2 * sqrt(floor))` does not explode autodiff on tiny fitted variances.
+const DISTRIBUTION_SPREAD_EPSILON_NORM: f32 = 1.0e-5;
+/// [`mse_ablation_minibatch_loss`] only: no pinball or pairwise, so a stronger spread penalty keeps
+/// the harness aligned with full training anti-collapse behaviour.
+const MSE_ABLATION_DISTRIBUTION_SPREAD_WEIGHT: f32 = 0.35;
+
 /// Label jitter in MMR, applied in normalised space with mean zero per row.
 /// Must match [super::training] `LABEL_JITTER_STD`.
 const LABEL_JITTER_STD: f64 = 40.0;
+
+/// Keeps ordinal logits in a range where `log_sigmoid` and gradients stay finite during mixed-rank batches.
+const ORDINAL_LOGITS_CLAMP: f32 = 40.0;
 
 /// Row-level boost for the harness T3 MSE ablation: rows whose mean MMR (clean) is
 /// above `threshold_mmr` multiply per-element loss by `extra_multiplier`.
@@ -47,20 +69,114 @@ pub struct MseExtremeMmrRowBoost {
     pub extra_multiplier: f32,
 }
 
+/// Identifies one training minibatch for **deterministic** mean-zero label jitter.
+///
+/// Jitter values are a pure function of [`LabelJitterStep`] and matrix cell `(row, slot)`, so the
+/// same step always yields the same noise on any machine (unlike [`Tensor::random`] on Wgpu).
+#[derive(Debug, Clone, Copy)]
+pub struct LabelJitterStep {
+    pub epoch: u64,
+    pub batch_in_epoch: u64,
+}
+
+const fn jitter_splitmix64(value: u64) -> u64 {
+    let mut accumulator = value.wrapping_add(0x9E3779B97F4A7C15);
+    accumulator = (accumulator ^ (accumulator >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    accumulator = (accumulator ^ (accumulator >> 27)).wrapping_mul(0x94D049BB133111EB);
+    accumulator ^ (accumulator >> 31)
+}
+
+/// Open subinterval `(0, 1)` for Box–Muller (avoids `ln(0)`).
+fn jitter_open_unit_interval(seed: u64) -> f64 {
+    let word = jitter_splitmix64(seed);
+    let mantissa = ((word >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
+    mantissa.clamp(1.0e-12, 1.0 - 1.0e-12)
+}
+
+fn jitter_standard_normal_from_seed(seed: u64) -> f64 {
+    let uniform_first = jitter_open_unit_interval(seed);
+    let uniform_second = jitter_open_unit_interval(seed ^ 0x1234_5678_9ABC_DEF0);
+    (-2.0_f64 * uniform_first.ln()).sqrt() * (std::f64::consts::TAU * uniform_second).cos()
+}
+
+fn gaussian_noise_for_label_cell(step: LabelJitterStep, row: usize, slot: usize) -> f32 {
+    let key = step
+        .epoch
+        .wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        .wrapping_add(step.batch_in_epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add((row as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+        .wrapping_add((slot as u64).wrapping_mul(0x1656_67B1_9E37_79F9));
+    jitter_standard_normal_from_seed(key) as f32
+}
+
 fn mean_zero_label_jitter_normalized<B: burn::tensor::backend::Backend>(
     device: &B::Device,
     batch_size: usize,
     mask: Tensor<B, 2>,
+    jitter_step: LabelJitterStep,
 ) -> Tensor<B, 2> {
-    let jitter = Tensor::<B, 2>::random(
-        [batch_size, TOTAL_PLAYERS],
-        burn::tensor::Distribution::Normal(0.0, LABEL_JITTER_STD / f64::from(MMR_SCALE)),
-        device,
-    );
+    let sigma = (LABEL_JITTER_STD / f64::from(MMR_SCALE)) as f32;
+    let mut flat = Vec::with_capacity(batch_size * TOTAL_PLAYERS);
+    for row in 0..batch_size {
+        for slot in 0..TOTAL_PLAYERS {
+            flat.push(gaussian_noise_for_label_cell(jitter_step, row, slot) * sigma);
+        }
+    }
+    let jitter =
+        Tensor::<B, 1>::from_floats(flat.as_slice(), device).reshape([batch_size, TOTAL_PLAYERS]);
     let row_sum = (jitter.clone() * mask.clone()).sum_dim(1);
     let known = mask.clone().sum_dim(1).clamp_min(1.0);
     let row_mean = row_sum / known;
     (jitter - row_mean) * mask
+}
+
+/// Mean pinball loss over several quantiles. `diff` = prediction − target (normalised). For each
+/// `quantile`, uses `quantile · relu(−diff) + (1 − quantile) · relu(diff)` (standard check loss).
+fn multi_quantile_pinball<B: burn::tensor::backend::Backend>(
+    diff: Tensor<B, 2>,
+    quantiles: &[f32],
+) -> Tensor<B, 2> {
+    let target_above_prediction = activation::relu(diff.clone().neg());
+    let prediction_above_target = activation::relu(diff);
+    let mut quantile_iter = quantiles.iter().copied();
+    let first = quantile_iter
+        .next()
+        .expect("pinball quantiles must not be empty");
+    let mut sum = target_above_prediction.clone() * first
+        + prediction_above_target.clone() * (1.0f32 - first);
+    for quantile in quantile_iter {
+        sum = sum
+            + target_above_prediction.clone() * quantile
+            + prediction_above_target.clone() * (1.0f32 - quantile);
+    }
+    sum / quantiles.len() as f32
+}
+
+/// Masked slots only. Compares standard deviation of **clean** targets vs predictions in
+/// normalised space; returns squared `relu(std_target − std_prediction)`.
+fn masked_minibatch_spread_loss_squared<B: burn::tensor::backend::Backend>(
+    predictions_norm: Tensor<B, 2>,
+    targets_norm_clean: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let known_tensor_spread = mask.clone().sum().clamp_min(1.0);
+    let mean_slot_target =
+        (targets_norm_clean.clone() * mask.clone()).sum() / known_tensor_spread.clone();
+    let mean_slot_target_sq =
+        (targets_norm_clean.powf_scalar(2.0) * mask.clone()).sum() / known_tensor_spread.clone();
+    let var_slot_target = (mean_slot_target_sq - mean_slot_target.powf_scalar(2.0))
+        .clamp_min(DISTRIBUTION_SPREAD_EPSILON_NORM);
+    let std_slot_target = var_slot_target.sqrt();
+
+    let mean_slot_pred =
+        (predictions_norm.clone() * mask.clone()).sum() / known_tensor_spread.clone();
+    let mean_slot_pred_sq = (predictions_norm.powf_scalar(2.0) * mask).sum() / known_tensor_spread;
+    let var_slot_pred = (mean_slot_pred_sq - mean_slot_pred.powf_scalar(2.0))
+        .clamp_min(DISTRIBUTION_SPREAD_EPSILON_NORM);
+    let std_slot_pred = var_slot_pred.sqrt();
+
+    let spread_gap = (std_slot_target - std_slot_pred).clamp_min(0.0);
+    spread_gap.powf_scalar(2.0)
 }
 
 /// Output of the production (full training) loss: combined scalar loss and per-row
@@ -80,7 +196,7 @@ pub struct ProductionMinibatchLossOutput<B: burn::tensor::backend::Backend> {
     pub harness_target_sum_norm: f32,
 }
 
-/// Full production training loss: Huber + pinball, inverse-frequency row weights,
+/// Full production training loss: Huber + τ-averaged pinball, inverse-frequency row weights,
 /// ordinal BCE, pairwise hinge, using [`SequenceModel::forward_with_ordinal_scale`].
 pub fn production_training_minibatch_loss<
     B: burn::tensor::backend::AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend,
@@ -90,6 +206,7 @@ pub fn production_training_minibatch_loss<
     device: &B::Device,
     rank_weights: &[f32],
     lobby_scale: f32,
+    jitter_step: LabelJitterStep,
 ) -> ProductionMinibatchLossOutput<B>
 where
     B::FloatElem: From<f32>,
@@ -122,8 +239,12 @@ where
     let weights = Tensor::<B, 1>::from_floats(weights_vec.as_slice(), device)
         .reshape([mean_target_mmr_vec.len(), 1]);
 
-    let jitter_norm =
-        mean_zero_label_jitter_normalized::<B>(device, mean_target_mmr_vec.len(), mask.clone());
+    let jitter_norm = mean_zero_label_jitter_normalized::<B>(
+        device,
+        mean_target_mmr_vec.len(),
+        mask.clone(),
+        jitter_step,
+    );
     let raw_targets = batch.targets.clone();
     let raw_predictions = predictions.clone();
     let targets_norm = batch.targets.clone() / MMR_SCALE + jitter_norm;
@@ -137,40 +258,43 @@ where
     let high_rank_mask = targets_norm
         .greater_elem(PINBALL_THRESHOLD_MMR / MMR_SCALE)
         .float();
-    let pinball = (diff.clone() * PINBALL_TAU - diff.clamp_max(0.0)) * high_rank_mask;
-    let element_loss = huber_loss + pinball * PINBALL_WEIGHT;
+    let pinball_mixed = multi_quantile_pinball(diff, &PINBALL_QUANTILES);
+    let pinball_high_rank = pinball_mixed.clone() * high_rank_mask;
+    let pinball_full_batch = pinball_mixed * mask.clone();
+    let element_loss = huber_loss
+        + pinball_high_rank * PINBALL_WEIGHT
+        + pinball_full_batch * PINBALL_FULL_BATCH_WEIGHT;
     let regression_loss = (element_loss * mask.clone() * weights).sum() / known_count;
 
-    let flat_mask = mask
-        .clone()
-        .reshape([raw_targets.dims()[0] * TOTAL_PLAYERS]);
-    let flat_targets_mmr =
-        (raw_targets.clone() * MMR_SCALE).reshape([raw_targets.dims()[0] * TOTAL_PLAYERS]);
+    let flat_row_count = raw_targets.dims()[0] * TOTAL_PLAYERS;
+    let flat_mask = mask.clone().reshape([flat_row_count]);
+    let flat_targets_mmr = (raw_targets.clone() * MMR_SCALE).reshape([flat_row_count, 1]);
 
     let boundaries_vec: Vec<f32> = ORDINAL_BOUNDARIES_MMR.to_vec();
     let boundaries = Tensor::<B, 1>::from_floats(boundaries_vec.as_slice(), device)
         .unsqueeze::<2>()
         .transpose();
 
-    let flat_targets_mmr_col = flat_targets_mmr.clone().unsqueeze::<2>();
-    let ordinal_targets = flat_targets_mmr_col
-        .expand([flat_targets_mmr.dims()[0], ORDINAL_NUM_BOUNDARIES])
+    let ordinal_targets = flat_targets_mmr
+        .expand([flat_row_count, ORDINAL_NUM_BOUNDARIES])
         .greater(
             boundaries
                 .transpose()
-                .expand([flat_targets_mmr.dims()[0], ORDINAL_NUM_BOUNDARIES]),
+                .expand([flat_row_count, ORDINAL_NUM_BOUNDARIES]),
         )
         .float();
 
-    let sigmoid_logits = activation::sigmoid(ordinal_logits);
-    let bce = ordinal_targets.clone() * (sigmoid_logits.clone().clamp_min(1e-6).log())
-        + (ordinal_targets.neg() + 1.0) * ((sigmoid_logits.neg() + 1.0).clamp_min(1e-6).log());
-    let bce = bce.neg();
+    let ordinal_logits_stable = ordinal_logits
+        .clamp_max(ORDINAL_LOGITS_CLAMP)
+        .clamp_min(-ORDINAL_LOGITS_CLAMP);
+    let negative_log_likelihood = ordinal_targets.clone()
+        * activation::log_sigmoid(ordinal_logits_stable.clone())
+        + (ordinal_targets.neg() + 1.0) * activation::log_sigmoid(ordinal_logits_stable.neg());
+    let bce = negative_log_likelihood.neg();
 
     let ordinal_mask = flat_mask
-        .clone()
-        .unsqueeze::<2>()
-        .expand([flat_mask.dims()[0], ORDINAL_NUM_BOUNDARIES]);
+        .reshape([flat_row_count, 1])
+        .expand([flat_row_count, ORDINAL_NUM_BOUNDARIES]);
     let ordinal_known_count = ordinal_mask
         .clone()
         .sum()
@@ -215,8 +339,15 @@ where
     let pair_count = pair_count.first().copied().unwrap_or(1.0).max(1.0);
     let pairwise_loss = pairwise_loss_elements / pair_count;
 
-    // Clean-target diagnostics for the overfit harness (same normalised `predictions` as the loss).
+    // Minibatch spread: punish predictions that are too tight vs clean targets (global mean shortcut).
     let targets_norm_clean = batch.targets.clone() / MMR_SCALE;
+    let distribution_spread_loss = masked_minibatch_spread_loss_squared(
+        predictions_norm.clone(),
+        targets_norm_clean.clone(),
+        mask.clone(),
+    );
+
+    // Clean-target diagnostics for the overfit harness (same normalised `predictions` as the loss).
     let diff_harness = predictions_norm.clone() - targets_norm_clean.clone();
     let harness_sum_sq = (diff_harness.powf_scalar(2.0) * mask.clone()).sum();
     let known_slots = mask.clone().sum();
@@ -251,8 +382,10 @@ where
         .copied()
         .unwrap_or(0.0);
 
-    let total =
-        regression_loss + ordinal_loss * ORDINAL_LOSS_WEIGHT + pairwise_loss * PAIRWISE_LOSS_WEIGHT;
+    let total = regression_loss
+        + ordinal_loss * ORDINAL_LOSS_WEIGHT
+        + pairwise_loss * PAIRWISE_LOSS_WEIGHT
+        + distribution_spread_loss * DISTRIBUTION_SPREAD_LOSS_WEIGHT;
     let loss = total.unsqueeze::<1>();
     ProductionMinibatchLossOutput {
         loss,
@@ -273,7 +406,9 @@ pub struct MseAblationOutput<B: burn::tensor::backend::Backend> {
     pub harness_target_sum_norm: f32,
 }
 
-/// Harness `--mse-only` loss: MSE on mean-zero jitter, optional T3 high-MMR row boost.
+/// Harness `--mse-only` loss: MSE on mean-zero jitter and optional T3 high-MMR row boost.
+///
+/// Adds masked minibatch spread ([`MSE_ABLATION_DISTRIBUTION_SPREAD_WEIGHT`]; same statistic as production).
 ///
 /// No Huber, pinball, ordinal, or pairwise. Uses [`SequenceModel::forward_with_lobby_scale`] (same
 /// MMR head path as [`SequenceModel::forward`]) so training matches `eval_per_rank_rmse` and
@@ -286,6 +421,7 @@ pub fn mse_ablation_minibatch_loss<
     device: &B::Device,
     lobby_scale: f32,
     extreme_mmr: Option<MseExtremeMmrRowBoost>,
+    jitter_step: LabelJitterStep,
 ) -> MseAblationOutput<B>
 where
     B::FloatElem: From<f32>,
@@ -311,17 +447,28 @@ where
     };
 
     let targets_norm_clean = batch.targets.clone() / MMR_SCALE;
-    let jitter_norm =
-        mean_zero_label_jitter_normalized::<B>(device, actual_batch_size, mask.clone());
+    let jitter_norm = mean_zero_label_jitter_normalized::<B>(
+        device,
+        actual_batch_size,
+        mask.clone(),
+        jitter_step,
+    );
     let targets_norm_train = targets_norm_clean.clone() + jitter_norm;
     let preds_norm = predictions / MMR_SCALE;
     let diff_loss = preds_norm.clone() - targets_norm_train;
     // Plain MSE (no 0.5): standard gradient scale so T3 high-MMR row weighting matches the historical harness.
     let mse_element = diff_loss.powf_scalar(2.0);
     let known_count_tensor = mask.clone().sum();
-    let loss =
+    let mean_squared_error_loss =
         (mse_element * mask.clone() * weights).sum() / known_count_tensor.clone().clamp_min(1.0);
-    let loss = loss.unsqueeze::<1>();
+    let distribution_spread_loss = masked_minibatch_spread_loss_squared(
+        preds_norm.clone(),
+        targets_norm_clean.clone(),
+        mask.clone(),
+    );
+    let loss = (mean_squared_error_loss
+        + distribution_spread_loss * MSE_ABLATION_DISTRIBUTION_SPREAD_WEIGHT)
+        .unsqueeze::<1>();
 
     let diff_harness = preds_norm.clone() - targets_norm_clean.clone();
     let sum_sq = (diff_harness.powf_scalar(2.0) * mask.clone()).sum();

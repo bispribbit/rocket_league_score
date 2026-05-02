@@ -18,15 +18,15 @@
 //! resets all three).
 //!
 //! `--mse-only`: ablation (experiment 4 in `experiment.md`) — MSE on mean-zero
-//! jittered targets, **unit** rank weights, **no** pinball. Oversampling, lobby
-//! alternation, and learning-rate schedule stay on.
+//! jittered targets plus minibatch spread penalty, **unit** rank weights, **no** pinball.
+//! Oversampling, lobby alternation, and learning-rate schedule stay on.
 //!
 //! In the default (non `--mse-only`) mode, the harness uses
 //! [`ml_model_training::minibatch_loss::production_training_minibatch_loss`], the same
 //! Huber+pinball+rank-weight+ordinal+pairwise path as [`ml_model_training::train`].
 //! With `--mse-only`, the harness uses [`mse_ablation_minibatch_loss`] (MSE on jitter,
-//! optional T3 high-MMR row boost; [`SequenceModel::forward_with_lobby_scale`] to match
-//! evaluation).
+//! spread anti-collapse term, optional T3 high-MMR row boost;
+//! [`SequenceModel::forward_with_lobby_scale`] to match evaluation).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,8 @@ use ml_model_training::minibatch_loss::{
 };
 use ml_model_training::segment_cache::{SegmentFileInfo, SegmentStore};
 use ml_model_training::{
-    MseExtremeMmrRowBoost, SequenceBatcher, compute_inverse_frequency_weights, pseudo_random_f32,
+    LabelJitterStep, MseExtremeMmrRowBoost, SequenceBatcher, compute_inverse_frequency_weights,
+    pseudo_random_f32,
 };
 use replay_structs::Rank;
 
@@ -385,6 +386,10 @@ fn run_training(
                     &device,
                     lobby_scale,
                     mse_extreme_mmr_boost.clone(),
+                    LabelJitterStep {
+                        epoch: epoch as u64,
+                        batch_in_epoch: batch_count as u64,
+                    },
                 );
                 epoch_sq_err_sum += f64::from(out.harness_sum_sq_error_norm)
                     * f64::from(MMR_SCALE)
@@ -401,6 +406,10 @@ fn run_training(
                     &device,
                     &rank_weights,
                     lobby_scale,
+                    LabelJitterStep {
+                        epoch: epoch as u64,
+                        batch_in_epoch: batch_count as u64,
+                    },
                 );
                 epoch_sq_err_sum += f64::from(out.harness_sum_sq_error_norm)
                     * f64::from(MMR_SCALE)
@@ -792,7 +801,7 @@ fn main() {
     println!("  T1/T2 epochs : {}/{}", config.t1_epochs, config.t2_epochs);
     println!("  T3 epochs    : {}", config.t3_epochs);
     if config.mse_only {
-        println!("  Loss mode    : MSE ablation (no pinball, unit rank weights)");
+        println!("  Loss mode    : MSE ablation + spread (no pinball, unit rank weights)");
     } else {
         println!("  Loss mode    : MSE + pinball + inverse-frequency rank weights");
     }

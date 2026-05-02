@@ -4,6 +4,8 @@ For a **self-contained handoff** (goals, commands, file map, conventions), see [
 
 All runs use **burn-wgpu** with the FusedLSTM / CubeCL path, default `lr=1e-2`, `seq_len=300`, `batch_size=32` unless stated otherwise. Pass criteria: **T1** final RMSE < 50 MMR, **T2** final RMSE < 300 MMR, **T3** per-rank **SSL** RMSE < 350 MMR.
 
+**Loss paths:** **Default harness** (no `--mse-only`) uses **`production_training_minibatch_loss`** — Huber, τ-averaged pinball, rank weights, ordinal, pairwise, minibatch spread. **`--mse-only`** uses **`mse_ablation_minibatch_loss`**: MSE on jittered targets, **the same masked minibatch spread term** (separate weight), **no** Huber / pinball / ordinal / pairwise; unit rank weights unless you add T3 row boost.
+
 | # | Date (approx) | Description | T1 (final RMSE) | T2 (final RMSE) | T3 (overall RMSE) | T3 (SSL RMSE) | Pass |
 |---|----------------|------------|-----------------|-----------------|-------------------|----------------|------|
 | 1 | 2026-04-25 | **Baseline harness:** sequential indices `(0..n)`, vanishing MSE on normalised targets, `forward` only, no rank weights / pinball / oversampling. | 22.9 | 791.3 | 550.1 | 1367.7 | T1 only |
@@ -14,10 +16,15 @@ All runs use **burn-wgpu** with the FusedLSTM / CubeCL path, default `lr=1e-2`, 
 | 6 | 2026-04-25 | **T2 pass recipe:** `--mse-only --lr 3e-2 --t2-epochs 270 --t3-epochs 250 --lr-floor 0.10`. T2 early-stops ~139 when RMSE &lt; 300. | 23.6 (early stop) | 96.0 (early stop) | 432.5 | 1128.5 | T1+T2 |
 | 7 | 2026-04-26 | **T1+T2+T3 pass** (harness + model): `LOBBY_BIAS_OUTPUT_SCALE = 0`, `LABEL_JITTER_STD = 40` (harness + `training.rs`), `Wgpu::<f32>::seed(&device, 42)` for reproducibility, T3-only MSE row boost (mean target &gt; 1800 MMR → 10× weight), T3 uses `1.5×` base LR and `max(0.15, --lr-floor)` cosine floor. CLI: `--mse-only --lr 3e-2 --t2-epochs 270 --t3-epochs 450 --lr-floor 0.10`. | 27.9 (early stop) | 184.9 (early stop) | 228.4 | 230.4 | **All pass** |
 | 8 | 2026-04-26 | **Production parity refactor:** `minibatch_loss.rs` — `train()` and the default harness call `production_training_minibatch_loss` (Huber, pinball, rank weights, ordinal, pairwise). **`--mse-only`** uses `mse_ablation_minibatch_loss`: `forward_with_lobby_scale` (same MMR path as eval), shared `mean_zero_label_jitter_normalized`, plain MSE (no `0.5` factor), T3 row boost unchanged. Same CLI as row 7. | 17.6 (early stop) | 147.3 (early stop) | 327.2 | 210.5 | **All pass** |
+| 9 | 2026-05-01 | **Intermittent T3 failure, same recipe as rows 7–8:** Code still has row-8 `mse_ablation` (lobby forward, shared jitter, plain `diff²`, T3 row boost, `LOBBY_BIAS_OUTPUT_SCALE = 0`, `Wgpu` seed 42). **T1+T2 pass**; **T3** falls into **constant-MMR** basin (per-rank RMSE ~64 MMR steps, SSL ≫ 350). Example CLI: `--mse-only --lr 3e-2 --t2-epochs 270 --t3-epochs 500 --lr-floor 0.10` (500 T3 epochs did not fix SSL). Other re-runs on the same tree saw SSL ~940–980 with 450 epochs. | 17.6 (early stop) | 147.3 (early stop) | 670.1 | 1013.0 | T1+T2 only |
+| 10 | 2026-04-26 | **Production loss + numerics (`minibatch_loss.rs`):** τ-averaged pinball on `{0.1, 0.25, 0.75, 0.9}` (high-rank mask) + weaker full-batch pinball; **minibatch spread** (masked std of clean targets vs predictions, normalised space) in production and in **`mse_ablation`**; ordinal **BCE via `log_sigmoid`** + logits clamp; spread variance floor **`1e-5`** (was `1e-8`) to tame `sqrt` autodiff; ordinal tensors **`[flat_row_count, 1]`** before `expand` (fixes `[1, 96]` vs `[96, 21]` on Burn 0.20); label jitter from `Tensor::<B, 1>::from_floats` then `reshape`. **Default harness** (production loss). CLI: `--lr 3e-2 --t2-epochs 270 --t3-epochs 500 --lr-floor 0.10` (no `--mse-only`). | 19.0 (early stop) | 93.6 (early stop) | 167.1 | 310.0 | **All pass** |
 
 ## Notes
 
+- **Rows 7–8 vs row 9 (why it “used to work”):** With **non-deterministic** Wgpu `Tensor::random` jitter, the **same CLI** could land in different basins. **Update:** label jitter is now a **pure function** of epoch + batch index + cell (`LabelJitterStep` in `crates/ml_model_training/src/minibatch_loss.rs`), so **noise is reproducible** across runs and driver versions. **Residual variance:** weight initialization and any remaining backend randomness can still depend on `Wgpu` seeding; keep `Wgpu::<f32>::seed(&device, 42)` in the harness for best parity.
 - **Row 8:** After extracting shared loss, the first `--mse-only` T3 run regressed to a **constant-MMR** collapse (~976 SSL) until the ablation was aligned with eval: `forward_with_lobby_scale`, shared jitter helper, and **plain** `diff²` (not `0.5·diff²`). Full 450-epoch T3 re-validates row 7 (SSL 210.5 MMR this run).
+- **`--mse-only` vs default harness:** Comparing runs for **full production behaviour** (Huber, pinball, ordinal, pairwise), **omit `--mse-only`**. The ablation still trains **spread** so it is not “pure MSE only” anymore; use it to isolate the MMR head path and jitter without the rest of the auxiliary losses.
+- **Row 10:** T2 used to **NaN** around epoch 80 on Bronze/SSL mixes with the thicker production stack; ordinal **`log_sigmoid`** + logits clamp + larger spread **`ε`** addressed that. **Training** and the harness both call the same **`production_training_minibatch_loss`**.
 - **T1** always passes: single SSL replay, single constant label — not a strong test of *using features*, only of the stack and optimisation.
 - **T2** got *worse* in scalar RMSE vs row 1 (791 → ~1285) after changing the training signal: the old ~791 is consistent with a **global constant predictor** near the class-weighted mean; the new loss pushes the network away from that collapse but does not yet reach < 300 on **clean-target** RMSE.
 - **Row 4:** Removing pinball + rank weights **helped** T2 (1285 → **1033**) and brought `pred_mean` in line with the oversampled batch mean (~1090), but RMSE is still ~**1033** — the network is **not** learning replay-specific scalars for Bronze vs SSL, only a **global level** (within-batch mean). T3 U-shape unchanged vs row 3; SSL still **1377.7**.
@@ -27,10 +34,12 @@ All runs use **burn-wgpu** with the FusedLSTM / CubeCL path, default `lr=1e-2`, 
 
 ## Proposed next steps (short list)
 
-1. **Harness objective match:** make T2/T3 early-stop and report **Huber** (or the same combined loss as production) for the *logging* metric, or add a second line “clean Huber / clean RMSE” so we do not tune only to MSE if that is at odds with full training.
-2. ~~**T2-only ablation:**~~ Done as row 4 (`--mse-only`).
-3. **Learning rate / steps:** T2: row **6** (`--lr 3e-2`, `--lr-floor 0.10`, `--t2-epochs 270`) **PASS**. T3: extend **`--t3-epochs`** and/or tune tail LR — see row **7**.
-4. **Lobby / jitter knobs:** try `LOBBY_BIAS_OUTPUT_SCALE` at **0.1** or **0.0** in a dedicated experiment row; try **reducing** `LABEL_JITTER_STD` in the harness if training noise drowns out the tiny batch signal.
-5. ~~**Production parity:**~~ Done: shared `minibatch_loss` (`production_training_minibatch_loss` in `train` and default harness); `--mse-only` uses `mse_ablation_minibatch_loss` (see row 8).
+**Previously listed items — not all “done”:** only **T2-only ablation** and **production parity** were finished (~strikethrough items). **Open** from that list: (1) Huber-aligned **logging** in the harness, (3) more **T3 epochs / tail LR** sweeps if SSL still marginal, (4) **Lobby / jitter σ** sweeps on real training vs harness.
+
+### T3 stability and determinism
+
+1. **Done in code:** Mean-zero label jitter uses **`LabelJitterStep`** (no Wgpu `Tensor::random`). Production **`train()`** and harness share **`production_training_minibatch_loss`** / **`mse_ablation_minibatch_loss`** in `minibatch_loss.rs`. Row **10** validates **all tiers** on the **production** harness path with stable ordinal + spread numerics.
+2. **If T3 regresses again:** tune **SSL row boost** (`--mse-only` only), **T3 learning rate**, **`LABEL_JITTER_STD`**, or **`DISTRIBUTION_SPREAD_LOSS_WEIGHT`** / pinball weights — optimisation can still have **multiple basins** even with fixed jitter.
+3. **Full reproducibility hard mode:** pin **initial weights** (checkpoint from fixed seed) or audit Burn **dropout** / autotune if any non-determinism remains in forward.
 
 Add a new table row (and bump `#`) for every new change or hyperparameter sweep so we do not re-discuss the same dead ends.

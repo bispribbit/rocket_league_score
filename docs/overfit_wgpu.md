@@ -21,7 +21,7 @@ Training minimizes **MSE on mean-zero jittered targets** (and optional pinball +
 - **Oversampling:** Per-epoch shuffled indices (`build_oversampled_indices`) so batches are rank-balanced and not a fixed `(0..n)` order.
 - **Lobby path:** `forward_with_lobby_scale` with alternating lobby scale **1.0 / 0.0** per batch so the model cannot rely only on lobby bias.
 - **Phase C (`ml_model`):** `LOBBY_BIAS_OUTPUT_SCALE` scales the lobby bias head (currently **0.2**); reduces “always predict lobby mean” shortcuts.
-- **Jitter:** `training.rs` provides **mean-zero** label jitter in normalized space; harness matches it. Loss uses jittered targets; metrics use clean targets.
+- **Jitter:** **Mean-zero** Gaussian noise in normalized space with **fixed** draws: `LabelJitterStep` (epoch + batch index) and per-cell hashing in `minibatch_loss.rs` (not Wgpu `Tensor::random`). Production `train()` and harness share this. Loss uses jittered targets; metrics use clean targets.
 - **`--mse-only`:** MSE only, **unit** rank weights, **no** pinball. This recipe is what made **T2** reachable (see row 6 in `experiment.md`).
 - **Learning rate:** Warmup + cosine decay; effective LR uses **`--lr-floor`** as a **fraction of base `--lr`** (minimum multiplier on the cosine tail). Example: `--lr 3e-2 --lr-floor 0.10` → tail LR **3e-3**.
 

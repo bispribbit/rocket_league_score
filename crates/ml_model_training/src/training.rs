@@ -13,7 +13,7 @@ use replay_structs::{Rank, RankDivision};
 use tracing::{info, warn};
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
-use crate::minibatch_loss::production_training_minibatch_loss;
+use crate::minibatch_loss::{LabelJitterStep, production_training_minibatch_loss};
 use crate::segment_cache::SegmentStore;
 use crate::{CheckpointValidationMetrics, ValidationRankRmseEntry, save_checkpoint};
 
@@ -367,6 +367,10 @@ where
                 &device,
                 &rank_weights,
                 lobby_scale,
+                LabelJitterStep {
+                    epoch: epoch as u64,
+                    batch_in_epoch: batch_count as u64,
+                },
             );
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 

@@ -65,7 +65,7 @@ pub struct FullTrainConfig {
 impl Default for FullTrainConfig {
     fn default() -> Self {
         Self {
-            model_name: String::from("lstm_v13"),
+            model_name: String::from("lstm_v15"),
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
@@ -289,6 +289,12 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         duration_ms = step3_duration.as_millis(),
         "Model architecture"
     );
+    if model_config.dropout > f64::EPSILON {
+        info!(
+            dropout = model_config.dropout,
+            "Full training uses this dropout; `overfit_wgpu` forces dropout=0 for all tiers — compare harness vs pipeline only after matching dropout (or expect stronger mean / mid-rank bias here)."
+        );
+    }
 
     // Step 4: Train model using memory-mapped segments
     let step4_start = Instant::now();
