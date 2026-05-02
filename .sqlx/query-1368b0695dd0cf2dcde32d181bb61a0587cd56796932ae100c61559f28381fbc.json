@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE replay_players\n        SET smurf_score = $3\n        WHERE replay_id = $1 AND player_name = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Float4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1368b0695dd0cf2dcde32d181bb61a0587cd56796932ae100c61559f28381fbc"
+}

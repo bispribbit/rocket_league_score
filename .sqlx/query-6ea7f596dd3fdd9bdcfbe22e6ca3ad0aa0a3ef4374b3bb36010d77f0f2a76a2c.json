@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE replay_players AS rp\n        SET smurf_score = data.score\n        FROM unnest($1::uuid[], $2::text[], $3::float8[]) AS data(replay_id, player_name, score)\n        WHERE rp.replay_id = data.replay_id AND rp.player_name = data.player_name\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "Float8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6ea7f596dd3fdd9bdcfbe22e6ca3ad0aa0a3ef4374b3bb36010d77f0f2a76a2c"
+}
