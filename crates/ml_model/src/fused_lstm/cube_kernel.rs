@@ -164,11 +164,12 @@ fn launch_cell<R: CubeRuntime, F: FloatElement>(
     let client = c_prev.client.clone();
     let device = c_prev.device.clone();
 
-    let [batch, hidden] = c_prev.shape.dims();
+    let shape = c_prev.meta.shape().clone();
+    let [batch, hidden] = shape.dims::<2>();
     let total = batch * hidden;
 
-    let h_next = empty_device_dtype(client.clone(), device.clone(), c_prev.shape.clone(), dtype);
-    let c_next = empty_device_dtype(client.clone(), device, c_prev.shape.clone(), dtype);
+    let h_next = empty_device_dtype(client.clone(), device.clone(), shape.clone(), dtype);
+    let c_next = empty_device_dtype(client.clone(), device, shape, dtype);
 
     let cube_dim = CubeDim::new(&client, total);
     let cube_count = calculate_cube_count_elemwise(&client, total, cube_dim);
@@ -177,13 +178,12 @@ fn launch_cell<R: CubeRuntime, F: FloatElement>(
         &client,
         cube_count,
         cube_dim,
-        x_proj_t.as_tensor_arg(1),
-        h_proj.as_tensor_arg(1),
-        c_prev.as_tensor_arg(1),
-        h_next.as_tensor_arg(1),
-        c_next.as_tensor_arg(1),
-    )
-    .expect("lstm_cell_kernel launch failed");
+        x_proj_t.into_tensor_arg(),
+        h_proj.into_tensor_arg(),
+        c_prev.into_tensor_arg(),
+        h_next.clone().into_tensor_arg(),
+        c_next.clone().into_tensor_arg(),
+    );
 
     (h_next, c_next)
 }
@@ -197,11 +197,12 @@ fn launch_cell_train<R: CubeRuntime, F: FloatElement>(
     let client = c_prev.client.clone();
     let device = c_prev.device.clone();
 
-    let [batch, hidden] = c_prev.shape.dims();
+    let shape = c_prev.meta.shape().clone();
+    let [batch, hidden] = shape.dims::<2>();
     let total = batch * hidden;
 
-    let h_next = empty_device_dtype(client.clone(), device.clone(), c_prev.shape.clone(), dtype);
-    let c_next = empty_device_dtype(client.clone(), device, c_prev.shape.clone(), dtype);
+    let h_next = empty_device_dtype(client.clone(), device.clone(), shape.clone(), dtype);
+    let c_next = empty_device_dtype(client.clone(), device, shape, dtype);
 
     let cube_dim = CubeDim::new(&client, total);
     let cube_count = calculate_cube_count_elemwise(&client, total, cube_dim);
@@ -210,12 +211,11 @@ fn launch_cell_train<R: CubeRuntime, F: FloatElement>(
         &client,
         cube_count,
         cube_dim,
-        z.as_tensor_arg(1),
-        c_prev.as_tensor_arg(1),
-        h_next.as_tensor_arg(1),
-        c_next.as_tensor_arg(1),
-    )
-    .expect("lstm_cell_kernel_train launch failed");
+        z.into_tensor_arg(),
+        c_prev.into_tensor_arg(),
+        h_next.clone().into_tensor_arg(),
+        c_next.clone().into_tensor_arg(),
+    );
 
     (h_next, c_next)
 }

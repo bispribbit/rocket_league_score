@@ -540,7 +540,6 @@ impl ExtractedSegmentFeatures {
     ///
     /// This method is `async` so GPU backends (for example WGPU) can read outputs with
     /// [`Tensor::into_data_async`] on targets such as WASM where synchronous reads are not supported.
-    #[expect(clippy::future_not_send)]
     pub async fn predict_single_segment<B: FusedLstmBackend>(
         &self,
         model: &SequenceModel<B>,
