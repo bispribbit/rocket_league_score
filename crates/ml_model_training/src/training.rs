@@ -108,8 +108,14 @@ const PREFETCH_COUNT: usize = 8;
 /// How often to sync with GPU to extract loss value (every N batches).
 const LOSS_SYNC_INTERVAL: usize = 10;
 
-/// Epoch at which EMA-based smurf masking kicks in.
-const SMURF_MASK_START_EPOCH: usize = 5;
+/// Epoch at which EMA-based smurf masking kicks in, or [`None`] to disable masking.
+///
+/// Currently [`None`]: smurf masking preferentially drops the high-EMA-loss segments
+/// at the distribution tails (Bronze-1 and SSL) when the model is in a mean-prediction
+/// basin, which reinforces the collapse instead of breaking it. See
+/// `docs/experiment.md` for the analysis. Re-enable by setting to `Some(start_epoch)`
+/// once the per-rank predicted-distribution log shows the model is no longer collapsed.
+const SMURF_MASK_START_EPOCH: Option<usize> = None;
 /// Number of consecutive epochs a segment must be in the top-1 % before masking.
 const SMURF_MASK_SUSTAIN_EPOCHS: usize = 3;
 /// EMA decay factor for per-segment loss tracking (α for new value).
@@ -284,8 +290,10 @@ where
     let start_epoch = state.current_epoch;
     let num_samples = train_dataset.len();
 
-    // Smurf-masking state (activated after SMURF_MASK_START_EPOCH).
-    let mut smurf_state = SmurfMaskState::new(num_samples);
+    // Smurf-masking state, only allocated when [`SMURF_MASK_START_EPOCH`] is enabled.
+    // The allocation scales with the dataset size (one bool/float/u32 per segment), so
+    // the [`None`] path skips it to keep training memory minimal.
+    let mut smurf_state = SMURF_MASK_START_EPOCH.map(|_| SmurfMaskState::new(num_samples));
 
     const EARLY_STOPPING_PATIENCE: usize = 1000;
 
@@ -305,10 +313,14 @@ where
         // Epoch indices: oversampled for rare ranks.
         let oversampled_indices = train_dataset.build_oversampled_indices(epoch as u64);
         // Apply smurf mask: drop segments that are permanently excluded.
-        let indices: Vec<usize> = oversampled_indices
-            .into_iter()
-            .filter(|&idx| smurf_state.active.get(idx).copied().unwrap_or(true))
-            .collect();
+        let indices: Vec<usize> = if let Some(smurf_state) = smurf_state.as_ref() {
+            oversampled_indices
+                .into_iter()
+                .filter(|&idx| smurf_state.active.get(idx).copied().unwrap_or(true))
+                .collect()
+        } else {
+            oversampled_indices
+        };
 
         let mut prefetcher = BatchPrefetcher::new(
             train_dataset.clone(),
@@ -333,7 +345,10 @@ where
         let mut epoch_loss_count = 0usize;
 
         // EMA updates for smurf masking (batch_idx → (segment_idx, loss_scalar) pairs).
+        // Stays empty (and the per-row tensor read below is skipped) while smurf masking is disabled.
         let mut smurf_ema_updates: Vec<(usize, f32)> = Vec::new();
+        let smurf_masking_active_this_epoch =
+            SMURF_MASK_START_EPOCH.is_some_and(|start| epoch >= start);
 
         let mut time_prefetch_wait_us = 0u64;
         let mut time_to_gpu_us = 0u64;
@@ -376,7 +391,7 @@ where
 
             let loss = minibatch_out.loss;
 
-            if epoch >= SMURF_MASK_START_EPOCH {
+            if smurf_masking_active_this_epoch {
                 let per_sample_loss = minibatch_out
                     .per_row_mse_for_smurf
                     .into_data()
@@ -440,7 +455,7 @@ where
         }
 
         // Update smurf EMA and refresh masks.
-        if epoch >= SMURF_MASK_START_EPOCH {
+        if smurf_masking_active_this_epoch && let Some(smurf_state) = smurf_state.as_mut() {
             smurf_state.update_ema(&smurf_ema_updates);
             smurf_state.refresh_masks();
         }
@@ -583,24 +598,41 @@ where
 }
 
 /// Per-rank error accumulator for validation diagnostics.
+///
+/// `squared_error_sum` and `target_count` are keyed by **true rank** so that `rmse()`
+/// is the RMSE for that rank's labelled slots.
+/// `predicted_count` is keyed by **predicted rank** (rank inferred from the raw MMR
+/// output) so the log shows how many predictions land in each bucket — the predicted
+/// distribution, making mean-collapse immediately visible.
+/// `correct_count` is keyed by **predicted rank** and counts slots where the predicted
+/// rank matches the true rank, giving a quick accuracy signal alongside the histogram.
 #[derive(Default)]
 struct PerRankErrors {
     squared_error_sum: f64,
-    count: usize,
+    /// Number of labelled slots whose **true** rank is this bucket.
+    target_count: usize,
+    /// Number of labelled slots whose **predicted** rank lands in this bucket.
+    predicted_count: usize,
+    /// Number of labelled slots predicted into this bucket where the true rank also
+    /// matches (i.e. correct rank predictions contributing to `predicted_count`).
+    correct_count: usize,
 }
 
 impl PerRankErrors {
     fn rmse(&self) -> f32 {
-        if self.count == 0 {
+        if self.target_count == 0 {
             return 0.0;
         }
-        ((self.squared_error_sum / self.count as f64) as f32).sqrt()
+        ((self.squared_error_sum / self.target_count as f64) as f32).sqrt()
     }
 }
 
-/// Collects squared errors per [`Rank`] from raw prediction/target vectors.
+/// Collects squared errors per **true** [`Rank`] and prediction/correct counts per
+/// **predicted** [`Rank`] from raw prediction/target vectors.
 ///
-/// Targets with value `0.0` (sentinel for unknown rank) are skipped.
+/// Targets with value `0.0` (sentinel for unknown rank) are skipped: those slots have
+/// no ground truth so they would distort both the RMSE and the predicted histogram.
+/// Skipping them keeps `sum(predicted_count) == sum(target_count)`.
 fn accumulate_per_rank_errors(
     stats: &mut std::collections::HashMap<Rank, PerRankErrors>,
     predictions: &[f32],
@@ -610,43 +642,57 @@ fn accumulate_per_rank_errors(
         if *target <= 0.0 {
             continue;
         }
-        let rank = Rank::from(RankDivision::from(*target));
-        let entry = stats.entry(rank).or_default();
+        let true_rank = Rank::from(RankDivision::from(*target));
+        let true_entry = stats.entry(true_rank).or_default();
         let err = (*pred - *target) as f64;
-        entry.squared_error_sum += err * err;
-        entry.count += 1;
-    }
-}
+        true_entry.squared_error_sum += err * err;
+        true_entry.target_count += 1;
 
-fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>) {
-    info!("  Validation RMSE by rank:");
-    for rank in Rank::all_ranked() {
-        if let Some(entry) = stats.get(&rank)
-            && entry.count > 0
-        {
-            info!(
-                "    {:<20} {:>7.1} MMR RMSE  (n={:>6})",
-                rank.as_api_string(),
-                entry.rmse(),
-                entry.count
-            );
+        let predicted_rank = Rank::from(RankDivision::from(*pred));
+        let predicted_entry = stats.entry(predicted_rank).or_default();
+        predicted_entry.predicted_count += 1;
+        if predicted_rank == true_rank {
+            predicted_entry.correct_count += 1;
         }
     }
 }
 
+fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>) {
+    info!("  Validation RMSE by rank (predicted=# predictions in bucket, valid=# correct):");
+    for rank in Rank::all_ranked() {
+        let Some(entry) = stats.get(&rank) else {
+            continue;
+        };
+        if entry.target_count == 0 && entry.predicted_count == 0 {
+            continue;
+        }
+        info!(
+            "    {:<20} {:>7.1} MMR RMSE  (predicted={:>6}, valid={:>6})",
+            rank.as_api_string(),
+            entry.rmse(),
+            entry.predicted_count,
+            entry.correct_count,
+        );
+    }
+}
+
 /// Builds ordered per-rank RMSE entries for checkpoint JSON (same order as logs).
+///
+/// `sample_count` records the number of **labelled slots** whose true rank is this
+/// bucket — i.e. the denominator of `rmse_mmr`. The predicted-distribution count is
+/// a diagnostic that lives only in the training logs, not in the checkpoint payload.
 fn validation_rank_rmse_entries_from_stats(
     stats: &std::collections::HashMap<Rank, PerRankErrors>,
 ) -> Vec<ValidationRankRmseEntry> {
     let mut entries = Vec::new();
     for rank in Rank::all_ranked() {
         if let Some(per_rank) = stats.get(&rank)
-            && per_rank.count > 0
+            && per_rank.target_count > 0
         {
             entries.push(ValidationRankRmseEntry {
                 rank: rank.as_api_string().to_string(),
                 rmse_mmr: f64::from(per_rank.rmse()),
-                sample_count: per_rank.count as u64,
+                sample_count: per_rank.target_count as u64,
             });
         }
     }

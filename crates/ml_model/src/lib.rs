@@ -111,7 +111,12 @@ pub struct ModelConfig {
     #[config(default = 64)]
     pub lobby_hidden: usize,
     /// Dropout rate for regularization.
-    #[config(default = 0.2)]
+    ///
+    /// Set to 0.0 because empirically the heavy regularization stack (pinball, ordinal,
+    /// pairwise, minibatch spread, label jitter, Adam + gradient clipping) plus dropout
+    /// pushed the model into a mean-prediction basin on the full dataset. See
+    /// `docs/experiment.md` for the analysis.
+    #[config(default = 0.0)]
     pub dropout: f64,
 }
 
