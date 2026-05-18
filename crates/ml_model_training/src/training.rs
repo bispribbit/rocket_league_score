@@ -801,16 +801,48 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     }
 }
 
-/// Computes a cosine-decayed learning rate.
+/// Linear warmup fraction of the total schedule (capped at [`COSINE_LR_WARMUP_MAX_EPOCHS`]).
 ///
-/// Starts at `base_lr` and decays smoothly to near zero over `total_epochs` epochs.
-/// The `start_epoch` parameter supports resuming from a checkpoint.
+/// Matches the `overfit_wgpu` harness so production and the harness share the same
+/// effective LR trajectory. The first epoch starts at [`COSINE_LR_WARMUP_FLOOR`] × `base_lr`
+/// and ramps linearly to `base_lr` by the end of warmup.
+const COSINE_LR_WARMUP_FRACTION: f64 = 0.25;
+const COSINE_LR_WARMUP_MAX_EPOCHS: usize = 20;
+/// LR multiplier at the very start of warmup (epoch 0).
+const COSINE_LR_WARMUP_FLOOR: f64 = 0.1;
+/// Minimum LR multiplier the cosine tail decays to (fraction of `base_lr`).
+///
+/// Without a floor the tail epochs effectively stop training; the harness uses 0.10
+/// (`--lr-floor 0.10` in the validated CLIs) and we mirror that here.
+const COSINE_LR_TAIL_FLOOR: f64 = 0.1;
+
+/// Computes a learning rate with linear warmup followed by cosine decay to a floor.
+///
+/// * Epochs `[start_epoch, start_epoch + warmup_epochs)`: linear ramp from
+///   [`COSINE_LR_WARMUP_FLOOR`] × `base_lr` up to `base_lr`.
+/// * Epochs `[start_epoch + warmup_epochs, total_epochs)`: cosine from `base_lr` down to
+///   [`COSINE_LR_TAIL_FLOOR`] × `base_lr`.
+///
+/// `start_epoch` supports resuming from a checkpoint — the warmup re-applies after
+/// every resume, which is intentional: it gently re-engages the optimizer state.
 fn cosine_lr(base_lr: f64, current_epoch: usize, start_epoch: usize, total_epochs: usize) -> f64 {
     if total_epochs <= start_epoch {
         return base_lr;
     }
-    let progress = (current_epoch - start_epoch) as f64 / (total_epochs - start_epoch) as f64;
-    base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+    let span = total_epochs - start_epoch;
+    let warmup_epochs =
+        ((span as f64 * COSINE_LR_WARMUP_FRACTION) as usize).min(COSINE_LR_WARMUP_MAX_EPOCHS);
+    let local_epoch = current_epoch.saturating_sub(start_epoch);
+
+    if local_epoch < warmup_epochs {
+        let ramp = local_epoch as f64 / warmup_epochs.max(1) as f64;
+        return base_lr * ramp.mul_add(1.0 - COSINE_LR_WARMUP_FLOOR, COSINE_LR_WARMUP_FLOOR);
+    }
+
+    let cosine_span = span.saturating_sub(warmup_epochs).max(1) as f64;
+    let progress = (local_epoch - warmup_epochs) as f64 / cosine_span;
+    let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+    base_lr * cosine.max(COSINE_LR_TAIL_FLOOR)
 }
 
 /// Returns a deterministic pseudo-random float in [0, 1) from two seeds.

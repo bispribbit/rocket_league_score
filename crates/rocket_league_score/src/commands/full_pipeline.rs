@@ -108,8 +108,11 @@ impl Default for FullTrainConfig {
             train_ratio: 0.9,
             epochs: 100,
             batch_size: 128,
-            // See TrainingConfig::learning_rate doc for overfit sweep results.
-            learning_rate: 0.01,
+            // Matches the `overfit_wgpu` harness recipe that breaks the mean-collapse basin
+            // (`--lr 3e-2 --lr-floor 0.10`) — see `docs/experiment.md` row 11. The harness
+            // historically passed at 3e-2; 1e-3 keeps production trapped at the population
+            // mean for 18+ epochs (every prediction in diamond-1/2).
+            learning_rate: 0.03,
             resume: false,
             checkpoint_every_n_epochs: 5,
             max_replays: None,

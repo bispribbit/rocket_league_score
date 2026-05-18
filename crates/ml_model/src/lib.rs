@@ -127,11 +127,17 @@ pub struct TrainingConfig {
     ///
     /// Overfit sweep (100 segments, 30 epochs, MSE + Huber grid):
     ///   lr=1e-4 → FLAT (0.8% improvement)
-    ///   lr=1e-3 → FLAT (0.8%)
-    ///   lr=1e-2 → OK   (64.9%, 1226→430 MMR RMSE)  <-- chosen
+    ///   lr=1e-3 → FLAT (0.8%)            ← also the value that left the full pipeline
+    ///                                     stuck at the mean for 18+ epochs (see
+    ///                                     `docs/experiment.md` row 11).
+    ///   lr=1e-2 → OK   (64.9%, 1226→430 MMR RMSE)
+    ///   lr=3e-2 → OK and validated end-to-end on the `overfit_wgpu` harness  ← chosen
     ///   lr=5e-2 → OK   (64.7%, similar final RMSE but less stable)
     ///   lr=1e-1 → OK   (64.6%, oscillates more)
-    #[config(default = 1e-2)]
+    ///
+    /// Used together with the linear warmup + 0.10 cosine floor in
+    /// `ml_model_training::training::cosine_lr` to match the harness schedule.
+    #[config(default = 3e-2)]
     pub learning_rate: f64,
     /// Number of training epochs.
     #[config(default = 100)]

@@ -15,7 +15,10 @@
 //!   `TRAIN_RATIO`      - Training set ratio (default: 0.9)
 //!   EPOCHS           - Number of epochs (default: 100)
 //!   `BATCH_SIZE`       - Batch size (default: 32)
-//!   `LEARNING_RATE`    - Learning rate (default: 0.001)
+//!   `LEARNING_RATE`    - Learning rate (default: 0.03 — matches the `overfit_wgpu`
+//!                       harness; combined with the warmup + 0.10 floor in
+//!                       `training::cosine_lr`, this is the schedule validated end-to-end
+//!                       on T1/T2/T3.)
 //!   RESUME           - Resume from checkpoint (default: false)
 //!   `MAX_REPLAYS`      - Limit number of replays (default: None, uses all)
 //!
@@ -69,7 +72,7 @@ async fn main() -> Result<()> {
     let train_ratio: f64 = get_env_or_default("TRAIN_RATIO", 0.9);
     let epochs: usize = get_env_or_default("EPOCHS", 500);
     let batch_size: usize = get_env_or_default("BATCH_SIZE", 144);
-    let learning_rate: f64 = get_env_or_default("LEARNING_RATE", 0.001);
+    let learning_rate: f64 = get_env_or_default("LEARNING_RATE", 0.03);
     let resume: bool = get_env_or_default("RESUME", true);
     let max_replays: Option<usize> = std::env::var("MAX_REPLAYS")
         .ok()
