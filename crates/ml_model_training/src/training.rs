@@ -601,21 +601,27 @@ where
 ///
 /// `squared_error_sum` and `target_count` are keyed by **true rank** so that `rmse()`
 /// is the RMSE for that rank's labelled slots.
-/// `predicted_count` is keyed by **predicted rank** (rank inferred from the raw MMR
-/// output) so the log shows how many predictions land in each bucket — the predicted
-/// distribution, making mean-collapse immediately visible.
-/// `correct_count` is keyed by **predicted rank** and counts slots where the predicted
-/// rank matches the true rank, giving a quick accuracy signal alongside the histogram.
+/// `predicted_count` / `correct_count` are keyed by **regression-predicted rank** (rank
+/// of the raw MMR output) — they show the regression head's predicted distribution and
+/// hit count per bucket, making mean-collapse immediately visible.
+/// `ordinal_predicted_count` / `ordinal_correct_count` are keyed by **ordinal-predicted
+/// rank** (rank inferred from the auxiliary ordinal head's logits, independent of the
+/// regression head). When the regression head is stuck in a constant-predictor saddle,
+/// the ordinal columns reveal whether the shared LSTM is still learning to differentiate
+/// ranks via the ordinal classification objective.
 #[derive(Default)]
 struct PerRankErrors {
     squared_error_sum: f64,
     /// Number of labelled slots whose **true** rank is this bucket.
     target_count: usize,
-    /// Number of labelled slots whose **predicted** rank lands in this bucket.
+    /// Number of labelled slots whose **regression-predicted** rank lands in this bucket.
     predicted_count: usize,
-    /// Number of labelled slots predicted into this bucket where the true rank also
-    /// matches (i.e. correct rank predictions contributing to `predicted_count`).
+    /// Number of labelled slots in `predicted_count` where the true rank also matches.
     correct_count: usize,
+    /// Number of labelled slots whose **ordinal-predicted** rank lands in this bucket.
+    ordinal_predicted_count: usize,
+    /// Number of labelled slots in `ordinal_predicted_count` where the true rank matches.
+    ordinal_correct_count: usize,
 }
 
 impl PerRankErrors {
@@ -627,18 +633,35 @@ impl PerRankErrors {
     }
 }
 
+/// Maps a count of positive ordinal logits (`0..=ORDINAL_NUM_BOUNDARIES`) to a [`Rank`].
+///
+/// The ordinal head emits 21 boundary logits; with `n` of them positive, the model
+/// predicts the player is above `n` boundaries, i.e. the `n`-th rank in `all_ranked()`
+/// order (Bronze-1 at `n=0`, SSL at `n=21`).
+fn ordinal_rank_from_positive_count(positive_count: usize) -> Rank {
+    let ranks: Vec<Rank> = Rank::all_ranked().collect();
+    let idx = positive_count.min(ranks.len().saturating_sub(1));
+    ranks.get(idx).copied().unwrap_or(Rank::Bronze1)
+}
+
 /// Collects squared errors per **true** [`Rank`] and prediction/correct counts per
 /// **predicted** [`Rank`] from raw prediction/target vectors.
 ///
 /// Targets with value `0.0` (sentinel for unknown rank) are skipped: those slots have
-/// no ground truth so they would distort both the RMSE and the predicted histogram.
-/// Skipping them keeps `sum(predicted_count) == sum(target_count)`.
+/// no ground truth so they would distort both the RMSE and the predicted histograms.
+/// Skipping them keeps `sum(predicted_count) == sum(target_count)` and similarly for
+/// the ordinal counters.
+///
+/// `ordinal_logits` is the flattened `[num_slots, ORDINAL_NUM_BOUNDARIES]` ordinal-head
+/// output for the same slots as `predictions` / `targets`. When [`None`], the ordinal
+/// diagnostic is skipped (used by callers that haven't routed the auxiliary head).
 fn accumulate_per_rank_errors(
     stats: &mut std::collections::HashMap<Rank, PerRankErrors>,
     predictions: &[f32],
     targets: &[f32],
+    ordinal_logits: Option<&[f32]>,
 ) {
-    for (pred, target) in predictions.iter().zip(targets.iter()) {
+    for (slot_idx, (pred, target)) in predictions.iter().zip(targets.iter()).enumerate() {
         if *target <= 0.0 {
             continue;
         }
@@ -654,24 +677,46 @@ fn accumulate_per_rank_errors(
         if predicted_rank == true_rank {
             predicted_entry.correct_count += 1;
         }
+
+        if let Some(logits) = ordinal_logits {
+            let start = slot_idx * ml_model::ORDINAL_NUM_BOUNDARIES;
+            let end = start + ml_model::ORDINAL_NUM_BOUNDARIES;
+            if let Some(slot_logits) = logits.get(start..end) {
+                let positive = slot_logits.iter().filter(|&&l| l > 0.0).count();
+                let ordinal_rank = ordinal_rank_from_positive_count(positive);
+                let ordinal_entry = stats.entry(ordinal_rank).or_default();
+                ordinal_entry.ordinal_predicted_count += 1;
+                if ordinal_rank == true_rank {
+                    ordinal_entry.ordinal_correct_count += 1;
+                }
+            }
+        }
     }
 }
 
 fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>) {
-    info!("  Validation RMSE by rank (predicted=# predictions in bucket, valid=# correct):");
+    info!(
+        "  Validation RMSE by rank (reg = regression head; ord = ordinal head; \
+         p=predicted count, v=valid count):"
+    );
     for rank in Rank::all_ranked() {
         let Some(entry) = stats.get(&rank) else {
             continue;
         };
-        if entry.target_count == 0 && entry.predicted_count == 0 {
+        if entry.target_count == 0
+            && entry.predicted_count == 0
+            && entry.ordinal_predicted_count == 0
+        {
             continue;
         }
         info!(
-            "    {:<20} {:>7.1} MMR RMSE  (predicted={:>6}, valid={:>6})",
+            "    {:<20} {:>7.1} MMR RMSE  reg(p={:>6}, v={:>6})  ord(p={:>6}, v={:>6})",
             rank.as_api_string(),
             entry.rmse(),
             entry.predicted_count,
             entry.correct_count,
+            entry.ordinal_predicted_count,
+            entry.ordinal_correct_count,
         );
     }
 }
@@ -742,7 +787,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
             continue;
         };
 
-        let predictions = model.forward(batch.inputs);
+        let (predictions, ordinal_logits) = model.forward_with_ordinal_scale(batch.inputs, 1.0);
 
         // Extract raw values for per-rank breakdown before normalizing.
         let raw_preds: Vec<f32> = predictions.clone().into_data().to_vec().unwrap_or_default();
@@ -752,7 +797,13 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
             .into_data()
             .to_vec()
             .unwrap_or_default();
-        accumulate_per_rank_errors(&mut rank_stats, &raw_preds, &raw_targets);
+        let raw_ordinal_logits: Vec<f32> = ordinal_logits.into_data().to_vec().unwrap_or_default();
+        accumulate_per_rank_errors(
+            &mut rank_stats,
+            &raw_preds,
+            &raw_targets,
+            Some(&raw_ordinal_logits),
+        );
 
         // Mask unknown-rank slots (target == 0.0 sentinel).
         let mask = batch.targets.clone().greater_elem(0.0).float();
