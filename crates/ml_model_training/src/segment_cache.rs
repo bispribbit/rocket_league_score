@@ -660,6 +660,31 @@ impl SegmentStore {
 
         Some((features, target_mmr))
     }
+
+    /// Builds a new [`SegmentStore`] containing only the entries at the given indices,
+    /// keeping the per-entry path / target / rank fields intact.
+    ///
+    /// Used by the warm-start phase to construct a balanced K-per-rank mini-set on top
+    /// of the same on-disk cache as the full training dataset (no re-parsing, no
+    /// duplicate cache directories).
+    ///
+    /// Preloaded segments are intentionally **not** carried over — the new store will
+    /// load lazily from disk like a fresh training store. Call
+    /// [`SegmentStore::preload_all_segments`] on the result if needed.
+    #[must_use]
+    pub fn subset_by_indices(&self, indices: &[usize], name: String) -> Self {
+        let mut subset = Self::new(name, self.length);
+        for &index in indices {
+            if let Some(entry) = self.entries.get(index) {
+                subset.entries.push(SegmentEntry {
+                    path: entry.path.clone(),
+                    target_mmr: entry.target_mmr,
+                    primary_rank_index: entry.primary_rank_index,
+                });
+            }
+        }
+        subset
+    }
 }
 
 // =============================================================================

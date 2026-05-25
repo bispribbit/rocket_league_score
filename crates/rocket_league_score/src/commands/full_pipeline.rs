@@ -27,7 +27,8 @@ use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_player_centric_game
 use ml_model::{ModelConfig, TrainingConfig, create_model};
 use ml_model_training::segment_cache::{SegmentStore, SegmentStoreBuilder};
 use ml_model_training::{
-    CheckpointConfig, CheckpointValidationMetrics, TrainingState, save_checkpoint, train,
+    CheckpointConfig, CheckpointValidationMetrics, TrainingState, balanced_segment_indices,
+    save_checkpoint, train,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
@@ -45,6 +46,21 @@ type TrainBackend = Autodiff<Wgpu>;
 /// This budget intentionally stays below total VRAM to leave room for model weights,
 /// optimizer state, gradients, and other activations.
 const FUSED_LSTM_X_PROJECTION_BUDGET_BYTES: usize = 2_000_000_000;
+
+/// Warm-start config: number of segments per rank to draw from the full training
+/// dataset for the balanced pre-training pass. `0` disables warm-start entirely.
+///
+/// 10 / rank × 23 ranks ≈ 200 segments (matches the `overfit_wgpu` T3 mini-set scale
+/// that successfully broke out of the basin in the harness).
+const WARM_START_SEGMENTS_PER_RANK: usize = 10;
+
+/// Warm-start config: number of epochs to run on the balanced mini-set before
+/// continuing with the full dataset.
+///
+/// The harness needed ~250 epochs at T3 to lift SSL out of the mean basin; we mirror
+/// that here so the model is no longer a constant-predictor when main training
+/// inherits the weights.
+const WARM_START_EPOCHS: usize = 250;
 
 struct FusedProjectionEstimate {
     bytes: usize,
@@ -359,6 +375,63 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         );
     }
 
+    // Step 3.5: Warm-start pre-training on a balanced K-per-rank mini-set.
+    //
+    // Mirrors the `overfit_wgpu` T3 harness recipe (≈200 segments, hundreds of epochs)
+    // that reliably breaks out of the mean-prediction basin. Without warm-start the
+    // full-dataset training gets pinned at the population mean because the SSL up-pull
+    // and Bronze-1 down-pull cancel near diamond-1/platinum-3. See `docs/experiment.md`
+    // rows 11-13 for the analysis. Skipped automatically when resuming from a real
+    // checkpoint (the existing weights are presumed to already be past the basin) or
+    // when [`WARM_START_SEGMENTS_PER_RANK`] / [`WARM_START_EPOCHS`] are set to 0.
+    let warm_start_should_run =
+        start_state.is_none() && WARM_START_SEGMENTS_PER_RANK > 0 && WARM_START_EPOCHS > 0;
+    let warm_start_baseline = if warm_start_should_run {
+        let warm_start_indices =
+            balanced_segment_indices(&train_dataset, WARM_START_SEGMENTS_PER_RANK);
+        if warm_start_indices.is_empty() {
+            warn!("Warm-start: no balanced segments could be selected; skipping pre-training");
+            None
+        } else {
+            let warm_start_start = Instant::now();
+            info!(
+                segments = warm_start_indices.len(),
+                target_per_rank = WARM_START_SEGMENTS_PER_RANK,
+                epochs = WARM_START_EPOCHS,
+                "Step 3.5: Warm-start pre-training on balanced mini-set"
+            );
+            let warm_start_store = Arc::new(
+                train_dataset.subset_by_indices(&warm_start_indices, "warm_start".to_string()),
+            );
+            let warm_start_config = TrainingConfig::new(model_config.clone())
+                .with_learning_rate(config.learning_rate)
+                .with_epochs(WARM_START_EPOCHS)
+                .with_batch_size(training_config.batch_size);
+            let warm_start_output = train(
+                &mut model,
+                warm_start_store,
+                valid_dataset.as_ref(),
+                &warm_start_config,
+                None,
+                Some(TrainingState::new(0)),
+            )?;
+            let warm_start_duration = warm_start_start.elapsed();
+            info!(
+                final_train_loss = warm_start_output.final_train_loss,
+                final_valid_loss = warm_start_output.final_valid_loss,
+                epochs_completed = warm_start_output.epochs_completed,
+                duration_sec = warm_start_duration.as_secs_f64(),
+                "Warm-start phase complete; main training will use this state as a starting point"
+            );
+            warm_start_output.final_validation_rank_rmse
+        }
+    } else {
+        if start_state.is_some() {
+            info!("Resuming from checkpoint — skipping warm-start phase");
+        }
+        None
+    };
+
     // Step 4: Train model using memory-mapped segments
     let step4_start = Instant::now();
     info!("Step 4: Starting training with mmap segments...");
@@ -369,13 +442,21 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         save_on_improvement: true,
     };
 
+    let mut main_training_state = start_state.unwrap_or_else(|| TrainingState::new(0));
+    if warm_start_baseline.is_some() {
+        info!(
+            "Tail-rank guard armed with warm-start baseline (watching: bronze-1, grand-champion-3, supersonic-legend)"
+        );
+    }
+    main_training_state.tail_rank_baseline = warm_start_baseline;
+
     let output = train(
         &mut model,
         train_dataset.clone(),
         valid_dataset.as_ref(),
         &training_config,
         Some(checkpoint_config),
-        start_state,
+        Some(main_training_state),
     )?;
 
     let train_rmse = output.final_train_loss.sqrt();

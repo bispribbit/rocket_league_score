@@ -32,6 +32,14 @@ pub struct TrainingState {
     pub current_valid_loss: Option<f32>,
     /// Per-rank validation RMSE from the last validation pass (MMR units).
     pub last_validation_rank_rmse: Option<Vec<ValidationRankRmseEntry>>,
+    /// Reference per-rank validation RMSE (MMR units) captured at the end of the
+    /// warm-start phase, used as the **tail-rank guard** baseline.
+    ///
+    /// When this is set, each validation pass during main training compares the
+    /// tail-rank RMSEs (Bronze-1, GC-3, SSL) against this baseline and logs a warning
+    /// if they degrade by more than [`TAIL_RANK_GUARD_DEGRADATION_FRACTION`]. The guard
+    /// is monitoring-only: it does **not** stop training or revert the model.
+    pub tail_rank_baseline: Option<Vec<ValidationRankRmseEntry>>,
 }
 
 fn checkpoint_validation_metrics_from_state(
@@ -53,6 +61,7 @@ impl TrainingState {
             current_train_loss: 0.0,
             current_valid_loss: None,
             last_validation_rank_rmse: None,
+            tail_rank_baseline: None,
         }
     }
 }
@@ -100,6 +109,11 @@ pub struct TrainingOutput {
     pub epochs_completed: usize,
     /// Paths to checkpoints saved during training.
     pub checkpoint_paths: Vec<String>,
+    /// Per-rank validation RMSE from the last validation pass (MMR units).
+    ///
+    /// Used by the full-pipeline warm-start phase to seed
+    /// [`TrainingState::tail_rank_baseline`] for the subsequent main-training run.
+    pub final_validation_rank_rmse: Option<Vec<ValidationRankRmseEntry>>,
 }
 
 /// Number of batches to prefetch ahead (keep GPU fed while loading next batches).
@@ -107,6 +121,20 @@ const PREFETCH_COUNT: usize = 8;
 
 /// How often to sync with GPU to extract loss value (every N batches).
 const LOSS_SYNC_INTERVAL: usize = 10;
+
+/// Tail ranks watched by the **tail-rank guard** (see [`TrainingState::tail_rank_baseline`]).
+///
+/// These are the ranks where mean-collapse hurts the most because they sit at the
+/// extremes of the MMR distribution and have very few labelled examples relative to
+/// the centre of the ladder. A warm-start baseline that has any signal here is the
+/// minimum bar; if main training erodes it past
+/// [`TAIL_RANK_GUARD_DEGRADATION_FRACTION`] we want a loud signal in the logs.
+const TAIL_RANK_GUARD_API_STRINGS: &[&str] = &["bronze-1", "grand-champion-3", "supersonic-legend"];
+
+/// Fractional degradation (relative to the warm-start baseline RMSE) above which the
+/// tail-rank guard logs a warning. `0.25` = "current tail RMSE is more than 125 % of
+/// the baseline tail RMSE".
+const TAIL_RANK_GUARD_DEGRADATION_FRACTION: f64 = 0.25;
 
 /// Epoch at which EMA-based smurf masking kicks in, or [`None`] to disable masking.
 ///
@@ -215,6 +243,32 @@ pub fn compute_inverse_frequency_weights(dataset: &SegmentStore) -> Vec<f32> {
         .collect();
     let mean_weight = weights.iter().sum::<f32>() / weights.len() as f32;
     weights.iter().map(|w| w / mean_weight).collect()
+}
+
+/// Returns up to `target_per_rank` segment indices for each of the 23 numeric ranks.
+///
+/// Pick is deterministic (linear scan in entry order) and skips ranks with zero
+/// segments. Used by the warm-start phase to build a tiny balanced mini-set for the
+/// pre-training pass without touching the on-disk cache.
+#[must_use]
+pub fn balanced_segment_indices(dataset: &SegmentStore, target_per_rank: usize) -> Vec<usize> {
+    if target_per_rank == 0 || dataset.is_empty() {
+        return Vec::new();
+    }
+    let mut per_rank_counts = [0usize; 23];
+    let mut picked = Vec::new();
+    for index in 0..dataset.len() {
+        let rank_index = dataset.get_primary_rank_index(index).unwrap_or(0) as usize;
+        let Some(count) = per_rank_counts.get_mut(rank_index) else {
+            continue;
+        };
+        if *count >= target_per_rank {
+            continue;
+        }
+        *count += 1;
+        picked.push(index);
+    }
+    picked
 }
 
 /// Looks up per-sample inverse-frequency weights on CPU and returns them as a Vec.
@@ -504,6 +558,9 @@ where
                 compute_validation_loss(&inner_model, valid_ds, &valid_batcher, config.batch_size);
             let validation_time = valid_start.elapsed();
             state.current_valid_loss = Some(validation_result.loss);
+            if let Some(baseline) = state.tail_rank_baseline.as_deref() {
+                log_tail_rank_guard(baseline, &validation_result.rank_rmse_entries);
+            }
             state.last_validation_rank_rmse = Some(validation_result.rank_rmse_entries);
 
             // Early stopping check
@@ -538,6 +595,7 @@ where
                         final_valid_loss: state.current_valid_loss,
                         epochs_completed: epoch + 1,
                         checkpoint_paths,
+                        final_validation_rank_rmse: state.last_validation_rank_rmse,
                     });
                 }
             }
@@ -594,6 +652,7 @@ where
         final_valid_loss: state.current_valid_loss,
         epochs_completed: config.epochs,
         checkpoint_paths,
+        final_validation_rank_rmse: state.last_validation_rank_rmse,
     })
 }
 
@@ -742,6 +801,38 @@ fn validation_rank_rmse_entries_from_stats(
         }
     }
     entries
+}
+
+/// Compares the current validation per-rank RMSEs against the warm-start baseline for
+/// the watched tail ranks and logs a warning per rank that has degraded past
+/// [`TAIL_RANK_GUARD_DEGRADATION_FRACTION`].
+///
+/// Monitoring only: never modifies the model or stops training. Intended to flag
+/// "warm-start broke us out of the basin and then main training pushed us back in"
+/// so we can correlate the regression with epoch / LR / loss changes.
+fn log_tail_rank_guard(baseline: &[ValidationRankRmseEntry], current: &[ValidationRankRmseEntry]) {
+    for rank_label in TAIL_RANK_GUARD_API_STRINGS {
+        let baseline_entry = baseline.iter().find(|e| e.rank == *rank_label);
+        let current_entry = current.iter().find(|e| e.rank == *rank_label);
+        let (Some(baseline_entry), Some(current_entry)) = (baseline_entry, current_entry) else {
+            continue;
+        };
+        if baseline_entry.rmse_mmr <= 0.0 {
+            continue;
+        }
+        let degradation =
+            (current_entry.rmse_mmr - baseline_entry.rmse_mmr) / baseline_entry.rmse_mmr;
+        if degradation > TAIL_RANK_GUARD_DEGRADATION_FRACTION {
+            warn!(
+                rank = rank_label,
+                baseline_rmse_mmr = baseline_entry.rmse_mmr,
+                current_rmse_mmr = current_entry.rmse_mmr,
+                degradation_fraction = degradation,
+                threshold_fraction = TAIL_RANK_GUARD_DEGRADATION_FRACTION,
+                "Tail-rank guard: rank RMSE has degraded past threshold relative to warm-start baseline"
+            );
+        }
+    }
 }
 
 /// Result of one full validation pass: aggregate loss and per-rank RMSE.

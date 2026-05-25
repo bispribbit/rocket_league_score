@@ -42,19 +42,6 @@ const PINBALL_THRESHOLD_MMR: f32 = 1400.0;
 const ORDINAL_LOSS_WEIGHT: f32 = 0.2;
 const PAIRWISE_LOSS_WEIGHT: f32 = 0.1;
 
-/// Symmetric tail-anchor multipliers for the production loss. Lobbies whose **clean** mean
-/// target MMR sits above [`TAIL_BOOST_HIGH_THRESHOLD_MMR`] or below [`TAIL_BOOST_LOW_THRESHOLD_MMR`]
-/// have their per-element regression loss multiplied by [`TAIL_BOOST_MULTIPLIER`].
-///
-/// Mirrors the harness `MseExtremeMmrRowBoost { threshold_mmr: 1800, extra_multiplier: 10.0 }`
-/// that anchors SSL in T3 (see `docs/experiment.md` rows 7, 8, 10). The symmetric low-tail
-/// boost is added because production's mean-collapse basin is symmetric: predicted ≈ 902 MMR
-/// is equidistant from Bronze-1 (130) and SSL (2200), so anchoring only one side leaves the
-/// other shoulder of the U-shape free.
-const TAIL_BOOST_HIGH_THRESHOLD_MMR: f32 = 1800.0;
-const TAIL_BOOST_LOW_THRESHOLD_MMR: f32 = 250.0;
-const TAIL_BOOST_MULTIPLIER: f32 = 10.0;
-
 /// Penalises minibatches whose **predicted** MMR spread (std of known slots, normalised space) is
 /// much **smaller** than the **target** spread. That discourages the shortcut where the model
 /// outputs a narrow “bell” around the batch mean instead of matching the width of the label
@@ -257,27 +244,6 @@ where
     let weights = Tensor::<B, 1>::from_floats(per_element_weights_vec.as_slice(), device)
         .reshape([batch_size_local, TOTAL_PLAYERS]);
 
-    // Per-row tail anchor: rows whose clean mean target is in the high or low tail get a
-    // multiplicative boost on every element of that row. Mirrors the harness
-    // `MseExtremeMmrRowBoost` used in T3 (see `docs/experiment.md` rows 7, 8, 10), made
-    // symmetric to anchor both Bronze-1 and SSL ends of the U-shape.
-    let row_has_known = mask.clone().sum_dim(1).greater_elem(0.0).float();
-    let masked_targets_sum = (batch.targets.clone() * mask.clone()).sum_dim(1);
-    let known_per_row = mask.clone().sum_dim(1).clamp_min(1.0);
-    let mean_target_mmr_per_row = masked_targets_sum / known_per_row;
-    let high_tail_rows = mean_target_mmr_per_row
-        .clone()
-        .greater_elem(TAIL_BOOST_HIGH_THRESHOLD_MMR)
-        .float();
-    // `lower_elem` would also match the sentinel rows where every slot is 0; gate on
-    // `row_has_known` so rows with no known slots don't get spuriously boosted.
-    let low_tail_rows = mean_target_mmr_per_row
-        .lower_elem(TAIL_BOOST_LOW_THRESHOLD_MMR)
-        .float()
-        * row_has_known;
-    let tail_row_scale = ((high_tail_rows + low_tail_rows) * (TAIL_BOOST_MULTIPLIER - 1.0) + 1.0)
-        .expand([batch_size_local, TOTAL_PLAYERS]);
-
     let jitter_norm =
         mean_zero_label_jitter_normalized::<B>(device, batch_size_local, mask.clone(), jitter_step);
     let raw_targets = batch.targets.clone();
@@ -299,8 +265,7 @@ where
     let element_loss = huber_loss
         + pinball_high_rank * PINBALL_WEIGHT
         + pinball_full_batch * PINBALL_FULL_BATCH_WEIGHT;
-    let regression_loss =
-        (element_loss * mask.clone() * weights * tail_row_scale).sum() / known_count;
+    let regression_loss = (element_loss * mask.clone() * weights).sum() / known_count;
 
     let flat_row_count = raw_targets.dims()[0] * TOTAL_PLAYERS;
     let flat_mask = mask.clone().reshape([flat_row_count]);
