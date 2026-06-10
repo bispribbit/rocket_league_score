@@ -16,6 +16,10 @@ path = "src/bin/overfit_wgpu.rs"
 name = "mixed_rank_eval"
 path = "src/bin/mixed_rank_eval.rs"
 
+[[bin]]
+name = "signal_probe"
+path = "src/bin/signal_probe.rs"
+
 [lints]
 workspace = true
 

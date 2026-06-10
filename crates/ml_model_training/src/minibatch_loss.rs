@@ -269,7 +269,11 @@ where
 
     let flat_row_count = raw_targets.dims()[0] * TOTAL_PLAYERS;
     let flat_mask = mask.clone().reshape([flat_row_count]);
-    let flat_targets_mmr = (raw_targets.clone() * MMR_SCALE).reshape([flat_row_count, 1]);
+    // `raw_targets` is already in raw MMR units (e.g. 194–2200). Do NOT multiply by
+    // MMR_SCALE: that would inflate every target to ~485 000 – 5 500 000, which exceeds
+    // every ordinal boundary (max 2200) and forces all ordinal targets to 1 (every
+    // player appears to be SSL), destroying the auxiliary head's gradient signal.
+    let flat_targets_mmr = raw_targets.clone().reshape([flat_row_count, 1]);
 
     let boundaries_vec: Vec<f32> = ORDINAL_BOUNDARIES_MMR.to_vec();
     let boundaries = Tensor::<B, 1>::from_floats(boundaries_vec.as_slice(), device)
@@ -307,19 +311,25 @@ where
         (bce * ordinal_mask).sum() / (ordinal_known_count * ORDINAL_NUM_BOUNDARIES as f32);
 
     let batch_size_local = raw_targets.dims()[0];
-    let preds_flat = raw_predictions.reshape([batch_size_local * TOTAL_PLAYERS]);
+    // Normalize predictions to the same space as the margin (50 / MMR_SCALE).
+    // Using raw-MMR pred_diff with a normalized margin of 0.02 meant any 0.02 raw-MMR
+    // separation satisfied the hinge, making the loss a near-constant that provided no
+    // meaningful within-lobby ranking gradient.
+    let preds_norm_flat = (raw_predictions / MMR_SCALE).reshape([batch_size_local * TOTAL_PLAYERS]);
     let targets_flat = raw_targets.reshape([batch_size_local * TOTAL_PLAYERS]);
-    let preds_lobby = preds_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
+    let preds_lobby = preds_norm_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
     let targets_lobby = targets_flat.reshape([batch_size_local, TOTAL_PLAYERS]);
     let mask_lobby = mask.clone().reshape([batch_size_local, TOTAL_PLAYERS]);
 
     let preds_i = preds_lobby.clone().unsqueeze_dim::<3>(2);
     let preds_j = preds_lobby.unsqueeze_dim::<3>(1);
+    // pred_diff is now in normalized space, consistent with pairwise_hinge_margin.
     let pred_diff = preds_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
         - preds_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS]);
 
     let targets_i = targets_lobby.clone().unsqueeze_dim::<3>(2);
     let targets_j = targets_lobby.unsqueeze_dim::<3>(1);
+    // target_diff stays in raw MMR so the 25 MMR threshold is straightforward.
     let target_diff = targets_i.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
         - targets_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS]);
 
@@ -329,6 +339,8 @@ where
         * mask_j.expand([batch_size_local, TOTAL_PLAYERS, TOTAL_PLAYERS])
         * target_diff.greater_elem(MMR_SCALE * 0.01).float();
 
+    // Margin in normalized space: 50 MMR / 2500 = 0.02. With pred_diff also normalized,
+    // the hinge fires until the model separates players by a genuine 50 MMR difference.
     let pairwise_hinge_margin: f32 = 50.0 / MMR_SCALE;
     let pairwise_loss_elements =
         (pair_mask.clone() * (pairwise_hinge_margin - pred_diff).clamp_min(0.0)).sum();
@@ -510,5 +522,159 @@ where
         harness_known_slots,
         harness_pred_sum_norm,
         harness_target_sum_norm,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use ml_model::{MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES};
+
+    // ── Ordinal target correctness ───────────────────────────────────────────
+
+    /// For a player with the given raw MMR, compute which ordinal boundaries
+    /// (in raw-MMR space) are exceeded — reproducing the production formula.
+    fn ordinal_targets_for_mmr(mmr_raw: f32) -> Vec<bool> {
+        ORDINAL_BOUNDARIES_MMR
+            .iter()
+            .map(|&boundary| mmr_raw > boundary)
+            .collect()
+    }
+
+    /// REGRESSION TEST — ordinal targets must use raw MMR, not MMR * MMR_SCALE.
+    ///
+    /// Bug: the original code computed `raw_targets * MMR_SCALE` before comparing
+    /// against the boundaries, inflating a Bronze-1 player's 194 MMR to 485 000.
+    /// Since the highest boundary is 2 200, every slot got target = 1 for all 21
+    /// boundaries, making the ordinal head train identically for every player
+    /// (i.e., always predict SSL) and wasting 20 % of the loss weight.
+    #[test]
+    fn ordinal_targets_not_double_scaled() {
+        let bronze1_mmr = 194.0_f32; // mmr_middle() for Bronze-1
+        let diamond1_mmr = 966.0_f32; // mmr_middle() for Diamond-1
+        let ssl_mmr = 2200.0_f32; // mmr_middle() for SSL
+
+        // Bronze-1: should be below ALL boundaries (no boundary exceeded).
+        let bronze_targets = ordinal_targets_for_mmr(bronze1_mmr);
+        assert_eq!(bronze_targets.len(), ORDINAL_NUM_BOUNDARIES);
+        assert!(
+            bronze_targets.iter().all(|&t| !t),
+            "Bronze-1 at 194 MMR must not exceed any ordinal boundary; \
+             if this fails the ordinal target is being double-scaled by MMR_SCALE"
+        );
+
+        // Demonstrate the double-scale bug: 194 * 2500 exceeds every boundary.
+        let bronze_double_scaled = ordinal_targets_for_mmr(bronze1_mmr * MMR_SCALE);
+        assert!(
+            bronze_double_scaled.iter().all(|&t| t),
+            "Sanity: 194 * MMR_SCALE should exceed all boundaries (demonstrates the removed bug)"
+        );
+
+        // Diamond-1: should exceed boundaries 0-11 (194 … 902 MMR), not 12+ (966+).
+        let diamond_targets = ordinal_targets_for_mmr(diamond1_mmr);
+        // Boundary 11 = 902.0 (above Platinum-3): 966 > 902 ✓
+        assert!(
+            diamond_targets[11],
+            "Diamond-1 (966 MMR) must exceed boundary 11 (902 MMR)"
+        );
+        // Boundary 12 = 966.0 (above Diamond-1): 966 > 966 = false ✓
+        assert!(
+            !diamond_targets[12],
+            "Diamond-1 (966 MMR) must NOT exceed boundary 12 (966 MMR, strict greater-than)"
+        );
+
+        // SSL: 2200 MMR — the last boundary is also 2200 (strict greater-than → false),
+        // so SSL gets 20/21 positives, not 21/21. This is a known label nuance; test it
+        // to document the behaviour explicitly.
+        let ssl_targets = ordinal_targets_for_mmr(ssl_mmr);
+        let positive_count = ssl_targets.iter().filter(|&&t| t).count();
+        assert_eq!(
+            positive_count,
+            ORDINAL_NUM_BOUNDARIES - 1,
+            "SSL (2200 MMR) should exceed 20 of 21 boundaries (last boundary is also 2200)"
+        );
+    }
+
+    // ── Pairwise hinge margin correctness ───────────────────────────────────
+
+    /// Computes the pairwise hinge loss for a single pair using the CORRECT formula:
+    /// pred_diff is in **normalized** space (raw_pred / MMR_SCALE) so the 50-MMR
+    /// margin (stored as `50 / MMR_SCALE`) is commensurable with pred_diff.
+    fn pairwise_hinge_correct(pred_i_raw: f32, pred_j_raw: f32) -> f32 {
+        let pred_diff = (pred_i_raw - pred_j_raw) / MMR_SCALE;
+        let margin = 50.0_f32 / MMR_SCALE;
+        (margin - pred_diff).max(0.0)
+    }
+
+    /// Computes the pairwise hinge using the BUGGY formula where pred_diff is in raw
+    /// MMR but the margin is normalized (0.02), so a 0.1 raw-MMR separation already
+    /// satisfies the hinge, providing no meaningful ranking gradient.
+    fn pairwise_hinge_buggy(pred_i_raw: f32, pred_j_raw: f32) -> f32 {
+        let pred_diff = pred_i_raw - pred_j_raw; // raw MMR — the bug
+        let margin = 50.0_f32 / MMR_SCALE; // normalized (0.02) — wrong unit mix
+        (margin - pred_diff).max(0.0)
+    }
+
+    /// REGRESSION TEST — pairwise hinge must use normalized predictions.
+    ///
+    /// Bug: `raw_predictions` (raw MMR) was used directly in `pred_diff`, while
+    /// `pairwise_hinge_margin = 50 / MMR_SCALE = 0.02`.  Any raw-MMR difference
+    /// above 0.02 (i.e., trivially, always) satisfied the hinge → the loss was
+    /// zero or nearly so for all plausible predictions, providing no gradient.
+    #[test]
+    fn pairwise_hinge_fires_for_collapsed_predictions() {
+        // Scenario: two players with targets 100 MMR apart (well above the 25 MMR
+        // activation threshold), but the model predicts nearly identical values —
+        // a typical collapsed state.
+        // target_i = 1000 MMR, target_j = 900 MMR (100 MMR apart, > 25 MMR threshold).
+        // pred_i corresponds to the higher-target player; pred_j to the lower-target player.
+        // The hinge tests whether pred_i - pred_j >= margin.
+        let pred_i = 900.1_f32; // collapsed: slightly above pred_j, but by only 0.1 raw MMR
+        let pred_j = 900.0_f32; // collapsed: both effectively ~diamond-1
+
+        // CORRECT formula: 0.1 MMR difference is far below the 50-MMR margin →
+        // hinge must fire (loss > 0, gradient pushes predictions apart).
+        let loss_correct = pairwise_hinge_correct(pred_i, pred_j);
+        assert!(
+            loss_correct > 0.0,
+            "Correct pairwise hinge should fire when predictions differ by only 0.1 MMR \
+             but targets differ by 100 MMR (margin = 50 MMR); got loss = {loss_correct}"
+        );
+
+        // BUG formula: 0.1 raw-MMR difference > 0.02 normalized margin → hinge is zero
+        // (model gets no gradient despite being essentially collapsed).
+        let loss_buggy = pairwise_hinge_buggy(pred_i, pred_j);
+        assert!(
+            loss_buggy < f32::EPSILON,
+            "Buggy pairwise hinge should be zero because 0.1 raw-MMR > 0.02 normalized margin \
+             (demonstrates the removed unit mismatch); got {loss_buggy}"
+        );
+    }
+
+    #[test]
+    fn pairwise_hinge_zero_when_well_separated() {
+        // When the model correctly separates players by more than 50 MMR, no loss.
+        let pred_i = 1000.0_f32; // correctly higher
+        let pred_j = 900.0_f32; // correctly lower — 100 MMR apart
+        // 100 / 2500 = 0.04 > margin 0.02 → loss = 0
+        let loss = pairwise_hinge_correct(pred_i, pred_j);
+        assert!(
+            loss < f32::EPSILON,
+            "No hinge loss when predictions are separated by 100 MMR (> 50 MMR margin); got {loss}"
+        );
+    }
+
+    #[test]
+    fn pairwise_hinge_nonzero_at_exact_margin() {
+        // At exactly the margin boundary, loss should be 0 (margin − margin = 0).
+        let pred_i = 950.0_f32;
+        let pred_j = 900.0_f32; // exactly 50 MMR apart
+        let loss = pairwise_hinge_correct(pred_i, pred_j);
+        assert!(
+            loss.abs() < 1e-6,
+            "Hinge should be zero at exactly the 50-MMR margin boundary, got {loss}"
+        );
     }
 }

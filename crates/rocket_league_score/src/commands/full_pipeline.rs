@@ -50,8 +50,8 @@ const FUSED_LSTM_X_PROJECTION_BUDGET_BYTES: usize = 2_000_000_000;
 /// Warm-start config: number of segments per rank to draw from the full training
 /// dataset for the balanced pre-training pass. `0` disables warm-start entirely.
 ///
-/// 10 / rank × 23 ranks ≈ 200 segments (matches the `overfit_wgpu` T3 mini-set scale
-/// that successfully broke out of the basin in the harness).
+/// 10 / rank × 23 ranks ≈ 200–230 segments (matches the `overfit_wgpu` T3 mini-set
+/// scale that successfully broke out of the basin in the harness).
 const WARM_START_SEGMENTS_PER_RANK: usize = 10;
 
 /// Warm-start config: number of epochs to run on the balanced mini-set before
@@ -61,6 +61,23 @@ const WARM_START_SEGMENTS_PER_RANK: usize = 10;
 /// that here so the model is no longer a constant-predictor when main training
 /// inherits the weights.
 const WARM_START_EPOCHS: usize = 250;
+
+/// Batch size used **only** during the warm-start phase.
+///
+/// The production batch size (144) on 230 segments yields only ~2 optimizer steps
+/// per epoch → ~500 total steps for 250 epochs.  The harness recipe that reliably
+/// escapes the collapse basin uses batch 32 on the same segment count → ~7 steps per
+/// epoch → ~1 750 steps, much closer to the ~3 600 effective steps that passed T3.
+/// Using a small fixed batch here makes warm-start equivalent to the harness regardless
+/// of the production batch size chosen for main training.
+const WARM_START_BATCH_SIZE: usize = 32;
+
+/// Minimum prediction standard deviation (MMR) expected after a successful warm-start.
+///
+/// If the warm-start ends with pred_std below this threshold the model is still in the
+/// mean-prediction basin and main training is extremely unlikely to escape on its own.
+/// A warning is logged so the operator can abort and investigate before burning 24 h.
+const WARM_START_MIN_PRED_STD_MMR: f32 = 100.0;
 
 struct FusedProjectionEstimate {
     bytes: usize,
@@ -403,10 +420,13 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
             let warm_start_store = Arc::new(
                 train_dataset.subset_by_indices(&warm_start_indices, "warm_start".to_string()),
             );
+            // Use a small batch size so optimizer steps match the harness recipe.
+            // With 230 segments at batch 32 we get ~7 steps/epoch × 250 = ~1 750 steps,
+            // versus ~2 steps/epoch × 250 = ~500 steps at the production batch size.
             let warm_start_config = TrainingConfig::new(model_config.clone())
                 .with_learning_rate(config.learning_rate)
                 .with_epochs(WARM_START_EPOCHS)
-                .with_batch_size(training_config.batch_size);
+                .with_batch_size(WARM_START_BATCH_SIZE);
             let warm_start_output = train(
                 &mut model,
                 warm_start_store,
@@ -423,6 +443,31 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
                 duration_sec = warm_start_duration.as_secs_f64(),
                 "Warm-start phase complete; main training will use this state as a starting point"
             );
+
+            // Basin-escape check: if prediction std is still near zero the warm-start
+            // did not break out of the mean-prediction attractor. Main training on the
+            // full dataset is very unlikely to self-correct from this state.
+            // Use the actual pred_std computed by CollapseAccumulator inside
+            // compute_validation_loss — no heuristic approximation.
+            let warm_start_pred_std = warm_start_output
+                .final_validation_pred_std_mmr
+                .unwrap_or(0.0);
+            if warm_start_pred_std < WARM_START_MIN_PRED_STD_MMR {
+                warn!(
+                    pred_std_estimate_mmr = warm_start_pred_std,
+                    threshold_mmr = WARM_START_MIN_PRED_STD_MMR,
+                    "Warm-start basin-escape check FAILED: model is still predicting near the \
+                     population mean. Consider increasing WARM_START_EPOCHS, reducing \
+                     WARM_START_BATCH_SIZE, or investigating feature/label alignment before \
+                     continuing main training."
+                );
+            } else {
+                info!(
+                    pred_std_estimate_mmr = warm_start_pred_std,
+                    "Warm-start basin-escape check passed"
+                );
+            }
+
             warm_start_output.final_validation_rank_rmse
         }
     } else {

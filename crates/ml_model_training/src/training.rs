@@ -32,6 +32,11 @@ pub struct TrainingState {
     pub current_valid_loss: Option<f32>,
     /// Per-rank validation RMSE from the last validation pass (MMR units).
     pub last_validation_rank_rmse: Option<Vec<ValidationRankRmseEntry>>,
+    /// Standard deviation of predictions from the last validation pass (raw MMR units).
+    ///
+    /// Propagated into [`TrainingOutput::final_validation_pred_std_mmr`] so the
+    /// warm-start basin-escape gate can use the real computed value instead of a heuristic.
+    pub last_validation_pred_std_mmr: Option<f32>,
     /// Reference per-rank validation RMSE (MMR units) captured at the end of the
     /// warm-start phase, used as the **tail-rank guard** baseline.
     ///
@@ -61,6 +66,7 @@ impl TrainingState {
             current_train_loss: 0.0,
             current_valid_loss: None,
             last_validation_rank_rmse: None,
+            last_validation_pred_std_mmr: None,
             tail_rank_baseline: None,
         }
     }
@@ -114,6 +120,12 @@ pub struct TrainingOutput {
     /// Used by the full-pipeline warm-start phase to seed
     /// [`TrainingState::tail_rank_baseline`] for the subsequent main-training run.
     pub final_validation_rank_rmse: Option<Vec<ValidationRankRmseEntry>>,
+    /// Standard deviation of model predictions over all known validation slots (raw MMR).
+    ///
+    /// Near-zero values indicate the model is collapsed to a constant. Used by the
+    /// warm-start basin-escape gate in `full_pipeline.rs`. `None` when no validation
+    /// set is available.
+    pub final_validation_pred_std_mmr: Option<f32>,
 }
 
 /// Number of batches to prefetch ahead (keep GPU fed while loading next batches).
@@ -558,6 +570,7 @@ where
                 compute_validation_loss(&inner_model, valid_ds, &valid_batcher, config.batch_size);
             let validation_time = valid_start.elapsed();
             state.current_valid_loss = Some(validation_result.loss);
+            state.last_validation_pred_std_mmr = Some(validation_result.pred_std_mmr);
             if let Some(baseline) = state.tail_rank_baseline.as_deref() {
                 log_tail_rank_guard(baseline, &validation_result.rank_rmse_entries);
             }
@@ -596,6 +609,7 @@ where
                         epochs_completed: epoch + 1,
                         checkpoint_paths,
                         final_validation_rank_rmse: state.last_validation_rank_rmse,
+                        final_validation_pred_std_mmr: state.last_validation_pred_std_mmr,
                     });
                 }
             }
@@ -653,6 +667,7 @@ where
         epochs_completed: config.epochs,
         checkpoint_paths,
         final_validation_rank_rmse: state.last_validation_rank_rmse,
+        final_validation_pred_std_mmr: state.last_validation_pred_std_mmr,
     })
 }
 
@@ -835,17 +850,149 @@ fn log_tail_rank_guard(baseline: &[ValidationRankRmseEntry], current: &[Validati
     }
 }
 
-/// Result of one full validation pass: aggregate loss and per-rank RMSE.
+/// Result of one full validation pass: aggregate loss, per-rank RMSE, and collapse metrics.
 struct ValidationLossResult {
     /// Mean validation loss (normalized Huber / MSE-style aggregate).
     pub loss: f32,
     /// Per-rank RMSE in MMR units, ladder order.
     pub rank_rmse_entries: Vec<ValidationRankRmseEntry>,
+    /// Standard deviation of predictions over all known slots (raw MMR).
+    /// `0.0` when fewer than two known slots are available.
+    pub pred_std_mmr: f32,
+}
+
+/// Collapse-detection metrics computed over the full validation set.
+///
+/// A healthy model shows `pred_std_mmr` well above zero, `pearson_r` approaching 1,
+/// and both baseline RMSE values substantially above the model's own RMSE. When all
+/// three collapse indicators converge (pred_std ≈ 0, pearson_r ≈ 0, model RMSE ≈
+/// constant-predictor RMSE) the model is stuck at the mean.
+struct CollapseMetrics {
+    /// Standard deviation of predictions over all known slots (raw MMR).
+    pred_std_mmr: f32,
+    /// Pearson correlation between predictions and targets (known slots only).
+    pearson_r: f32,
+    /// RMSE of the naive constant predictor (predict the global target mean for every slot).
+    constant_predictor_rmse_mmr: f32,
+    /// RMSE of the per-lobby mean predictor (predict the mean of each segment's known
+    /// targets for every player in that segment). This is the toughest "dumb" baseline
+    /// the model must beat to prove it is reading per-player features.
+    lobby_mean_predictor_rmse_mmr: f32,
+}
+
+/// Gathers per-slot (pred, target) pairs and per-segment lobby data so that
+/// [`CollapseMetrics`] can be derived without an extra pass over the dataset.
+#[derive(Default)]
+struct CollapseAccumulator {
+    /// (pred_mmr, target_mmr) for every **known** slot seen during validation.
+    known_slots: Vec<(f32, f32)>,
+    /// For every segment: the mean target MMR of known slots (used for lobby-mean baseline).
+    /// Stored as (sum_sq_error_lobby_mean, count) to allow incremental accumulation.
+    lobby_sse: f64,
+    lobby_count: u64,
+}
+
+impl CollapseAccumulator {
+    fn push_batch(&mut self, raw_preds: &[f32], raw_targets: &[f32], batch_size: usize) {
+        let slots_per_segment = feature_extractor::TOTAL_PLAYERS;
+        for seg in 0..batch_size {
+            let start = seg * slots_per_segment;
+            let end = start + slots_per_segment;
+            let Some(seg_preds) = raw_preds.get(start..end) else {
+                continue;
+            };
+            let Some(seg_targets) = raw_targets.get(start..end) else {
+                continue;
+            };
+
+            // Known slots in this segment.
+            let known: Vec<(f32, f32)> = seg_preds
+                .iter()
+                .zip(seg_targets.iter())
+                .filter(|&(_, t)| *t > 0.0)
+                .map(|(&p, &t)| (p, t))
+                .collect();
+
+            // Per-segment lobby-mean target (used for the lobby-mean baseline).
+            let lobby_target_sum: f32 = known.iter().map(|(_, t)| t).sum();
+            let lobby_known_count = known.len();
+            if lobby_known_count > 0 {
+                let lobby_mean = lobby_target_sum / lobby_known_count as f32;
+                for (_, target) in &known {
+                    let err = lobby_mean - target;
+                    self.lobby_sse += (err * err) as f64;
+                }
+                self.lobby_count += lobby_known_count as u64;
+            }
+
+            self.known_slots.extend_from_slice(&known);
+        }
+    }
+
+    fn compute_metrics(&self) -> Option<CollapseMetrics> {
+        let n = self.known_slots.len();
+        if n < 2 {
+            return None;
+        }
+        let n_f = n as f64;
+
+        let sum_p: f64 = self.known_slots.iter().map(|(p, _)| *p as f64).sum();
+        let sum_t: f64 = self.known_slots.iter().map(|(_, t)| *t as f64).sum();
+        let mean_p = sum_p / n_f;
+        let mean_t = sum_t / n_f;
+
+        let var_p: f64 = self
+            .known_slots
+            .iter()
+            .map(|(p, _)| (*p as f64 - mean_p).powi(2))
+            .sum::<f64>()
+            / (n_f - 1.0);
+        let std_p = var_p.sqrt();
+
+        let cov: f64 = self
+            .known_slots
+            .iter()
+            .map(|(p, t)| (*p as f64 - mean_p) * (*t as f64 - mean_t))
+            .sum::<f64>()
+            / (n_f - 1.0);
+        let var_t: f64 = self
+            .known_slots
+            .iter()
+            .map(|(_, t)| (*t as f64 - mean_t).powi(2))
+            .sum::<f64>()
+            / (n_f - 1.0);
+        let std_t = var_t.sqrt();
+        let pearson_r = if std_p > 1e-8 && std_t > 1e-8 {
+            (cov / (std_p * std_t)).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let constant_sse: f64 = self
+            .known_slots
+            .iter()
+            .map(|(_, t)| (*t as f64 - mean_t).powi(2))
+            .sum();
+        let constant_predictor_rmse_mmr = (constant_sse / n_f).sqrt() as f32;
+
+        let lobby_mean_predictor_rmse_mmr = if self.lobby_count > 0 {
+            (self.lobby_sse / self.lobby_count as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+
+        Some(CollapseMetrics {
+            pred_std_mmr: std_p as f32,
+            pearson_r: pearson_r as f32,
+            constant_predictor_rmse_mmr,
+            lobby_mean_predictor_rmse_mmr,
+        })
+    }
 }
 
 /// Computes validation loss on a segment dataset.
 ///
-/// Also logs a per-rank-tier RMSE breakdown for diagnostics.
+/// Also logs a per-rank-tier RMSE breakdown and collapse-detection diagnostics.
 fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     model: &SequenceModel<B>,
     dataset: &Arc<SegmentStore>,
@@ -857,6 +1004,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
         return ValidationLossResult {
             loss: 0.0,
             rank_rmse_entries: Vec::new(),
+            pred_std_mmr: 0.0,
         };
     }
 
@@ -864,6 +1012,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     let mut total_samples = 0;
     let mut rank_stats: std::collections::HashMap<Rank, PerRankErrors> =
         std::collections::HashMap::new();
+    let mut collapse = CollapseAccumulator::default();
 
     let indices: Vec<usize> = (0..num_segments).collect();
 
@@ -877,6 +1026,8 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
         let Some(batch) = batcher.batch_from_indices(dataset, batch_indices) else {
             continue;
         };
+
+        let actual_batch_size = batch.targets.dims()[0];
 
         let (predictions, ordinal_logits) = model.forward_with_ordinal_scale(batch.inputs, 1.0);
 
@@ -895,6 +1046,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
             &raw_targets,
             Some(&raw_ordinal_logits),
         );
+        collapse.push_batch(&raw_preds, &raw_targets, actual_batch_size);
 
         // Mask unknown-rank slots (target == 0.0 sentinel).
         let mask = batch.targets.clone().greater_elem(0.0).float();
@@ -929,6 +1081,27 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
 
     log_per_rank_breakdown(&rank_stats);
 
+    // Log collapse-detection diagnostics after the per-rank table and extract pred_std.
+    let pred_std_mmr = if let Some(metrics) = collapse.compute_metrics() {
+        info!(
+            "  Collapse diagnostics: pred_std={:.1} MMR  pearson_r={:.4}  \
+             constant_baseline={:.1} MMR  lobby_mean_baseline={:.1} MMR",
+            metrics.pred_std_mmr,
+            metrics.pearson_r,
+            metrics.constant_predictor_rmse_mmr,
+            metrics.lobby_mean_predictor_rmse_mmr,
+        );
+        if metrics.pred_std_mmr < 50.0 {
+            warn!(
+                pred_std_mmr = metrics.pred_std_mmr,
+                "Collapse alert: prediction std < 50 MMR — model may be stuck at the population mean"
+            );
+        }
+        metrics.pred_std_mmr
+    } else {
+        0.0
+    };
+
     let rank_rmse_entries = validation_rank_rmse_entries_from_stats(&rank_stats);
 
     let loss = if total_samples > 0 {
@@ -940,6 +1113,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     ValidationLossResult {
         loss,
         rank_rmse_entries,
+        pred_std_mmr,
     }
 }
 
