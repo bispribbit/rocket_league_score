@@ -10,12 +10,14 @@ use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
 use replay_structs::{Rank, RankDivision};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::dataset::{BatchPrefetcher, SequenceBatcher};
 use crate::minibatch_loss::{LabelJitterStep, production_training_minibatch_loss};
 use crate::segment_cache::SegmentStore;
-use crate::{CheckpointValidationMetrics, ValidationRankRmseEntry, save_checkpoint};
+use crate::{
+    CheckpointValidationMetrics, ValidationRankRmseEntry, load_checkpoint, save_checkpoint,
+};
 
 /// Tracks the current state of training for resumption.
 #[derive(Debug, Clone, Default)]
@@ -147,6 +149,11 @@ const TAIL_RANK_GUARD_API_STRINGS: &[&str] = &["bronze-1", "grand-champion-3", "
 /// tail-rank guard logs a warning. `0.25` = "current tail RMSE is more than 125 % of
 /// the baseline tail RMSE".
 const TAIL_RANK_GUARD_DEGRADATION_FRACTION: f64 = 0.25;
+
+/// Maximum consecutive NaN epochs before the training loop gives up entirely.
+/// Each NaN triggers a rollback to the last good checkpoint and a fresh Adam state;
+/// if that keeps producing NaN it is a structural problem, not a transient GPU glitch.
+const NAN_MAX_RECOVERY_ATTEMPTS: usize = 3;
 
 /// Epoch at which EMA-based smurf masking kicks in, or [`None`] to disable masking.
 ///
@@ -363,6 +370,11 @@ where
 
     const EARLY_STOPPING_PATIENCE: usize = 1000;
 
+    // Tracks the last checkpoint path that was saved successfully, so NaN recovery
+    // can reload the model from that snapshot.
+    let mut last_good_checkpoint_path: Option<String> = None;
+    let mut nan_recovery_attempts: usize = 0;
+
     let valid_segments = valid_dataset.map_or(0, |ds| ds.len());
     info!(
         "Starting training: {} train segs, {} valid segs, lr={}, seq_len={}, prefetch={}",
@@ -421,6 +433,7 @@ where
         let mut time_forward_us = 0u64;
         let mut time_backward_us = 0u64;
         let mut time_optimizer_us = 0u64;
+        let mut nan_detected = false;
 
         loop {
             let t_prefetch_start = Instant::now();
@@ -456,6 +469,27 @@ where
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
             let loss = minibatch_out.loss;
+
+            // ── NaN kill-switch: check loss before backward ─────────────
+            let loss_scalar: f32 = loss
+                .clone()
+                .into_data()
+                .to_vec()
+                .unwrap_or_else(|_| vec![0.0])
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            if loss_scalar.is_nan() || loss_scalar.is_infinite() {
+                error!(
+                    batch = batch_count,
+                    epoch,
+                    "NaN/Inf loss detected — aborting epoch immediately. \
+                     This typically follows a GPU kernel failure (cubecl 'Task failed') \
+                     and poisons the Adam optimizer state beyond recovery."
+                );
+                nan_detected = true;
+                break;
+            }
 
             if smurf_masking_active_this_epoch {
                 let per_sample_loss = minibatch_out
@@ -519,6 +553,54 @@ where
             *model = optimizer.step(lr, model.clone(), grads);
             time_optimizer_us += t_optimizer_start.elapsed().as_micros() as u64;
         }
+
+        // ── NaN recovery: rollback to last checkpoint + fresh Adam state ──
+        if nan_detected {
+            nan_recovery_attempts += 1;
+            if nan_recovery_attempts > NAN_MAX_RECOVERY_ATTEMPTS {
+                error!(
+                    attempts = nan_recovery_attempts,
+                    "NaN persists after {NAN_MAX_RECOVERY_ATTEMPTS} recovery attempts — \
+                     aborting training. Check GPU health and data integrity."
+                );
+                return Err(anyhow::anyhow!(
+                    "Training aborted: NaN loss persisted after {NAN_MAX_RECOVERY_ATTEMPTS} \
+                     recovery attempts"
+                ));
+            }
+
+            if let Some(ckpt_path) = last_good_checkpoint_path.as_deref() {
+                warn!(
+                    checkpoint = ckpt_path,
+                    attempt = nan_recovery_attempts,
+                    "Rolling back to last good checkpoint and resetting Adam state"
+                );
+                match load_checkpoint::<B>(ckpt_path, &device) {
+                    Ok(recovered) => {
+                        *model = recovered;
+                        optimizer = AdamConfig::new()
+                            .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+                            .init();
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "Failed to load checkpoint for NaN recovery — aborting training"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "NaN recovery failed: could not load checkpoint '{ckpt_path}': {e}"
+                        ));
+                    }
+                }
+            }
+            error!("NaN detected but no checkpoint exists to roll back to — aborting training");
+            return Err(anyhow::anyhow!(
+                "Training aborted: NaN loss with no checkpoint available for recovery"
+            ));
+        }
+        // Epoch completed without NaN — reset the recovery counter.
+        nan_recovery_attempts = 0;
 
         // Update smurf EMA and refresh masks.
         if smurf_masking_active_this_epoch && let Some(smurf_state) = smurf_state.as_mut() {
@@ -641,6 +723,7 @@ where
                 match save_checkpoint(model, &path, config, validation_metrics) {
                     Ok(_ckpt) => {
                         info!("Saved checkpoint: {path}");
+                        last_good_checkpoint_path = Some(path.clone());
                         checkpoint_paths.push(path);
                     }
                     Err(e) => {
