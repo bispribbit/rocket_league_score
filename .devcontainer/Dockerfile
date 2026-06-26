@@ -50,7 +50,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# Rust via rustup, pinned to 1.95.0. We cannot use the official `rust:*-noble`
+# Rust via rustup, pinned to 1.96.0. We cannot use the official `rust:*-noble`
 # image as our base because we need the Kisak PPA available BEFORE installing
 # mesa-vulkan-drivers, and the ordering of the base + PPA layers matters for
 # caching. Install paths match the official Rust image so the existing
@@ -61,7 +61,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.95.0 --no-modify-path \
+        | sh -s -- -y --default-toolchain 1.96.0 --no-modify-path \
     && chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
 # Tailwind CSS CLI (matches crates/is_this_a_smurf/package.json).

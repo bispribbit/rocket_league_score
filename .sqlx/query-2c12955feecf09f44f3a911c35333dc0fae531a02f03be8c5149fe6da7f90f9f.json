@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, game_mode as \"game_mode: GameMode\", rank as \"rank: Rank\", metadata,\n                       download_status as \"download_status: DownloadStatus\", file_path, error_message,\n                       dataset_split as \"dataset_split: DatasetSplit\", created_at, updated_at\n                FROM replays\n                WHERE download_status = 'not_downloaded'\n                ORDER BY created_at\n                LIMIT $1\n                ",
+  "query": "\n        WITH coarse AS (\n            SELECT rp.replay_id,\n                   CASE\n                       WHEN rp.rank_division = 'unranked' THEN NULL\n                       WHEN rp.rank_division = 'supersonic_legend' THEN 22\n                       ELSE floor((array_position(enum_range(NULL::rank_division), rp.rank_division)::int - 2) / 4)::int + 1\n                   END AS ci\n            FROM replay_players rp\n            WHERE rp.rank_known = true\n        ),\n        mapped AS (\n            SELECT replay_id,\n                   (ARRAY[130,194,257,321,386,451,516,580,644,709,773,837,902,966,1030,1127,1258,1388,1520,1651,1782,2200])[ci] AS mmr\n            FROM coarse\n            WHERE ci IS NOT NULL\n        ),\n        per_replay AS (\n            SELECT replay_id,\n                   max(mmr) - percentile_cont(0.5) WITHIN GROUP (ORDER BY mmr) AS top_gap_mmr\n            FROM mapped\n            GROUP BY replay_id\n            HAVING count(*) >= 3\n        )\n        SELECT r.id, r.game_mode as \"game_mode: GameMode\", r.rank as \"rank: Rank\", r.metadata,\n               r.download_status as \"download_status: DownloadStatus\", r.file_path, r.error_message,\n               r.dataset_split as \"dataset_split: DatasetSplit\", r.created_at, r.updated_at\n        FROM per_replay\n        JOIN replays r ON r.id = per_replay.replay_id\n        WHERE per_replay.top_gap_mmr >= $1\n          AND r.download_status = 'not_downloaded'\n        ORDER BY r.created_at\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -201,6 +201,7 @@
     ],
     "parameters": {
       "Left": [
+        "Float8",
         "Int8"
       ]
     },
@@ -217,5 +218,5 @@
       false
     ]
   },
-  "hash": "c4cce88eda81672a18631c6b8a4aaa1bfa3864a4fde792ace1565fbdab309673"
+  "hash": "2c12955feecf09f44f3a911c35333dc0fae531a02f03be8c5149fe6da7f90f9f"
 }

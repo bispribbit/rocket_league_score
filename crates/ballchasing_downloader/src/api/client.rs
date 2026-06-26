@@ -74,7 +74,7 @@ fn parse_retry_after_http_header(response: &reqwest::Response) -> Option<Duratio
 ///
 /// The API `next` link may include an empty `max-rank=` query pair; appending
 /// `&max-rank=...` would duplicate the parameter and confuse servers.
-fn next_replay_list_url_with_max_rank(next_url: &str, max_rank: &str) -> Result<String> {
+pub fn next_replay_list_url_with_max_rank(next_url: &str, max_rank: &str) -> Result<String> {
     let mut url = Url::parse(next_url).context("Failed to parse ballchasing pagination URL")?;
     let pairs: Vec<(String, String)> = url
         .query_pairs()
@@ -200,6 +200,43 @@ impl BallchasingClient {
         );
 
         self.fetch_replay_list(&url).await
+    }
+
+    /// Lists replays for an explicit `[min_rank, max_rank]` band, using tier-level
+    /// API rank strings (e.g. `"gold-1"` … `"champion-3"`).
+    ///
+    /// Unlike [`Self::list_replays`] (which forces `max-rank = min-rank + 4`), this
+    /// lets callers scan a wide band to surface mixed-rank / party lobbies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
+    pub async fn list_replays_in_band(
+        &self,
+        playlist: GameMode,
+        min_rank: &str,
+        max_rank: &str,
+        count: usize,
+    ) -> Result<ReplayListResponse> {
+        let playlist_str = playlist.as_api_string();
+        let count = count.min(200);
+        let url = format!(
+            "{API_BASE_URL}/replays?playlist={playlist_str}&min-rank={min_rank}&max-rank={max_rank}&count={count}&sort-by=created&sort-dir=desc"
+        );
+        self.fetch_replay_list(&url).await
+    }
+
+    /// Fetches one page of replay summaries from a pagination URL (the `next`
+    /// link of a previous [`ReplayListResponse`]).
+    ///
+    /// Callers should pass the link through [`next_replay_list_url_with_max_rank`]
+    /// first to restore the `max-rank` filter the API drops from its `next` links.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
+    pub async fn fetch_replay_list_page(&self, url: &str) -> Result<ReplayListResponse> {
+        self.fetch_replay_list(url).await
     }
 
     /// Fetches a replay list from a URL (used for initial request and pagination).

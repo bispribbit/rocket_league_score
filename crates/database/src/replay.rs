@@ -598,6 +598,140 @@ pub async fn list_downloaded_replays() -> Result<Vec<Replay>, sqlx::Error> {
     .await
 }
 
+/// A downloaded replay whose rank-known players span a wide skill range
+/// (a real, physically-coherent mixed-rank / party lobby).
+#[derive(Debug, Clone)]
+pub struct MixedRankReplay {
+    /// Replay identifier.
+    pub id: Uuid,
+    /// Object-store file path of the replay.
+    pub file_path: String,
+    /// Dataset split (training / evaluation), if assigned.
+    pub dataset_split: Option<DatasetSplit>,
+    /// Gap in MMR between the top rank-known player and the lobby median
+    /// (`max - median`), using coarse-rank canonical MMR.
+    pub top_gap_mmr: f64,
+    /// Number of rank-known players in the lobby.
+    pub known_players: i64,
+}
+
+/// Lists downloaded replays that contain a lone high-skill outlier: the top
+/// rank-known player sits at least `min_top_gap_mmr` MMR above the lobby median.
+///
+/// This is the only physically coherent source of supervised smurf-style contrast
+/// (a correctly-labelled high player among lower-ranked lobbymates, e.g. a party).
+/// Coarse-rank canonical MMR is mapped in SQL (Bronze-1=130 … SSL=2200) so the
+/// threshold is interpretable in MMR units. Only replays with at least three
+/// rank-known players are considered so a median is meaningful.
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn list_mixed_rank_replays(
+    min_top_gap_mmr: f64,
+) -> Result<Vec<MixedRankReplay>, sqlx::Error> {
+    let pool = get_pool();
+    sqlx::query_as!(
+        MixedRankReplay,
+        r#"
+        WITH coarse AS (
+            SELECT rp.replay_id,
+                   CASE
+                       WHEN rp.rank_division = 'unranked' THEN NULL
+                       WHEN rp.rank_division = 'supersonic_legend' THEN 22
+                       ELSE floor((array_position(enum_range(NULL::rank_division), rp.rank_division)::int - 2) / 4)::int + 1
+                   END AS ci
+            FROM replay_players rp
+            WHERE rp.rank_known = true
+        ),
+        mapped AS (
+            SELECT replay_id,
+                   (ARRAY[130,194,257,321,386,451,516,580,644,709,773,837,902,966,1030,1127,1258,1388,1520,1651,1782,2200])[ci] AS mmr
+            FROM coarse
+            WHERE ci IS NOT NULL
+        ),
+        per_replay AS (
+            SELECT replay_id,
+                   count(*) AS known_players,
+                   max(mmr) - percentile_cont(0.5) WITHIN GROUP (ORDER BY mmr) AS top_gap_mmr
+            FROM mapped
+            GROUP BY replay_id
+            HAVING count(*) >= 3
+        )
+        SELECT r.id AS "id!",
+               r.file_path AS "file_path!",
+               r.dataset_split AS "dataset_split: DatasetSplit",
+               per_replay.top_gap_mmr AS "top_gap_mmr!",
+               per_replay.known_players AS "known_players!"
+        FROM per_replay
+        JOIN replays r ON r.id = per_replay.replay_id
+        WHERE per_replay.top_gap_mmr >= $1
+          AND r.download_status = 'downloaded'
+        ORDER BY per_replay.top_gap_mmr DESC
+        "#,
+        min_top_gap_mmr
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Lists mixed-rank replays (top player ≥ `min_top_gap_mmr` above the lobby
+/// median) that still need downloading (status `not_downloaded`).
+///
+/// Uses the same coarse-rank canonical MMR metric as [`list_mixed_rank_replays`]
+/// so the fetch pipeline and the spot-check agree on which replays are "mixed".
+///
+/// # Errors
+///
+/// Returns an error if the database query fails.
+pub async fn list_pending_mixed_rank_replays(
+    min_top_gap_mmr: f64,
+    limit: i64,
+) -> Result<Vec<Replay>, sqlx::Error> {
+    let pool = get_pool();
+    sqlx::query_as!(
+        Replay,
+        r#"
+        WITH coarse AS (
+            SELECT rp.replay_id,
+                   CASE
+                       WHEN rp.rank_division = 'unranked' THEN NULL
+                       WHEN rp.rank_division = 'supersonic_legend' THEN 22
+                       ELSE floor((array_position(enum_range(NULL::rank_division), rp.rank_division)::int - 2) / 4)::int + 1
+                   END AS ci
+            FROM replay_players rp
+            WHERE rp.rank_known = true
+        ),
+        mapped AS (
+            SELECT replay_id,
+                   (ARRAY[130,194,257,321,386,451,516,580,644,709,773,837,902,966,1030,1127,1258,1388,1520,1651,1782,2200])[ci] AS mmr
+            FROM coarse
+            WHERE ci IS NOT NULL
+        ),
+        per_replay AS (
+            SELECT replay_id,
+                   max(mmr) - percentile_cont(0.5) WITHIN GROUP (ORDER BY mmr) AS top_gap_mmr
+            FROM mapped
+            GROUP BY replay_id
+            HAVING count(*) >= 3
+        )
+        SELECT r.id, r.game_mode as "game_mode: GameMode", r.rank as "rank: Rank", r.metadata,
+               r.download_status as "download_status: DownloadStatus", r.file_path, r.error_message,
+               r.dataset_split as "dataset_split: DatasetSplit", r.created_at, r.updated_at
+        FROM per_replay
+        JOIN replays r ON r.id = per_replay.replay_id
+        WHERE per_replay.top_gap_mmr >= $1
+          AND r.download_status = 'not_downloaded'
+        ORDER BY r.created_at
+        LIMIT $2
+        "#,
+        min_top_gap_mmr,
+        limit
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Updates the dataset split for a specific replay.
 ///
 /// # Errors

@@ -8,6 +8,10 @@ license.workspace = true
 name = "bundle_importer"
 path = "src/bin/bundle_importer.rs"
 
+[[bin]]
+name = "fetch_mixed_rank"
+path = "src/bin/fetch_mixed_rank.rs"
+
 [lints]
 workspace = true
 

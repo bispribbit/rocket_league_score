@@ -13,9 +13,11 @@
 pub mod api;
 pub mod bundle;
 mod downloader;
+pub mod mixed_rank_fetch;
 mod players;
 
 pub use api::client::BallchasingClient;
 pub use bundle::import_bundle;
 pub use config::Config;
 pub use downloader::run;
+pub use mixed_rank_fetch::{MixedRankFetchConfig, run as run_mixed_rank_fetch};

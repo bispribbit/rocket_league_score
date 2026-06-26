@@ -17,6 +17,17 @@ use replay_structs::{Rank, RankDivision};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// Within-lobby top-gap (highest known MMR minus the median known MMR, in MMR) at or
+/// above which a segment is treated as a "mixed-rank" / smurf-bearing lobby and
+/// oversampled during training. Mirrors the acquisition criterion used by the
+/// mixed-rank fetch pipeline so the fetched lobbies are the ones that get boosted.
+const MIXED_TOP_GAP_THRESHOLD_MMR: f32 = 150.0;
+
+/// Extra repeat factor applied to mixed-rank segments on top of the rare-rank
+/// oversampling factor. Pushes the model to learn within-lobby skill spread
+/// (the smurf signal) instead of collapsing to the lobby mean.
+const MIXED_OVERSAMPLE_FACTOR: usize = 5;
+
 /// Information about a cached segment file.
 #[derive(Debug, Clone)]
 pub struct SegmentFileInfo {
@@ -481,17 +492,35 @@ impl SegmentStore {
             })
             .collect();
 
+        // Count mixed-rank segments so the boost is observable in logs.
+        let mut mixed_segment_count = 0usize;
+
         let mut indices: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
             .flat_map(|(idx, entry)| {
-                let factor = *repeat_factor
+                let rank_factor = *repeat_factor
                     .get(entry.primary_rank_index as usize)
                     .unwrap_or(&1);
-                std::iter::repeat_n(idx, factor)
+                let mixed_factor =
+                    if segment_top_gap_mmr(&entry.target_mmr) >= MIXED_TOP_GAP_THRESHOLD_MMR {
+                        mixed_segment_count += 1;
+                        MIXED_OVERSAMPLE_FACTOR
+                    } else {
+                        1
+                    };
+                std::iter::repeat_n(idx, rank_factor * mixed_factor)
             })
             .collect();
+
+        debug!(
+            mixed_segment_count,
+            mixed_top_gap_threshold_mmr = MIXED_TOP_GAP_THRESHOLD_MMR,
+            mixed_oversample_factor = MIXED_OVERSAMPLE_FACTOR,
+            total_indices = indices.len(),
+            "Built oversampled epoch indices (rare-rank + mixed-lobby boost)"
+        );
 
         shuffle_indices_lcg(&mut indices, seed);
         indices
@@ -838,6 +867,29 @@ impl SegmentStoreBuilder {
 // =============================================================================
 
 /// Derives the primary rank index from the mean of known (non-zero) player MMR targets.
+/// Within-lobby top-gap for a segment: highest known MMR minus the median known MMR.
+///
+/// Unknown players are encoded as `0.0` in `target_mmr` and excluded. Returns `0.0`
+/// when fewer than two players are rank-known (no spread can be measured).
+fn segment_top_gap_mmr(target_mmr: &[f32; TOTAL_PLAYERS]) -> f32 {
+    let mut known: Vec<f32> = target_mmr.iter().copied().filter(|&v| v > 0.0).collect();
+    if known.len() < 2 {
+        return 0.0;
+    }
+    known.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let max = known.last().copied().unwrap_or(0.0);
+    let mid = known.len() / 2;
+    let median = if known.len().is_multiple_of(2) {
+        f32::midpoint(
+            known.get(mid - 1).copied().unwrap_or(0.0),
+            known.get(mid).copied().unwrap_or(0.0),
+        )
+    } else {
+        known.get(mid).copied().unwrap_or(0.0)
+    };
+    max - median
+}
+
 fn primary_rank_index_from_mmr_array(target_mmr: &[f32; TOTAL_PLAYERS]) -> u8 {
     let known: Vec<f32> = target_mmr.iter().copied().filter(|&v| v > 0.0).collect();
     if known.is_empty() {
@@ -897,5 +949,53 @@ mod tests {
         assert_eq!(parse_frame_range("150-300"), Some((150, 300)));
         assert_eq!(parse_frame_range("invalid"), None);
         assert_eq!(parse_frame_range("abc-def"), None);
+    }
+
+    #[test]
+    fn test_segment_top_gap_mmr() {
+        // Single known player: cannot measure spread.
+        assert_eq!(segment_top_gap_mmr(&[600.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 0.0);
+        // Flat lobby: all six players at the same MMR -> no gap.
+        assert_eq!(
+            segment_top_gap_mmr(&[600.0, 600.0, 600.0, 600.0, 600.0, 600.0]),
+            0.0
+        );
+        // One outlier well above the rest: gap = max - median.
+        // known sorted = [500, 500, 500, 500, 500, 1000], median = 500.
+        assert_eq!(
+            segment_top_gap_mmr(&[1000.0, 500.0, 500.0, 500.0, 500.0, 500.0]),
+            500.0
+        );
+    }
+
+    fn store_with_targets(targets: &[[f32; TOTAL_PLAYERS]]) -> SegmentStore {
+        let mut store = SegmentStore::new("test".to_string(), 300);
+        for target in targets {
+            store.entries.push(SegmentEntry {
+                path: PathBuf::from("unused-in-test"),
+                target_mmr: *target,
+                primary_rank_index: primary_rank_index_from_mmr_array(target),
+            });
+        }
+        store
+    }
+
+    #[test]
+    fn test_mixed_lobby_oversampling() {
+        // Same rank index for both so rare-rank oversampling stays at 1x and we
+        // isolate the mixed-lobby boost.
+        let flat = [600.0, 600.0, 600.0, 600.0, 600.0, 600.0];
+        let mixed = [1100.0, 600.0, 600.0, 600.0, 600.0, 600.0];
+        let store = store_with_targets(&[flat, mixed]);
+
+        let indices = store.build_oversampled_indices(0);
+        let flat_copies = indices.iter().filter(|&&i| i == 0).count();
+        let mixed_copies = indices.iter().filter(|&&i| i == 1).count();
+
+        assert_eq!(flat_copies, 1, "flat lobby should not be oversampled");
+        assert_eq!(
+            mixed_copies, MIXED_OVERSAMPLE_FACTOR,
+            "mixed lobby should be oversampled by MIXED_OVERSAMPLE_FACTOR"
+        );
     }
 }

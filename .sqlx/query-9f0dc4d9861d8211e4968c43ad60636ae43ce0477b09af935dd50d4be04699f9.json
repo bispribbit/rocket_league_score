@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH coarse AS (\n            SELECT rp.replay_id,\n                   CASE\n                       WHEN rp.rank_division = 'unranked' THEN NULL\n                       WHEN rp.rank_division = 'supersonic_legend' THEN 22\n                       ELSE floor((array_position(enum_range(NULL::rank_division), rp.rank_division)::int - 2) / 4)::int + 1\n                   END AS ci\n            FROM replay_players rp\n            WHERE rp.rank_known = true\n        ),\n        mapped AS (\n            SELECT replay_id,\n                   (ARRAY[130,194,257,321,386,451,516,580,644,709,773,837,902,966,1030,1127,1258,1388,1520,1651,1782,2200])[ci] AS mmr\n            FROM coarse\n            WHERE ci IS NOT NULL\n        ),\n        per_replay AS (\n            SELECT replay_id,\n                   count(*) AS known_players,\n                   max(mmr) - percentile_cont(0.5) WITHIN GROUP (ORDER BY mmr) AS top_gap_mmr\n            FROM mapped\n            GROUP BY replay_id\n            HAVING count(*) >= 3\n        )\n        SELECT r.id AS \"id!\",\n               r.file_path AS \"file_path!\",\n               r.dataset_split AS \"dataset_split: DatasetSplit\",\n               per_replay.top_gap_mmr AS \"top_gap_mmr!\",\n               per_replay.known_players AS \"known_players!\"\n        FROM per_replay\n        JOIN replays r ON r.id = per_replay.replay_id\n        WHERE per_replay.top_gap_mmr >= $1\n          AND r.download_status = 'downloaded'\n        ORDER BY per_replay.top_gap_mmr DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "replays",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "file_path!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "replays",
+            "name": "file_path"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "dataset_split: DatasetSplit",
+        "type_info": {
+          "Custom": {
+            "name": "dataset_split",
+            "kind": {
+              "Enum": [
+                "training",
+                "evaluation"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "replays",
+            "name": "dataset_split"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "top_gap_mmr!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "known_players!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "9f0dc4d9861d8211e4968c43ad60636ae43ce0477b09af935dd50d4be04699f9"
+}

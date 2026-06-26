@@ -47,6 +47,18 @@ pub struct TrainingState {
     /// if they degrade by more than [`TAIL_RANK_GUARD_DEGRADATION_FRACTION`]. The guard
     /// is monitoring-only: it does **not** stop training or revert the model.
     pub tail_rank_baseline: Option<Vec<ValidationRankRmseEntry>>,
+    /// Highest validation prediction spread (`pred_std_mmr`) recorded at the last
+    /// collapse-progress reset. A meaningful rise here (or in [`Self::best_pearson_r`])
+    /// is the "more high/low-end predictions" signal the smart cutoff treats as "still
+    /// improving".
+    pub best_pred_std_mmr: f32,
+    /// Highest validation Pearson correlation recorded at the last collapse-progress reset.
+    pub best_pearson_r: f32,
+    /// Validation passes since the last collapse-progress gain (spread or correlation).
+    pub epochs_without_collapse_progress: usize,
+    /// When `true`, the collapse-aware smart cutoff is armed. Set only for the main
+    /// training run so it never truncates the warm-start escape phase or ad-hoc callers.
+    pub collapse_cutoff_enabled: bool,
 }
 
 fn checkpoint_validation_metrics_from_state(
@@ -70,6 +82,10 @@ impl TrainingState {
             last_validation_rank_rmse: None,
             last_validation_pred_std_mmr: None,
             tail_rank_baseline: None,
+            best_pred_std_mmr: 0.0,
+            best_pearson_r: -1.0,
+            epochs_without_collapse_progress: 0,
+            collapse_cutoff_enabled: false,
         }
     }
 }
@@ -167,6 +183,32 @@ const SMURF_MASK_START_EPOCH: Option<usize> = None;
 const SMURF_MASK_SUSTAIN_EPOCHS: usize = 3;
 /// EMA decay factor for per-segment loss tracking (α for new value).
 const SMURF_EMA_ALPHA: f32 = 0.3;
+
+// --- Smart collapse-aware cutoff -------------------------------------------------
+// Only armed for the main training run (see [`TrainingState::collapse_cutoff_enabled`]),
+// never for warm-start or ad-hoc callers. The cutoff treats a rise in prediction
+// **spread** (`pred_std_mmr`) OR rank **correlation** (`pearson_r`) as "still
+// improving" — the same "more high/low-end predictions" signal that is visible even
+// while the model is otherwise overfitting — and only aborts a run that is BOTH stuck
+// (no such gain for a while) AND still clearly collapsed (low spread and low
+// correlation), and never before the grace period.
+
+/// No cutoff can fire before this many epochs, giving the model room to climb out of
+/// the mean-collapse basin (row-16 escapes were seen around epoch 45).
+const COLLAPSE_CUTOFF_GRACE_EPOCHS: usize = 80;
+/// Validation passes without a spread/correlation gain before the cutoff fires.
+const COLLAPSE_CUTOFF_PATIENCE: usize = 40;
+/// At/above this prediction spread the model is showing real discrimination and is
+/// never cut (a healthy run reaches ~400 MMR spread; 150 is well clear of collapse).
+const COLLAPSE_CUTOFF_PRED_STD_MMR: f32 = 150.0;
+/// ...and at/above this rank correlation the model is learning to order players and is
+/// never cut. Both the spread and correlation guards must indicate collapse to fire.
+const COLLAPSE_CUTOFF_MAX_PEARSON_R: f32 = 0.30;
+/// Minimum rise in prediction spread (MMR) that counts as progress. Small enough that
+/// a slow, steady widening keeps resetting the patience counter.
+const COLLAPSE_PROGRESS_MIN_STD_GAIN_MMR: f32 = 5.0;
+/// Minimum rise in Pearson correlation that counts as progress.
+const COLLAPSE_PROGRESS_MIN_PEARSON_GAIN: f32 = 0.01;
 
 /// Per-segment smurf-masking state.
 #[derive(Default)]
@@ -658,6 +700,67 @@ where
             }
             state.last_validation_rank_rmse = Some(validation_result.rank_rmse_entries);
 
+            // Smart collapse-aware cutoff (main training only). Progress = a rise in
+            // prediction spread OR rank correlation; either keeps the run alive. We only
+            // abort a run that is both stuck and still clearly collapsed, after a grace
+            // period, so a slow-but-widening model is never cut short.
+            if state.collapse_cutoff_enabled {
+                let std_gain = validation_result.pred_std_mmr - state.best_pred_std_mmr;
+                let pearson_gain = validation_result.pearson_r - state.best_pearson_r;
+                let made_progress = std_gain >= COLLAPSE_PROGRESS_MIN_STD_GAIN_MMR
+                    || pearson_gain >= COLLAPSE_PROGRESS_MIN_PEARSON_GAIN;
+                if made_progress {
+                    state.epochs_without_collapse_progress = 0;
+                    state.best_pred_std_mmr =
+                        state.best_pred_std_mmr.max(validation_result.pred_std_mmr);
+                    state.best_pearson_r = state.best_pearson_r.max(validation_result.pearson_r);
+                } else {
+                    state.epochs_without_collapse_progress += 1;
+                }
+
+                let still_collapsed = validation_result.pred_std_mmr < COLLAPSE_CUTOFF_PRED_STD_MMR
+                    && validation_result.pearson_r < COLLAPSE_CUTOFF_MAX_PEARSON_R;
+                if epoch >= COLLAPSE_CUTOFF_GRACE_EPOCHS
+                    && state.epochs_without_collapse_progress >= COLLAPSE_CUTOFF_PATIENCE
+                    && still_collapsed
+                {
+                    log_progress(
+                        epoch + 1,
+                        state.current_train_loss,
+                        state.current_valid_loss,
+                    );
+                    warn!(
+                        epoch = epoch + 1,
+                        pred_std_mmr = validation_result.pred_std_mmr,
+                        best_pred_std_mmr = state.best_pred_std_mmr,
+                        pearson_r = validation_result.pearson_r,
+                        passes_without_progress = state.epochs_without_collapse_progress,
+                        "Smart cutoff: model is stuck in a low-spread (mean-collapse) regime — \
+                         no gain in prediction spread or rank correlation for \
+                         {COLLAPSE_CUTOFF_PATIENCE} validation passes. Stopping early."
+                    );
+
+                    if let Some(ckpt_cfg) = &checkpoint_config {
+                        let path = format!("{}_final", ckpt_cfg.path_prefix);
+                        let validation_metrics = checkpoint_validation_metrics_from_state(&state);
+                        if let Ok(_ckpt) = save_checkpoint(model, &path, config, validation_metrics)
+                        {
+                            info!("Saved final checkpoint: {path}");
+                            checkpoint_paths.push(path);
+                        }
+                    }
+
+                    return Ok(TrainingOutput {
+                        final_train_loss: state.current_train_loss,
+                        final_valid_loss: state.current_valid_loss,
+                        epochs_completed: epoch + 1,
+                        checkpoint_paths,
+                        final_validation_rank_rmse: state.last_validation_rank_rmse,
+                        final_validation_pred_std_mmr: state.last_validation_pred_std_mmr,
+                    });
+                }
+            }
+
             // Early stopping check
             if validation_result.loss < state.best_valid_loss {
                 state.best_valid_loss = validation_result.loss;
@@ -853,8 +956,9 @@ fn accumulate_per_rank_errors(
 
 fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>) {
     info!(
-        "  Validation RMSE by rank (reg = regression head; ord = ordinal head; \
-         p=predicted count, v=valid count):"
+        "  Validation RMSE by rank  \
+         (n=label count, reg=regression head, ord=ordinal head; \
+         p=predicted into bucket, v=correct, acc=v/n %):"
     );
     for rank in Rank::all_ranked() {
         let Some(entry) = stats.get(&rank) else {
@@ -866,14 +970,29 @@ fn log_per_rank_breakdown(stats: &std::collections::HashMap<Rank, PerRankErrors>
         {
             continue;
         }
+        let reg_acc = if entry.target_count > 0 {
+            100.0 * entry.correct_count as f64 / entry.target_count as f64
+        } else {
+            0.0
+        };
+        let ord_acc = if entry.target_count > 0 {
+            100.0 * entry.ordinal_correct_count as f64 / entry.target_count as f64
+        } else {
+            0.0
+        };
         info!(
-            "    {:<20} {:>7.1} MMR RMSE  reg(p={:>6}, v={:>6})  ord(p={:>6}, v={:>6})",
+            "    {:<20} {:>7.1} MMR  n={:>6}  \
+             reg(p={:>6}, v={:>6}, acc={:>5.1}%)  \
+             ord(p={:>6}, v={:>6}, acc={:>5.1}%)",
             rank.as_api_string(),
             entry.rmse(),
+            entry.target_count,
             entry.predicted_count,
             entry.correct_count,
+            reg_acc,
             entry.ordinal_predicted_count,
             entry.ordinal_correct_count,
+            ord_acc,
         );
     }
 }
@@ -942,6 +1061,9 @@ struct ValidationLossResult {
     /// Standard deviation of predictions over all known slots (raw MMR).
     /// `0.0` when fewer than two known slots are available.
     pub pred_std_mmr: f32,
+    /// Pearson correlation between predictions and targets over known slots.
+    /// `0.0` when it cannot be computed (degenerate variance / too few slots).
+    pub pearson_r: f32,
 }
 
 /// Collapse-detection metrics computed over the full validation set.
@@ -1088,6 +1210,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
             loss: 0.0,
             rank_rmse_entries: Vec::new(),
             pred_std_mmr: 0.0,
+            pearson_r: 0.0,
         };
     }
 
@@ -1164,8 +1287,9 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
 
     log_per_rank_breakdown(&rank_stats);
 
-    // Log collapse-detection diagnostics after the per-rank table and extract pred_std.
-    let pred_std_mmr = if let Some(metrics) = collapse.compute_metrics() {
+    // Log collapse-detection diagnostics after the per-rank table and extract
+    // pred_std + pearson_r (both feed the smart collapse-aware cutoff).
+    let (pred_std_mmr, pearson_r) = if let Some(metrics) = collapse.compute_metrics() {
         info!(
             "  Collapse diagnostics: pred_std={:.1} MMR  pearson_r={:.4}  \
              constant_baseline={:.1} MMR  lobby_mean_baseline={:.1} MMR",
@@ -1180,9 +1304,9 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
                 "Collapse alert: prediction std < 50 MMR — model may be stuck at the population mean"
             );
         }
-        metrics.pred_std_mmr
+        (metrics.pred_std_mmr, metrics.pearson_r)
     } else {
-        0.0
+        (0.0, 0.0)
     };
 
     let rank_rmse_entries = validation_rank_rmse_entries_from_stats(&rank_stats);
@@ -1197,6 +1321,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
         loss,
         rank_rmse_entries,
         pred_std_mmr,
+        pearson_r,
     }
 }
 

@@ -57,10 +57,10 @@ const WARM_START_SEGMENTS_PER_RANK: usize = 10;
 /// Warm-start config: number of epochs to run on the balanced mini-set before
 /// continuing with the full dataset.
 ///
-/// The harness needed ~250 epochs at T3 to lift SSL out of the mean basin; we mirror
+/// The harness needed ~500 epochs at T3 to lift SSL out of the mean basin; we mirror
 /// that here so the model is no longer a constant-predictor when main training
 /// inherits the weights.
-const WARM_START_EPOCHS: usize = 250;
+const WARM_START_EPOCHS: usize = 500;
 
 /// Batch size used **only** during the warm-start phase.
 ///
@@ -494,6 +494,10 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         );
     }
     main_training_state.tail_rank_baseline = warm_start_baseline;
+    // Arm the smart collapse-aware cutoff for the main run only (never warm-start):
+    // it stops early if the model stays stuck at the mean without widening its
+    // prediction spread or improving rank correlation.
+    main_training_state.collapse_cutoff_enabled = true;
 
     let output = train(
         &mut model,
