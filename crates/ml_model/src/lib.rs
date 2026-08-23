@@ -43,6 +43,19 @@ use fused_lstm::{FusedLstm, FusedLstmBackend, FusedLstmConfig};
 /// at the normalisation boundary.
 pub const MMR_SCALE: f32 = 2500.0;
 
+/// MMR a player's prediction must exceed their lobby's median prediction by before the
+/// product flags them as a smurf suspect.
+///
+/// This is the single definition of the shipped decision rule. It is deliberately shared
+/// rather than restated per crate so that the app's verdict, the `smurf_spotcheck`
+/// evaluation, and the in-training validation metrics can never disagree about what
+/// "detected" means — a disagreement that would silently invalidate every comparison
+/// between them.
+///
+/// The threshold is a rough hand-set value, not a calibrated one; see `docs/experiment.md`
+/// for the plan to replace it with a percentile fitted on held-out mixed lobbies.
+pub const SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR: f32 = 200.0;
+
 /// Output scale for the lobby-level bias in raw MMR units.
 ///
 /// The `lobby_bias_head` is otherwise free to match any per-game mean from a

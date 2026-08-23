@@ -25,7 +25,7 @@ use burn::backend::ndarray::NdArrayDevice;
 use clap::Parser;
 use config::OBJECT_STORE;
 use database::{initialize_pool, list_mixed_rank_replays, list_replay_players_by_replay};
-use feature_extractor::TOTAL_PLAYERS;
+use feature_extractor::{PlayerRoster, TOTAL_PLAYERS};
 use ml_model::{SequenceModel, predict_player_centric_per_segment};
 use ml_model_training::load_checkpoint;
 use object_store::ObjectStoreExt;
@@ -38,9 +38,10 @@ use tracing_subscriber::EnvFilter;
 // lacking subgroup/"plane" instructions) and is plenty fast for ~100 lobbies.
 type InferenceBackend = NdArray;
 
-/// MMR a player's prediction must exceed the lobby median by to be flagged
-/// (mirrors `is_this_a_smurf::SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN`).
-const SMURF_THRESHOLD_MMR: f32 = 200.0;
+/// MMR a player's prediction must exceed the lobby median by to be flagged.
+///
+/// Aliases the shipped rule so this spot-check and the app can never diverge.
+const SMURF_THRESHOLD_MMR: f32 = ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR;
 
 #[derive(Parser, Debug)]
 #[command(name = "smurf_spotcheck")]
@@ -72,7 +73,8 @@ struct Args {
 struct Tally {
     lobbies: usize,
     detected: usize,
-    top1: usize,
+    /// Sum of fractional top-1 credit (1.0 for an outright hit, 1/k for a k-way tie).
+    top1_credit_sum: f64,
     margin_sum: f64,
 }
 
@@ -175,17 +177,12 @@ async fn main() -> Result<()> {
             *slot_pred = median(&mut across_segments);
         }
 
-        let player_names: Vec<String> = parsed
-            .frames
-            .first()
-            .map(|frame| {
-                frame
-                    .players
-                    .iter()
-                    .map(|p| p.name.as_ref().clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Slot mapping must come from the same roster the prediction path builds, not from
+        // frame 0. The parser sorts each frame's players by (team, name) so frame 0 usually
+        // agrees — but only when all six players are present in it. `PlayerRoster::from_frames`
+        // unions names across every frame, exactly as `predict_player_centric_per_segment`
+        // does, so a late spawn cannot shift `slot_preds` out from under `high_slot`.
+        let player_names: Vec<String> = PlayerRoster::from_frames(&parsed.frames).names.to_vec();
 
         let db_players = list_replay_players_by_replay(candidate.id).await?;
 
@@ -215,12 +212,25 @@ async fn main() -> Result<()> {
         let margin = high_pred - lobby_median;
         let detected = high_pred > lobby_median + SMURF_THRESHOLD_MMR;
 
-        let argmax_slot = slot_preds
+        // Fractional credit when predictions tie at the top.
+        //
+        // `max_by` returns the LAST maximum, so a collapsed model — every slot identical —
+        // always picked slot 5 and scored `high_slot == 5`. That measures "how often is the
+        // outlier the alphabetically-last orange player", not chance, and it is exactly the
+        // model behaviour this tool exists to detect. Splitting the credit across tied slots
+        // makes a fully collapsed model score 1/6, i.e. chance.
+        let best_pred = slot_preds.iter().copied().fold(f32::MIN, f32::max);
+        let tied_at_top = slot_preds
             .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map_or(high_slot, |(idx, _)| idx);
-        let top1 = argmax_slot == high_slot;
+            .filter(|pred| (**pred - best_pred).abs() < f32::EPSILON)
+            .count()
+            .max(1);
+        let top1_credit = if (high_pred - best_pred).abs() < f32::EPSILON {
+            1.0 / tied_at_top as f64
+        } else {
+            0.0
+        };
+        let top1 = top1_credit >= 1.0;
 
         let split_label = candidate
             .dataset_split
@@ -236,13 +246,19 @@ async fn main() -> Result<()> {
             lobby_median,
             margin,
             if detected { "YES" } else { "no" },
-            if top1 { "YES" } else { "no" },
+            if top1 {
+                "YES"
+            } else if top1_credit > 0.0 {
+                "tie"
+            } else {
+                "no"
+            },
         );
 
         for tally in [&mut overall, by_split.entry(split_label).or_default()] {
             tally.lobbies += 1;
             tally.detected += usize::from(detected);
-            tally.top1 += usize::from(top1);
+            tally.top1_credit_sum += top1_credit;
             tally.margin_sum += margin as f64;
         }
     }
@@ -268,11 +284,15 @@ fn print_summary(label: &str, tally: &Tally) {
         return;
     }
     let n = tally.lobbies as f64;
+    // Chance for picking the outlier out of a full lobby, printed so a result is readable
+    // without doing the arithmetic — row 15's 13–18 % was chance, not signal.
+    let chance_rate = 100.0 / TOTAL_PLAYERS as f64;
     println!(
-        "\n[{label}] lobbies={}  detection_rate={:.1}%  top1_rate={:.1}%  mean_margin={:.0} MMR",
+        "\n[{label}] lobbies={}  detection_rate={:.1}%  top1_rate={:.1}% (chance {:.1}%)  mean_margin={:.0} MMR",
         tally.lobbies,
         100.0 * tally.detected as f64 / n,
-        100.0 * tally.top1 as f64 / n,
+        100.0 * tally.top1_credit_sum / n,
+        chance_rate,
         tally.margin_sum / n,
     );
 }

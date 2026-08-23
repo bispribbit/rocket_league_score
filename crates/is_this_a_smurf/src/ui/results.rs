@@ -7,7 +7,7 @@ use replay_structs::{Team, UnsupportedReplayMatch};
 
 use crate::app_state::{AppState, PlayerAverage, PredictionResults, ProgressState};
 use crate::branding::SMURF_SUSPECT_BADGE;
-use crate::prediction::{SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN, lobby_median_mmr};
+use crate::prediction::lobby_median_mmr;
 use crate::rank_icon::rank_division_icon_asset;
 use crate::verdict_copy::VerdictSegment;
 
@@ -25,7 +25,7 @@ const PREDICTED_RANK_ROAST_LABELS: [&str; 10] = [
 ];
 
 fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
-    player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
+    player_mmr > lobby_median_mmr + ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR
 }
 
 fn predicted_rank_roast_label() -> &'static str {

@@ -9,9 +9,6 @@ use crate::app_state::{
     StepStatus,
 };
 
-/// MMR above the lobby median before we treat a player as a smurf suspect (approximate).
-pub(crate) const SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN: f32 = 200.0;
-
 /// Cached regulation-clock parameters derived once from the frame list.
 ///
 /// Rocket League replays store an absolute `time` (seconds from replay start) and a

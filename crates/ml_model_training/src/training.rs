@@ -39,6 +39,13 @@ pub struct TrainingState {
     /// Propagated into [`TrainingOutput::final_validation_pred_std_mmr`] so the
     /// warm-start basin-escape gate can use the real computed value instead of a heuristic.
     pub last_validation_pred_std_mmr: Option<f32>,
+    /// Whole-match and within-lobby metrics from the last validation pass.
+    ///
+    /// This is the family of numbers smurf detection is actually judged on — per-player
+    /// predictions aggregated across a replay's segments, then compared inside the lobby.
+    /// Kept on the state so checkpoint selection and stopping rules can be moved onto it
+    /// rather than onto per-segment loss.
+    pub last_validation_within_lobby: Option<WithinLobbyMetrics>,
     /// Reference per-rank validation RMSE (MMR units) captured at the end of the
     /// warm-start phase, used as the **tail-rank guard** baseline.
     ///
@@ -81,6 +88,7 @@ impl TrainingState {
             current_valid_loss: None,
             last_validation_rank_rmse: None,
             last_validation_pred_std_mmr: None,
+            last_validation_within_lobby: None,
             tail_rank_baseline: None,
             best_pred_std_mmr: 0.0,
             best_pearson_r: -1.0,
@@ -695,6 +703,7 @@ where
             let validation_time = valid_start.elapsed();
             state.current_valid_loss = Some(validation_result.loss);
             state.last_validation_pred_std_mmr = Some(validation_result.pred_std_mmr);
+            state.last_validation_within_lobby = validation_result.within_lobby;
             if let Some(baseline) = state.tail_rank_baseline.as_deref() {
                 log_tail_rank_guard(baseline, &validation_result.rank_rmse_entries);
             }
@@ -1064,6 +1073,10 @@ struct ValidationLossResult {
     /// Pearson correlation between predictions and targets over known slots.
     /// `0.0` when it cannot be computed (degenerate variance / too few slots).
     pub pearson_r: f32,
+    /// Whole-match and within-lobby metrics, or `None` when no lobby had two
+    /// rank-known players. These describe the shipped behaviour; every other field
+    /// on this struct scores individual ~20-second segments.
+    pub within_lobby: Option<WithinLobbyMetrics>,
 }
 
 /// Collapse-detection metrics computed over the full validation set.
@@ -1195,6 +1208,348 @@ impl CollapseAccumulator {
     }
 }
 
+// --- Whole-match / within-lobby validation metrics -------------------------------
+// Everything above this point scores a single ~20-second segment slot. Production does
+// not: `predict_player_centric` averages a player's prediction over all of a replay's
+// segments and `is_this_a_smurf` takes the median, then compares against the lobby
+// median. These metrics reproduce that, so the logged numbers describe the shipped
+// behaviour rather than a snap judgement the product never makes.
+
+/// Within-lobby top-gap (MMR above the lobby median) at which a validation lobby counts
+/// as "mixed" for the smurf-proxy metrics.
+///
+/// Reuses the training-side oversampling threshold, which is also the `--min-gap 150`
+/// default of `fetch_mixed_rank`, so the lobbies scored here are exactly the ones the
+/// acquisition pipeline was built to collect.
+const WITHIN_LOBBY_MIXED_GAP_MMR: f32 = crate::segment_cache::MIXED_TOP_GAP_THRESHOLD_MMR;
+
+/// Margin above the lobby median prediction at which the shipped rule flags a player.
+///
+/// Aliases the single definition in `ml_model` so the detection rate logged during
+/// training means exactly what the app and `smurf_spotcheck` mean by it.
+const WITHIN_LOBBY_SMURF_MARGIN_MMR: f32 = ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR;
+
+/// Minimum true MMR gap for a within-lobby pair to count toward concordance.
+///
+/// Adjacent rank divisions sit ~19 MMR apart, inside the label's own quantisation error,
+/// so ordering them is not a meaningful ask.
+const WITHIN_LOBBY_MIN_PAIR_GAP_MMR: f32 = 25.0;
+
+/// Median of `values`, sorted in place. Returns `0.0` for an empty slice.
+fn median_of(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        let lower = values.get(mid - 1).copied().unwrap_or(0.0);
+        let upper = values.get(mid).copied().unwrap_or(0.0);
+        f32::midpoint(lower, upper)
+    } else {
+        values.get(mid).copied().unwrap_or(0.0)
+    }
+}
+
+/// Whole-match validation metrics, computed on per-player-per-match predictions.
+#[derive(Debug, Clone, Copy)]
+pub struct WithinLobbyMetrics {
+    /// Lobbies with at least two rank-known players.
+    pub lobbies: usize,
+    /// RMSE of each player's whole-match prediction against their own label.
+    pub player_match_rmse_mmr: f32,
+    /// RMSE of the lobby's median prediction against the lobby's median label.
+    pub lobby_rmse_mmr: f32,
+    /// Component of `player_match_rmse_mmr` from getting the lobby level wrong.
+    pub between_rmse_mmr: f32,
+    /// Component of `player_match_rmse_mmr` from mis-ordering players inside the lobby.
+    /// This is the part smurf detection depends on; the other part is irrelevant to it.
+    pub within_rmse_mmr: f32,
+    /// Fraction of comparable within-lobby pairs ordered correctly (ties score 0.5).
+    /// `0.5` is chance.
+    pub concordance: f32,
+    /// Number of pairs behind `concordance`.
+    pub comparable_pairs: usize,
+    /// Lobbies passing [`WITHIN_LOBBY_MIXED_GAP_MMR`].
+    pub mixed_lobbies: usize,
+    /// `concordance` restricted to those lobbies.
+    pub mixed_concordance: f32,
+    /// Mixed lobbies with a single unambiguous highest-labelled player, which is the
+    /// denominator for the three rates below.
+    pub mixed_scored_lobbies: usize,
+    /// Fraction where the highest-labelled player also got the highest prediction.
+    /// Chance is `1 / known_slots`, about 16.7 % for a full lobby.
+    pub mixed_top1_rate: f32,
+    /// Fraction where the shipped `+200 MMR over lobby median` rule fires on that player.
+    pub mixed_detection_rate: f32,
+    /// Mean of (highest-labelled player's prediction − lobby median prediction).
+    pub mixed_mean_margin_mmr: f32,
+}
+
+/// One replay's accumulated per-slot segment predictions.
+struct LobbyPredictions {
+    /// Every segment prediction seen for each slot, collapsed to a median at the end.
+    slot_predictions: [Vec<f32>; feature_extractor::TOTAL_PLAYERS],
+    /// The replay's label row (`0.0` = rank unknown, masked everywhere).
+    targets: [f32; feature_extractor::TOTAL_PLAYERS],
+}
+
+impl LobbyPredictions {
+    fn new(targets: [f32; feature_extractor::TOTAL_PLAYERS]) -> Self {
+        Self {
+            slot_predictions: core::array::from_fn(|_| Vec::new()),
+            targets,
+        }
+    }
+}
+
+/// Regroups per-segment validation predictions back into whole matches.
+#[derive(Default)]
+struct WithinLobbyAccumulator {
+    lobbies: std::collections::HashMap<uuid::Uuid, LobbyPredictions>,
+}
+
+impl WithinLobbyAccumulator {
+    /// Files one validation batch. `segment_indices` must be the same slice that produced
+    /// `raw_preds`, in the same order, so row *n* of the tensor maps to segment *n*.
+    fn push_batch(
+        &mut self,
+        dataset: &SegmentStore,
+        segment_indices: &[usize],
+        raw_preds: &[f32],
+        raw_targets: &[f32],
+    ) {
+        let slots = feature_extractor::TOTAL_PLAYERS;
+        for (row, &segment_index) in segment_indices.iter().enumerate() {
+            let Some(replay_id) = dataset.get_replay_id(segment_index) else {
+                continue;
+            };
+            let start = row * slots;
+            let (Some(row_preds), Some(row_targets)) = (
+                raw_preds.get(start..start + slots),
+                raw_targets.get(start..start + slots),
+            ) else {
+                continue;
+            };
+
+            let entry = self.lobbies.entry(replay_id).or_insert_with(|| {
+                LobbyPredictions::new(core::array::from_fn(|slot| {
+                    row_targets.get(slot).copied().unwrap_or(0.0)
+                }))
+            });
+            for (slot, &pred) in row_preds.iter().enumerate() {
+                if let Some(bucket) = entry.slot_predictions.get_mut(slot) {
+                    bucket.push(pred);
+                }
+            }
+        }
+    }
+
+    fn compute_metrics(&self) -> Option<WithinLobbyMetrics> {
+        let mut player_sse = 0.0f64;
+        let mut player_count = 0u64;
+        let mut lobby_sse = 0.0f64;
+        let mut lobby_count = 0u64;
+        let mut between_sse = 0.0f64;
+        let mut within_sse = 0.0f64;
+
+        let mut concordant = 0.0f64;
+        let mut pairs = 0u64;
+        let mut mixed_concordant = 0.0f64;
+        let mut mixed_pairs = 0u64;
+
+        let mut mixed_lobbies = 0u64;
+        let mut mixed_scored = 0u64;
+        let mut mixed_top1 = 0.0f64;
+        let mut mixed_detected = 0u64;
+        let mut mixed_margin_sum = 0.0f64;
+
+        for lobby in self.lobbies.values() {
+            // (whole-match prediction, label) for rank-known slots only.
+            let mut known: Vec<(f32, f32)> = Vec::with_capacity(feature_extractor::TOTAL_PLAYERS);
+            for (slot, target) in lobby.targets.iter().enumerate() {
+                if *target <= 0.0 {
+                    continue;
+                }
+                let Some(samples) = lobby.slot_predictions.get(slot) else {
+                    continue;
+                };
+                if samples.is_empty() {
+                    continue;
+                }
+                let mut sorted = samples.clone();
+                known.push((median_of(&mut sorted), *target));
+            }
+            if known.len() < 2 {
+                continue;
+            }
+
+            let mut pred_values: Vec<f32> = known.iter().map(|(pred, _)| *pred).collect();
+            let mut target_values: Vec<f32> = known.iter().map(|(_, target)| *target).collect();
+            let lobby_pred_median = median_of(&mut pred_values);
+            let lobby_target_median = median_of(&mut target_values);
+            let lobby_error = f64::from(lobby_pred_median - lobby_target_median);
+
+            lobby_sse += lobby_error * lobby_error;
+            lobby_count += 1;
+
+            for (pred, target) in &known {
+                let error = f64::from(pred - target);
+                player_sse += error * error;
+                player_count += 1;
+                between_sse += lobby_error * lobby_error;
+                let within_error =
+                    f64::from((pred - lobby_pred_median) - (target - lobby_target_median));
+                within_sse += within_error * within_error;
+            }
+
+            let is_mixed = crate::segment_cache::segment_top_gap_mmr(&lobby.targets)
+                >= WITHIN_LOBBY_MIXED_GAP_MMR;
+
+            for (index, (pred_a, target_a)) in known.iter().enumerate() {
+                for (pred_b, target_b) in known.iter().skip(index + 1) {
+                    if (target_a - target_b).abs() <= WITHIN_LOBBY_MIN_PAIR_GAP_MMR {
+                        continue;
+                    }
+                    let agreement = if (pred_a - pred_b).abs() < f32::EPSILON {
+                        0.5
+                    } else if (target_a > target_b) == (pred_a > pred_b) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    concordant += agreement;
+                    pairs += 1;
+                    if is_mixed {
+                        mixed_concordant += agreement;
+                        mixed_pairs += 1;
+                    }
+                }
+            }
+
+            if !is_mixed {
+                continue;
+            }
+            mixed_lobbies += 1;
+
+            // Top-1 and detection are only well defined when one player is clearly highest.
+            let highest_target = known
+                .iter()
+                .map(|(_, target)| *target)
+                .fold(f32::MIN, f32::max);
+            let at_top = known
+                .iter()
+                .filter(|(_, target)| (*target - highest_target).abs() < f32::EPSILON)
+                .count();
+            if at_top != 1 {
+                continue;
+            }
+            let Some((high_pred, _)) = known
+                .iter()
+                .find(|(_, target)| (*target - highest_target).abs() < f32::EPSILON)
+            else {
+                continue;
+            };
+
+            mixed_scored += 1;
+            let margin = high_pred - lobby_pred_median;
+            mixed_margin_sum += f64::from(margin);
+            if margin > WITHIN_LOBBY_SMURF_MARGIN_MMR {
+                mixed_detected += 1;
+            }
+            // Fractional credit when predictions tie at the top. Without this a fully
+            // collapsed model — every slot identical — would tie for first everywhere and
+            // score 100 % top-1. Splitting the credit puts it at exactly chance instead,
+            // which is the whole point of watching this number.
+            let highest_pred = known.iter().map(|(pred, _)| *pred).fold(f32::MIN, f32::max);
+            if (high_pred - highest_pred).abs() < f32::EPSILON {
+                let tied_at_top = known
+                    .iter()
+                    .filter(|(pred, _)| (*pred - highest_pred).abs() < f32::EPSILON)
+                    .count()
+                    .max(1);
+                mixed_top1 += 1.0 / tied_at_top as f64;
+            }
+        }
+
+        if lobby_count == 0 || player_count == 0 {
+            return None;
+        }
+
+        let rmse = |sse: f64, count: u64| -> f32 {
+            if count == 0 {
+                0.0
+            } else {
+                (sse / count as f64).sqrt() as f32
+            }
+        };
+        let rate = |hits: u64, total: u64| -> f32 {
+            if total == 0 {
+                0.0
+            } else {
+                hits as f32 / total as f32
+            }
+        };
+
+        Some(WithinLobbyMetrics {
+            lobbies: lobby_count as usize,
+            player_match_rmse_mmr: rmse(player_sse, player_count),
+            lobby_rmse_mmr: rmse(lobby_sse, lobby_count),
+            between_rmse_mmr: rmse(between_sse, player_count),
+            within_rmse_mmr: rmse(within_sse, player_count),
+            concordance: if pairs == 0 {
+                0.0
+            } else {
+                (concordant / pairs as f64) as f32
+            },
+            comparable_pairs: pairs as usize,
+            mixed_lobbies: mixed_lobbies as usize,
+            mixed_concordance: if mixed_pairs == 0 {
+                0.0
+            } else {
+                (mixed_concordant / mixed_pairs as f64) as f32
+            },
+            mixed_scored_lobbies: mixed_scored as usize,
+            mixed_top1_rate: if mixed_scored == 0 {
+                0.0
+            } else {
+                (mixed_top1 / mixed_scored as f64) as f32
+            },
+            mixed_detection_rate: rate(mixed_detected, mixed_scored),
+            mixed_mean_margin_mmr: if mixed_scored == 0 {
+                0.0
+            } else {
+                (mixed_margin_sum / mixed_scored as f64) as f32
+            },
+        })
+    }
+}
+
+fn log_within_lobby_metrics(metrics: &WithinLobbyMetrics) {
+    info!(
+        "  Whole-match (per-player median over a replay's segments, n={} lobbies): \
+         player={:.1} MMR  lobby={:.1} MMR  |  between={:.1}  within={:.1}",
+        metrics.lobbies,
+        metrics.player_match_rmse_mmr,
+        metrics.lobby_rmse_mmr,
+        metrics.between_rmse_mmr,
+        metrics.within_rmse_mmr,
+    );
+    info!(
+        "  Within-lobby ordering: concordance={:.3} over {} pairs (0.500 = chance)  |  \
+         mixed lobbies (gap>={:.0}): n={} conc={:.3} scored={} top1={:.1}% detect={:.1}% margin={:+.0} MMR",
+        metrics.concordance,
+        metrics.comparable_pairs,
+        WITHIN_LOBBY_MIXED_GAP_MMR,
+        metrics.mixed_lobbies,
+        metrics.mixed_concordance,
+        metrics.mixed_scored_lobbies,
+        100.0 * metrics.mixed_top1_rate,
+        100.0 * metrics.mixed_detection_rate,
+        metrics.mixed_mean_margin_mmr,
+    );
+}
+
 /// Computes validation loss on a segment dataset.
 ///
 /// Also logs a per-rank-tier RMSE breakdown and collapse-detection diagnostics.
@@ -1211,6 +1566,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
             rank_rmse_entries: Vec::new(),
             pred_std_mmr: 0.0,
             pearson_r: 0.0,
+            within_lobby: None,
         };
     }
 
@@ -1219,6 +1575,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     let mut rank_stats: std::collections::HashMap<Rank, PerRankErrors> =
         std::collections::HashMap::new();
     let mut collapse = CollapseAccumulator::default();
+    let mut within_lobby = WithinLobbyAccumulator::default();
 
     let indices: Vec<usize> = (0..num_segments).collect();
 
@@ -1253,6 +1610,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
             Some(&raw_ordinal_logits),
         );
         collapse.push_batch(&raw_preds, &raw_targets, actual_batch_size);
+        within_lobby.push_batch(dataset, batch_indices, &raw_preds, &raw_targets);
 
         // Mask unknown-rank slots (target == 0.0 sentinel).
         let mask = batch.targets.clone().greater_elem(0.0).float();
@@ -1309,6 +1667,13 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
         (0.0, 0.0)
     };
 
+    // Whole-match and within-lobby metrics last, so the ordinal numbers the product
+    // actually depends on are the final thing in each validation block.
+    let within_lobby_metrics = within_lobby.compute_metrics();
+    if let Some(metrics) = within_lobby_metrics.as_ref() {
+        log_within_lobby_metrics(metrics);
+    }
+
     let rank_rmse_entries = validation_rank_rmse_entries_from_stats(&rank_stats);
 
     let loss = if total_samples > 0 {
@@ -1322,6 +1687,7 @@ fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
         rank_rmse_entries,
         pred_std_mmr,
         pearson_r,
+        within_lobby: within_lobby_metrics,
     }
 }
 
@@ -1421,5 +1787,127 @@ mod tests {
         let v0 = pseudo_random_f32(0, 0);
         let v1 = pseudo_random_f32(1, 0);
         assert!((v0 - v1).abs() > f32::EPSILON);
+    }
+
+    /// Builds an accumulator from `(replay, targets, per_slot_segment_predictions)`.
+    fn accumulator_from(
+        lobbies: &[([f32; feature_extractor::TOTAL_PLAYERS], Vec<Vec<f32>>)],
+    ) -> WithinLobbyAccumulator {
+        let mut accumulator = WithinLobbyAccumulator::default();
+        for (index, (targets, slot_predictions)) in lobbies.iter().enumerate() {
+            let mut lobby = LobbyPredictions::new(*targets);
+            for (slot, samples) in slot_predictions.iter().enumerate() {
+                if let Some(bucket) = lobby.slot_predictions.get_mut(slot) {
+                    bucket.clone_from(samples);
+                }
+            }
+            accumulator
+                .lobbies
+                .insert(uuid::Uuid::from_u128(index as u128 + 1), lobby);
+        }
+        accumulator
+    }
+
+    /// A wide lobby the model reads perfectly: ordering, top-1 and the within component
+    /// should all be ideal, and the flagged player is the genuinely highest one.
+    #[test]
+    fn test_within_lobby_perfect_prediction() {
+        let targets = [600.0, 620.0, 640.0, 660.0, 680.0, 1400.0];
+        let predictions: Vec<Vec<f32>> = targets.iter().map(|t| vec![*t]).collect();
+        let metrics = accumulator_from(&[(targets, predictions)])
+            .compute_metrics()
+            .expect("metrics");
+
+        assert_eq!(metrics.lobbies, 1);
+        assert!(metrics.player_match_rmse_mmr < 1e-3);
+        assert!(metrics.within_rmse_mmr < 1e-3);
+        assert!(metrics.between_rmse_mmr < 1e-3);
+        assert!((metrics.concordance - 1.0).abs() < 1e-6);
+        // max 1400 vs median 650 => gap 750, well past the mixed threshold.
+        assert_eq!(metrics.mixed_lobbies, 1);
+        assert_eq!(metrics.mixed_scored_lobbies, 1);
+        assert!((metrics.mixed_top1_rate - 1.0).abs() < 1e-6);
+        assert!((metrics.mixed_detection_rate - 1.0).abs() < 1e-6);
+        assert!(metrics.mixed_mean_margin_mmr > 700.0);
+    }
+
+    /// The failure mode these metrics exist to catch: one prediction for the whole lobby.
+    /// Concordance must read as chance and top-1 must not be rewarded for tying.
+    #[test]
+    fn test_within_lobby_collapsed_model_scores_chance() {
+        let targets = [600.0, 620.0, 640.0, 660.0, 680.0, 1400.0];
+        let predictions: Vec<Vec<f32>> = (0..feature_extractor::TOTAL_PLAYERS)
+            .map(|_| vec![700.0f32])
+            .collect();
+        let metrics = accumulator_from(&[(targets, predictions)])
+            .compute_metrics()
+            .expect("metrics");
+
+        assert!((metrics.concordance - 0.5).abs() < 1e-6);
+        // Six-way tie at the top => 1/6, exactly chance, not a hit.
+        assert!((metrics.mixed_top1_rate - 1.0 / 6.0).abs() < 1e-6);
+        // Every prediction equals the lobby median, so no margin and no flag.
+        assert!(metrics.mixed_mean_margin_mmr.abs() < 1e-3);
+        assert!(metrics.mixed_detection_rate.abs() < 1e-6);
+        // The lobby level is right; all of the error is within-lobby.
+        assert!(metrics.within_rmse_mmr > 250.0);
+    }
+
+    /// Getting the lobby level wrong but the ordering right loads `between` and leaves
+    /// `within` clean — the decomposition has to separate the two.
+    #[test]
+    fn test_within_lobby_between_and_within_separate() {
+        let targets = [600.0, 620.0, 640.0, 660.0, 680.0, 1400.0];
+        let predictions: Vec<Vec<f32>> = targets.iter().map(|t| vec![*t + 300.0]).collect();
+        let metrics = accumulator_from(&[(targets, predictions)])
+            .compute_metrics()
+            .expect("metrics");
+
+        assert!((metrics.between_rmse_mmr - 300.0).abs() < 1e-2);
+        assert!(metrics.within_rmse_mmr < 1e-2);
+        assert!((metrics.concordance - 1.0).abs() < 1e-6);
+        assert!((metrics.lobby_rmse_mmr - 300.0).abs() < 1e-2);
+    }
+
+    /// Per-player aggregation is a median across that replay's segments, so a single wild
+    /// segment must not move the player's whole-match prediction.
+    #[test]
+    fn test_within_lobby_uses_segment_median() {
+        let targets = [600.0, 620.0, 640.0, 660.0, 680.0, 1400.0];
+        let mut predictions: Vec<Vec<f32>> = targets.iter().map(|t| vec![*t, *t, *t]).collect();
+        // One catastrophic segment for the top player; the median ignores it.
+        if let Some(top) = predictions.get_mut(5) {
+            *top = vec![1400.0, 1400.0, -9000.0];
+        }
+        let metrics = accumulator_from(&[(targets, predictions)])
+            .compute_metrics()
+            .expect("metrics");
+
+        assert!(metrics.player_match_rmse_mmr < 1e-3);
+        assert!((metrics.mixed_top1_rate - 1.0).abs() < 1e-6);
+    }
+
+    /// Homogeneous lobbies must not enter the mixed-lobby tallies, and slots with an
+    /// unknown rank (0.0 sentinel) must be excluded everywhere.
+    #[test]
+    fn test_within_lobby_skips_homogeneous_and_unknown_slots() {
+        let targets = [600.0, 600.0, 600.0, 620.0, 620.0, 0.0];
+        let predictions: Vec<Vec<f32>> = vec![
+            vec![600.0],
+            vec![600.0],
+            vec![600.0],
+            vec![620.0],
+            vec![620.0],
+            vec![9999.0],
+        ];
+        let metrics = accumulator_from(&[(targets, predictions)])
+            .compute_metrics()
+            .expect("metrics");
+
+        assert_eq!(metrics.lobbies, 1);
+        assert_eq!(metrics.mixed_lobbies, 0);
+        assert_eq!(metrics.mixed_scored_lobbies, 0);
+        // The unknown slot's absurd prediction must not reach the error terms.
+        assert!(metrics.player_match_rmse_mmr < 1e-3);
     }
 }

@@ -4,7 +4,7 @@ use rand::{Rng, RngExt, rng};
 use replay_structs::RankDivision;
 
 use crate::app_state::PredictionResults;
-use crate::prediction::{SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN, lobby_median_mmr};
+use crate::prediction::lobby_median_mmr;
 
 mod no_smurf_lines;
 
@@ -108,7 +108,7 @@ pub(crate) const fn no_smurf_lines_for_median_rank(rank: RankDivision) -> &'stat
 }
 
 fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
-    player_mmr > lobby_median_mmr + SMURF_SUSPICION_MMR_ABOVE_LOBBY_MEDIAN
+    player_mmr > lobby_median_mmr + ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR
 }
 
 fn random_pool_index(rng: &mut impl Rng, pool_len: usize) -> usize {

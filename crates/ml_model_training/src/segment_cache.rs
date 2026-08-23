@@ -17,11 +17,13 @@ use replay_structs::{Rank, RankDivision};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// Within-lobby top-gap (highest known MMR minus the median known MMR, in MMR) at or
-/// above which a segment is treated as a "mixed-rank" / smurf-bearing lobby and
-/// oversampled during training. Mirrors the acquisition criterion used by the
-/// mixed-rank fetch pipeline so the fetched lobbies are the ones that get boosted.
-const MIXED_TOP_GAP_THRESHOLD_MMR: f32 = 150.0;
+/// Top-gap at or above which a lobby counts as mixed-rank.
+///
+/// Top-gap is the highest known MMR minus the median known MMR. Such lobbies are
+/// oversampled during training and scored separately during validation. Mirrors the
+/// acquisition criterion used by the mixed-rank fetch pipeline, so the lobbies that get
+/// boosted are exactly the ones it was built to collect.
+pub const MIXED_TOP_GAP_THRESHOLD_MMR: f32 = 150.0;
 
 /// Extra repeat factor applied to mixed-rank segments on top of the rare-rank
 /// oversampling factor. Pushes the model to learn within-lobby skill spread
@@ -353,6 +355,12 @@ struct SegmentEntry {
     /// Numeric rank index of the lobby's mean known MMR (for oversampling).
     /// Maps to `replay_structs::Rank::as_numeric_index()` (0 = Unranked, 22 = SSL).
     primary_rank_index: u8,
+    /// Replay this segment was cut from.
+    ///
+    /// Every segment of one replay shares a `replay_id`, which is what lets validation
+    /// group its ~12 segments back into a single lobby and report per-player-per-match
+    /// and within-lobby metrics instead of per-20-second-segment ones.
+    replay_id: Uuid,
 }
 
 /// Converts bytes to f32 Vec, using zero-copy when possible.
@@ -434,6 +442,7 @@ impl SegmentStore {
                         path: segment_file.path.clone(),
                         target_mmr,
                         primary_rank_index,
+                        replay_id: segment_file.replay_id,
                     });
                     added += 1;
                 } else {
@@ -655,6 +664,14 @@ impl SegmentStore {
         self.entries.get(index).map(|e| e.target_mmr)
     }
 
+    /// Returns the replay a segment was cut from, or `None` if index is out of bounds.
+    ///
+    /// Validation groups segments by this to recover whole-match predictions.
+    #[must_use]
+    pub fn get_replay_id(&self, index: usize) -> Option<Uuid> {
+        self.entries.get(index).map(|e| e.replay_id)
+    }
+
     /// Gets player-centric features and target MMR for a segment.
     ///
     /// This method loads the cached segments containing player-centric features
@@ -709,6 +726,7 @@ impl SegmentStore {
                     path: entry.path.clone(),
                     target_mmr: entry.target_mmr,
                     primary_rank_index: entry.primary_rank_index,
+                    replay_id: entry.replay_id,
                 });
             }
         }
@@ -871,7 +889,7 @@ impl SegmentStoreBuilder {
 ///
 /// Unknown players are encoded as `0.0` in `target_mmr` and excluded. Returns `0.0`
 /// when fewer than two players are rank-known (no spread can be measured).
-fn segment_top_gap_mmr(target_mmr: &[f32; TOTAL_PLAYERS]) -> f32 {
+pub fn segment_top_gap_mmr(target_mmr: &[f32; TOTAL_PLAYERS]) -> f32 {
     let mut known: Vec<f32> = target_mmr.iter().copied().filter(|&v| v > 0.0).collect();
     if known.len() < 2 {
         return 0.0;
@@ -975,6 +993,7 @@ mod tests {
                 path: PathBuf::from("unused-in-test"),
                 target_mmr: *target,
                 primary_rank_index: primary_rank_index_from_mmr_array(target),
+                replay_id: Uuid::nil(),
             });
         }
         store

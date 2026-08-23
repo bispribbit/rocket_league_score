@@ -16,6 +16,6 @@ pub use checkpoint::{
 pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
 pub use minibatch_loss::{LabelJitterStep, MseExtremeMmrRowBoost};
 pub use training::{
-    CheckpointConfig, TrainingOutput, TrainingState, balanced_segment_indices,
+    CheckpointConfig, TrainingOutput, TrainingState, WithinLobbyMetrics, balanced_segment_indices,
     compute_inverse_frequency_weights, lookup_rank_weights, pseudo_random_f32, train,
 };
