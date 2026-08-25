@@ -27,7 +27,7 @@ use database::{
     list_replay_players_by_replay,
 };
 use feature_extractor::TOTAL_PLAYERS;
-use ml_model::{SequenceModel, predict_player_centric_per_segment};
+use ml_model::{SequenceModel, predict_player_centric_per_segment_from_parsed};
 use ml_model_training::load_checkpoint;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
@@ -141,10 +141,11 @@ pub async fn run(config: &FlagSmurfsConfig) -> Result<()> {
             .map(|p| (p.player_name.clone(), p.rank_division.mmr_middle() as f32))
             .collect();
 
-        // Run inference (no ratings needed — inference uses default context).
-        let per_segment = predict_player_centric_per_segment(
+        // Run inference. Ratings are not needed, but the parsed replay is: it carries the
+        // goal list, which is what keeps the features aligned with the training path.
+        let per_segment = predict_player_centric_per_segment_from_parsed(
             &model,
-            &parsed.frames,
+            &parsed,
             &device,
             config.sequence_length,
         );
@@ -168,7 +169,7 @@ pub async fn run(config: &FlagSmurfsConfig) -> Result<()> {
         }
 
         // Map slot predictions to player names using the frame ordering from the replay.
-        // `predict_player_centric_per_segment` preserves the player ordering from the first frame.
+        // `predict_player_centric_per_segment_from_parsed` preserves the roster player ordering.
         let player_names: Vec<String> = parsed
             .frames
             .first()

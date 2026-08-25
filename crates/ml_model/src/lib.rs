@@ -32,6 +32,7 @@ use burn::tensor::activation::softmax;
 use feature_extractor::{
     FRAME_SUBSAMPLE_RATE, PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
     extract_player_centric_game_sequence_inference,
+    extract_player_centric_game_sequence_inference_with_context,
 };
 use fused_lstm::{FusedLstm, FusedLstmBackend, FusedLstmConfig};
 
@@ -537,11 +538,27 @@ pub struct ExtractedSegmentFeatures {
 }
 
 impl ExtractedSegmentFeatures {
-    /// Builds features from game frames for inference.
+    /// Builds features from a parsed replay for inference.
     ///
-    /// Uses the same subsampling and feature set as the training pipeline.
-    /// Cumulative per-player stats reset every `segment_length` subsampled frames.
-    /// Score diff is set to 0 (unknown during live inference).
+    /// Prefer this over [`Self::from_frames`]: it feeds the model the same feature
+    /// distribution the model was trained on, because goal-replay frames are excluded and
+    /// the score differential is reconstructed from the goal list, exactly as in training.
+    #[must_use]
+    pub fn from_parsed(parsed: &replay_structs::ParsedReplay, segment_length: usize) -> Self {
+        let player_centric_frames =
+            extract_player_centric_game_sequence_inference_with_context(parsed, segment_length);
+        Self {
+            player_centric_frames,
+            original_replay_frame_count: parsed.frames.len(),
+        }
+    }
+
+    /// Builds features from a bare frame list.
+    ///
+    /// Only for callers with no [`replay_structs::ParsedReplay`] to hand. Without the goal
+    /// list the score differential is pinned to `0.0` and goal-replay frames are kept, so
+    /// the features differ from training; use [`Self::from_parsed`] where possible.
+    #[must_use]
     pub fn from_frames(frames: &[replay_structs::GameFrame], segment_length: usize) -> Self {
         let player_centric_frames =
             extract_player_centric_game_sequence_inference(frames, segment_length);
@@ -616,10 +633,39 @@ impl ExtractedSegmentFeatures {
     }
 }
 
+/// Predicts MMR for all players per segment, from a parsed replay.
+///
+/// Prefer this over [`predict_player_centric_per_segment`]: the goal list lets the
+/// features be built exactly as they were in training (goal-replay frames excluded,
+/// real score differential), so the model is scored on vectors of a kind it has seen.
+pub fn predict_player_centric_per_segment_from_parsed<B: FusedLstmBackend>(
+    model: &SequenceModel<B>,
+    parsed: &replay_structs::ParsedReplay,
+    device: &B::Device,
+    segment_length: usize,
+) -> Vec<SegmentPrediction> {
+    if parsed.frames.is_empty() {
+        return vec![];
+    }
+    let player_centric_frames =
+        extract_player_centric_game_sequence_inference_with_context(parsed, segment_length);
+    predict_from_player_centric_frames(
+        model,
+        &player_centric_frames,
+        parsed.frames.len(),
+        device,
+        segment_length,
+    )
+}
+
 /// Predicts MMR for all players per segment using player-centric features.
 ///
 /// Returns a list of per-segment predictions. Use [`predict_player_centric`] if you
 /// only need the averaged result.
+///
+/// Only for callers with no [`replay_structs::ParsedReplay`]; see
+/// [`predict_player_centric_per_segment_from_parsed`], which matches the training
+/// feature distribution.
 ///
 /// # Arguments
 ///
@@ -640,11 +686,28 @@ pub fn predict_player_centric_per_segment<B: FusedLstmBackend>(
     if frames.is_empty() {
         return vec![];
     }
-
-    let original_frame_count = frames.len();
     let player_centric_frames =
         extract_player_centric_game_sequence_inference(frames, segment_length);
+    predict_from_player_centric_frames(
+        model,
+        &player_centric_frames,
+        frames.len(),
+        device,
+        segment_length,
+    )
+}
 
+/// Runs the model over already-extracted player-centric frames.
+///
+/// Shared by the frame-only and parsed-replay prediction entry points so the two cannot
+/// diverge in batching or segment-bound arithmetic.
+fn predict_from_player_centric_frames<B: FusedLstmBackend>(
+    model: &SequenceModel<B>,
+    player_centric_frames: &[[PlayerCentricFrameFeatures; TOTAL_PLAYERS]],
+    original_frame_count: usize,
+    device: &B::Device,
+    segment_length: usize,
+) -> Vec<SegmentPrediction> {
     let num_segments = if player_centric_frames.len() >= segment_length {
         player_centric_frames.len() / segment_length
     } else {
@@ -657,7 +720,7 @@ pub fn predict_player_centric_per_segment<B: FusedLstmBackend>(
         let start = seg_idx * segment_length;
         let end = (start + segment_length).min(player_centric_frames.len());
         let segment_frames =
-            get_segment_player_frames(&player_centric_frames, start, segment_length);
+            get_segment_player_frames(player_centric_frames, start, segment_length);
 
         // Build input tensor [6_players, seg_len, PLAYER_CENTRIC_FEATURE_COUNT]
         let mut input_data = Vec::with_capacity(6 * segment_length * PLAYER_CENTRIC_FEATURE_COUNT);

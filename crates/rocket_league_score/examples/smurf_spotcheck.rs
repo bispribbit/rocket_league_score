@@ -26,7 +26,7 @@ use clap::Parser;
 use config::OBJECT_STORE;
 use database::{initialize_pool, list_mixed_rank_replays, list_replay_players_by_replay};
 use feature_extractor::{PlayerRoster, TOTAL_PLAYERS};
-use ml_model::{SequenceModel, predict_player_centric_per_segment};
+use ml_model::{SequenceModel, predict_player_centric_per_segment_from_parsed};
 use ml_model_training::load_checkpoint;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
         };
 
         let per_segment =
-            predict_player_centric_per_segment(&model, &parsed.frames, &device, args.seq_len);
+            predict_player_centric_per_segment_from_parsed(&model, &parsed, &device, args.seq_len);
         if per_segment.is_empty() {
             skipped += 1;
             continue;

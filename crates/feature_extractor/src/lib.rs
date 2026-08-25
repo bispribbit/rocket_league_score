@@ -100,6 +100,15 @@ const AIRBORNE_Z_THRESHOLD: f32 = 25.0;
 /// Minimum speed to count as supersonic (Rocket League units per second).
 const SUPERSONIC_SPEED: f32 = 2200.0;
 
+/// Index of the first of the three score/time context features in the feature vector.
+///
+/// Layout: `[score_diff_normalized, seconds_remaining_normalized, is_overtime]`. These are
+/// the only features that depend on match metadata rather than on the frame itself, which
+/// makes them the ones at risk of diverging between the training and inference paths.
+/// Named so tests can assert on them; a `debug_assert_eq!` at the write site keeps it
+/// honest if the preceding feature blocks ever change size.
+pub const SCORE_TIME_CONTEXT_FEATURE_OFFSET: usize = 100;
+
 /// Game context extracted for a single frame (shared across all 6 player views).
 #[derive(Debug, Clone, Default)]
 struct FrameGameContext {
@@ -498,6 +507,10 @@ pub(crate) fn extract_player_centric_frame_features(
     idx += 1;
 
     // 13. Score + time context (3 features)
+    debug_assert_eq!(
+        idx, SCORE_TIME_CONTEXT_FEATURE_OFFSET,
+        "score/time context moved; update SCORE_TIME_CONTEXT_FEATURE_OFFSET"
+    );
     features.features[idx] = game_ctx.score_diff_normalized;
     features.features[idx + 1] = game_ctx.seconds_remaining_normalized;
     features.features[idx + 2] = game_ctx.is_overtime;
@@ -677,21 +690,95 @@ pub fn extract_player_centric_game_sequence(
     let target_mmr = build_target_mmr_array(player_ratings);
     let roster = PlayerRoster::from_player_ratings(player_ratings);
 
-    // Build the goal-replay exclusion mask (O(goals) space, O(frames) scan).
-    let excluded = build_goal_replay_excluded_set(&parsed.goal_frames, &parsed.kickoff_frames);
+    let player_frames = extract_player_centric_frames_with_context(
+        &parsed.frames,
+        &roster,
+        segment_length,
+        Some(SequenceContext::from_parsed(parsed)),
+    );
 
-    // Precompute cumulative scores per original frame index.
-    let cumulative_score = precompute_cumulative_score(&parsed.goals, parsed.frames.len());
+    PlayerCentricGameSequence {
+        player_frames,
+        target_mmr,
+    }
+}
+
+/// Match-level metadata that is not recoverable from the frame list alone.
+///
+/// Everything here comes off a [`ParsedReplay`]. It is optional at the call site so a
+/// caller that genuinely only holds frames can still extract features, but every
+/// in-tree caller has a `ParsedReplay` and should pass it: omitting the context changes
+/// the feature distribution the model sees (see
+/// [`extract_player_centric_frames_with_context`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SequenceContext<'a> {
+    /// Scored goals, used to reconstruct the running score at each frame.
+    pub goals: &'a [GoalEvent],
+    /// Frame indices at which a goal was scored.
+    pub goal_frames: &'a [usize],
+    /// Frame indices at which play resumed after a kickoff.
+    pub kickoff_frames: &'a [usize],
+}
+
+impl<'a> SequenceContext<'a> {
+    /// Borrows the match metadata out of a parsed replay.
+    #[must_use]
+    pub fn from_parsed(parsed: &'a ParsedReplay) -> Self {
+        Self {
+            goals: &parsed.goals,
+            goal_frames: &parsed.goal_frames,
+            kickoff_frames: &parsed.kickoff_frames,
+        }
+    }
+}
+
+/// Shared feature extraction used by both the training and the inference paths.
+///
+/// Having exactly one implementation is the point: when training and inference each had
+/// their own loop, the inference loop silently disagreed with the training loop on three
+/// features, so the model was asked at serving time to score vectors of a kind it had
+/// never been trained on.
+///
+/// `context` controls the two things that need match metadata:
+///
+/// * **Goal-replay exclusion** — frames inside a goal celebration are dropped, as in
+///   training. Without context they are kept.
+/// * **Score differential** — reconstructed from the goal list. Without context it is
+///   `0.0`, which is in-distribution (a tied game) even though it is not always correct.
+///
+/// The clock features (`seconds_remaining_normalized`, `is_overtime`) are always derived
+/// from `frame.seconds_remaining`, with or without context. They read straight off the
+/// frame, so there was never a reason to zero them, and zeroing both at once produced the
+/// pair `seconds_remaining_normalized = 0, is_overtime = 0` — a combination that cannot
+/// occur in training, where a zero clock always means overtime.
+#[must_use]
+pub fn extract_player_centric_frames_with_context(
+    frames: &[GameFrame],
+    roster: &PlayerRoster,
+    segment_length: usize,
+    context: Option<SequenceContext<'_>>,
+) -> Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> {
+    // Only meaningful with context; without it nothing is excluded.
+    let excluded = context.map(|ctx| {
+        build_goal_replay_excluded_set(ctx.goal_frames, ctx.kickoff_frames)
+    });
+
+    // Only meaningful with context; without it the score stays 0-0 for every frame.
+    let cumulative_score =
+        context.map(|ctx| precompute_cumulative_score(ctx.goals, frames.len()));
 
     let mut cumulatives = core::array::from_fn(|_| CumulativePlayerState::default());
     let mut player_frames: Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> = Vec::new();
     let mut subsampled_count = 0usize;
 
-    for (frame_idx, frame) in parsed.frames.iter().enumerate() {
+    for (frame_idx, frame) in frames.iter().enumerate() {
         if frame_idx % FRAME_SUBSAMPLE_RATE != 0 {
             continue;
         }
-        if excluded.contains(&frame_idx) {
+        if excluded
+            .as_ref()
+            .is_some_and(|set| set.contains(&frame_idx))
+        {
             continue;
         }
 
@@ -707,10 +794,13 @@ pub fn extract_player_centric_game_sequence(
             frame.players.iter().map(|p| (&**p.name, p)).collect();
 
         // Update cumulative state for each player slot.
-        update_cumulative_states(&mut cumulatives, &roster, &player_map);
+        update_cumulative_states(&mut cumulatives, roster, &player_map);
 
         // Compute score diff from the focal perspective (team-0 = blue).
-        let (blue_score, orange_score) = cumulative_score.get(frame_idx).copied().unwrap_or((0, 0));
+        let (blue_score, orange_score) = cumulative_score
+            .as_ref()
+            .and_then(|scores| scores.get(frame_idx).copied())
+            .unwrap_or((0, 0));
 
         let seconds_remaining_normalized = (frame.seconds_remaining as f32 / 300.0).clamp(0.0, 1.0);
         let is_overtime = if frame.seconds_remaining <= 0 {
@@ -733,7 +823,7 @@ pub fn extract_player_centric_game_sequence(
 
         // Extract all 6 player feature vectors.
         // Blue players (slots 0-2) use game_ctx_blue; orange (slots 3-5) use game_ctx_orange.
-        let role_ranks = compute_role_ranks(frame, &roster, &player_map);
+        let role_ranks = compute_role_ranks(frame, roster, &player_map);
         let mut frame_features = core::array::from_fn(|_| PlayerCentricFrameFeatures::default());
         for slot in 0..TOTAL_PLAYERS {
             let ctx = if slot < PLAYERS_PER_TEAM {
@@ -744,7 +834,7 @@ pub fn extract_player_centric_game_sequence(
             frame_features[slot] = extract_player_centric_frame_features(
                 frame,
                 slot,
-                &roster,
+                roster,
                 &player_map,
                 &cumulatives[slot],
                 ctx,
@@ -756,11 +846,9 @@ pub fn extract_player_centric_game_sequence(
         subsampled_count += 1;
     }
 
-    PlayerCentricGameSequence {
-        player_frames,
-        target_mmr,
-    }
+    player_frames
 }
+
 
 /// Builds the set of original frame indices that fall inside goal-replay windows.
 ///
@@ -884,55 +972,44 @@ fn compute_role_ranks(
     role_ranks
 }
 
-/// Simplified extraction for inference: no goal trimming, no cumulative state reset across games.
+/// Extraction for inference when the caller only holds the frame list.
 ///
-/// Cumulative stats still reset at every `segment_length` subsampled frames.
-/// Score diff is set to 0 (unknown during live inference).
+/// Prefer [`extract_player_centric_game_sequence_inference_with_context`]: without match
+/// metadata the score differential is pinned to `0.0` and goal-replay frames are kept, so
+/// the features drift from what the model was trained on. This entry point exists for
+/// callers that genuinely have nothing but frames.
+///
+/// The roster is recovered from the frames themselves (union of names across all frames,
+/// blue then orange, each sorted by name) rather than from database ratings.
+#[must_use]
 pub fn extract_player_centric_game_sequence_inference(
     frames: &[GameFrame],
     segment_length: usize,
 ) -> Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> {
     let roster = PlayerRoster::from_frames(frames);
-
-    let mut cumulatives = core::array::from_fn(|_| CumulativePlayerState::default());
-    let mut player_frames = Vec::new();
-    let mut subsampled_count = 0usize;
-    let game_ctx = FrameGameContext::default();
-
-    for (frame_idx, frame) in frames.iter().enumerate() {
-        if frame_idx % FRAME_SUBSAMPLE_RATE != 0 {
-            continue;
-        }
-
-        if subsampled_count > 0 && subsampled_count.is_multiple_of(segment_length) {
-            for state in &mut cumulatives {
-                *state = CumulativePlayerState::default();
-            }
-        }
-
-        let player_map: HashMap<&str, &PlayerState> =
-            frame.players.iter().map(|p| (&**p.name, p)).collect();
-        update_cumulative_states(&mut cumulatives, &roster, &player_map);
-
-        let role_ranks = compute_role_ranks(frame, &roster, &player_map);
-        let mut frame_features = core::array::from_fn(|_| PlayerCentricFrameFeatures::default());
-        for slot in 0..TOTAL_PLAYERS {
-            frame_features[slot] = extract_player_centric_frame_features(
-                frame,
-                slot,
-                &roster,
-                &player_map,
-                &cumulatives[slot],
-                &game_ctx,
-                role_ranks[slot],
-            );
-        }
-        player_frames.push(frame_features);
-        subsampled_count += 1;
-    }
-
-    player_frames
+    extract_player_centric_frames_with_context(frames, &roster, segment_length, None)
 }
+
+/// Extraction for inference that reproduces the training feature distribution exactly.
+///
+/// Same code path, same goal-replay exclusion, and the same reconstructed score
+/// differential as [`extract_player_centric_game_sequence`]. The only remaining
+/// difference is that the roster comes from the frames instead of from database ratings,
+/// which affects slot *labelling*, not the feature values in each slot.
+#[must_use]
+pub fn extract_player_centric_game_sequence_inference_with_context(
+    parsed: &ParsedReplay,
+    segment_length: usize,
+) -> Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> {
+    let roster = PlayerRoster::from_frames(&parsed.frames);
+    extract_player_centric_frames_with_context(
+        &parsed.frames,
+        &roster,
+        segment_length,
+        Some(SequenceContext::from_parsed(parsed)),
+    )
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1189,4 +1266,234 @@ mod tests {
         assert!(forward.y.abs() < 0.001);
         assert!(forward.z.abs() < 0.001);
     }
+
+    // =========================================================================
+    // F4 regression: the training and inference feature paths must agree.
+    //
+    // These guard the fix for the train/inference skew. Before it, inference ran a
+    // separate loop that pinned all three score/time context features to zero and kept
+    // goal-replay frames, so the model was served vectors unlike anything in its
+    // training set — including `seconds_remaining_normalized == 0` together with
+    // `is_overtime == 0`, which training can never produce.
+    // =========================================================================
+
+    /// Builds a player in a fixed slot, offset so no two players coincide.
+    fn f4_player(name: &str, team: Team, offset: f32) -> PlayerState {
+        PlayerState {
+            actor_id: offset as i32,
+            name: Arc::new(name.to_string()),
+            team,
+            actor_state: ActorState {
+                position: Vector3 {
+                    x: offset * 100.0,
+                    y: offset * -80.0,
+                    z: 17.0,
+                },
+                velocity: Vector3 {
+                    x: offset * 30.0,
+                    y: offset * 10.0,
+                    z: 0.0,
+                },
+                rotation: Quaternion {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 1.0,
+                },
+                boost: (offset * 0.1).min(1.0),
+                is_demolished: false,
+            },
+        }
+    }
+
+    /// A six-player replay whose clock runs into overtime, with one goal and a kickoff.
+    ///
+    /// The clock crossing zero is the point: it forces frames where `is_overtime == 1`,
+    /// which is exactly the combination the old inference path could not represent.
+    fn f4_parsed_replay(frame_count: usize) -> ParsedReplay {
+        let names = ["Ayla", "Bex", "Cyd", "Dov", "Esk", "Fen"];
+        let frames: Vec<GameFrame> = (0..frame_count)
+            .map(|i| {
+                let players = names
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, name)| {
+                        let team = if slot < PLAYERS_PER_TEAM {
+                            Team::Blue
+                        } else {
+                            Team::Orange
+                        };
+                        f4_player(name, team, (i as f32).mul_add(0.25, (slot + 1) as f32))
+                    })
+                    .collect();
+                GameFrame {
+                    time: i as f32 * 0.033,
+                    delta: 0.033,
+                    // Starts positive, crosses zero into overtime partway through.
+                    seconds_remaining: 20 - i as i32,
+                    ball: BallState {
+                        position: Vector3 {
+                            x: i as f32 * 5.0,
+                            y: i as f32 * -3.0,
+                            z: 100.0,
+                        },
+                        velocity: Vector3 {
+                            x: 300.0,
+                            y: -100.0,
+                            z: 20.0,
+                        },
+                    },
+                    players,
+                }
+            })
+            .collect();
+
+        ParsedReplay {
+            goals: vec![GoalEvent {
+                frame: 12,
+                player_name: "Ayla".to_string(),
+                player_team: Team::Blue,
+            }],
+            goal_frames: vec![12],
+            kickoff_frames: vec![24],
+            frames,
+        }
+    }
+
+    #[test]
+    fn test_inference_with_context_matches_training_features() {
+        let parsed = f4_parsed_replay(60);
+        let ratings: Vec<PlayerRating> = ["Ayla", "Bex", "Cyd", "Dov", "Esk", "Fen"]
+            .iter()
+            .enumerate()
+            .map(|(slot, name)| PlayerRating {
+                player_name: (*name).to_string(),
+                mmr: 800,
+                team: i16::from(slot >= PLAYERS_PER_TEAM),
+            })
+            .collect();
+
+        let training = extract_player_centric_game_sequence(&parsed, &ratings, 10);
+        let inference = extract_player_centric_game_sequence_inference_with_context(&parsed, 10);
+
+        // Same frames survive goal-replay exclusion on both paths.
+        assert_eq!(
+            training.player_frames.len(),
+            inference.len(),
+            "training and inference kept a different number of frames"
+        );
+        assert!(
+            !inference.is_empty(),
+            "fixture produced no frames; the test would pass vacuously"
+        );
+
+        // And every feature of every slot of every frame is bit-for-bit identical.
+        // Exact equality is deliberate: the two paths run the same arithmetic on the
+        // same inputs, so any difference at all is the skew reappearing.
+        #[expect(clippy::float_cmp, reason = "bit-identical output is the property under test")]
+        for (frame_idx, (train_frame, inf_frame)) in
+            training.player_frames.iter().zip(inference.iter()).enumerate()
+        {
+            for (slot, (train_slot, inf_slot)) in
+                train_frame.iter().zip(inf_frame.iter()).enumerate()
+            {
+                assert_eq!(
+                    train_slot.features, inf_slot.features,
+                    "features diverged at frame {frame_idx}, slot {slot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_training_path_excludes_goal_replay_frames() {
+        // Guards the fixture itself: if exclusion stopped happening, the equality test
+        // above would still pass while silently comparing two unexcluded paths.
+        let parsed = f4_parsed_replay(60);
+        let roster = PlayerRoster::from_frames(&parsed.frames);
+
+        let with_context = extract_player_centric_frames_with_context(
+            &parsed.frames,
+            &roster,
+            10,
+            Some(SequenceContext::from_parsed(&parsed)),
+        );
+        let without_context =
+            extract_player_centric_frames_with_context(&parsed.frames, &roster, 10, None);
+
+        assert!(
+            with_context.len() < without_context.len(),
+            "goal-replay frames were not excluded when context was supplied"
+        );
+    }
+
+    #[test]
+    fn test_clock_features_never_take_the_impossible_combination() {
+        // `seconds_remaining_normalized == 0` means the clock has run out, which always
+        // means overtime. The pair (0, 0) is unreachable in training, so no inference path
+        // may emit it — that was the concrete symptom of the skew.
+        let parsed = f4_parsed_replay(60);
+        let seconds_idx = SCORE_TIME_CONTEXT_FEATURE_OFFSET + 1;
+        let overtime_idx = SCORE_TIME_CONTEXT_FEATURE_OFFSET + 2;
+
+        let with_context = extract_player_centric_game_sequence_inference_with_context(&parsed, 10);
+        let without_context =
+            extract_player_centric_game_sequence_inference(&parsed.frames, 10);
+
+        let mut saw_overtime = false;
+        for (label, frames) in [
+            ("with context", &with_context),
+            ("without context", &without_context),
+        ] {
+            for (frame_idx, frame) in frames.iter().enumerate() {
+                for (slot, player) in frame.iter().enumerate() {
+                    // These features are written as literal 0.0 / 1.0, never computed,
+                    // so exact comparison is the correct test.
+                    #[expect(clippy::float_cmp, reason = "features are literal 0.0/1.0 flags")]
+                    {
+                        let seconds = player.features[seconds_idx];
+                        let overtime = player.features[overtime_idx];
+                        if overtime == 1.0 {
+                            saw_overtime = true;
+                        }
+                        assert!(
+                            !(seconds == 0.0 && overtime == 0.0),
+                            "{label}: impossible clock pair (0, 0) at frame {frame_idx}, slot {slot}"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_overtime,
+            "fixture never reached overtime, so the assertion above proved nothing"
+        );
+    }
+
+    #[test]
+    fn test_score_context_is_zero_without_metadata_and_nonzero_with_it() {
+        // The one feature that genuinely cannot be recovered from frames alone. This
+        // documents the remaining, deliberate difference between the two entry points.
+        let parsed = f4_parsed_replay(60);
+        let score_idx = SCORE_TIME_CONTEXT_FEATURE_OFFSET;
+
+        let with_context = extract_player_centric_game_sequence_inference_with_context(&parsed, 10);
+        let without_context =
+            extract_player_centric_game_sequence_inference(&parsed.frames, 10);
+
+        assert!(
+            without_context
+                .iter()
+                .all(|frame| frame.iter().all(|p| p.features[score_idx] == 0.0)),
+            "score differential should be zero when no goal list is supplied"
+        );
+        assert!(
+            with_context
+                .iter()
+                .any(|frame| frame.iter().any(|p| p.features[score_idx] != 0.0)),
+            "score differential should be reconstructed from the goal list"
+        );
+    }
+
 }

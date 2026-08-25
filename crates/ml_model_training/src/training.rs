@@ -1062,7 +1062,7 @@ fn log_tail_rank_guard(baseline: &[ValidationRankRmseEntry], current: &[Validati
 }
 
 /// Result of one full validation pass: aggregate loss, per-rank RMSE, and collapse metrics.
-struct ValidationLossResult {
+pub struct ValidationLossResult {
     /// Mean validation loss (normalized Huber / MSE-style aggregate).
     pub loss: f32,
     /// Per-rank RMSE in MMR units, ladder order.
@@ -1553,7 +1553,11 @@ fn log_within_lobby_metrics(metrics: &WithinLobbyMetrics) {
 /// Computes validation loss on a segment dataset.
 ///
 /// Also logs a per-rank-tier RMSE breakdown and collapse-detection diagnostics.
-fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
+///
+/// Public so a checkpoint can be re-scored without re-training: the `revalidate`
+/// example in `rocket_league_score` calls this directly, which guarantees the numbers
+/// it prints are produced by the same code path as an in-training validation pass.
+pub fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
     model: &SequenceModel<B>,
     dataset: &Arc<SegmentStore>,
     batcher: &SequenceBatcher<B>,

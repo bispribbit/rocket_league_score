@@ -251,8 +251,8 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 return;
                             }
                             let sequence_length = sequence_length_from_embedded_config();
-                            let extracted = ExtractedSegmentFeatures::from_frames(
-                                &parsed.frames,
+                            let extracted = ExtractedSegmentFeatures::from_parsed(
+                                &parsed,
                                 sequence_length,
                             );
                             let num_segments = extracted.segment_count(sequence_length);
