@@ -72,6 +72,16 @@ const WARM_START_EPOCHS: usize = 500;
 /// of the production batch size chosen for main training.
 const WARM_START_BATCH_SIZE: usize = 32;
 
+/// Warm-start config: how often to validate during the warm-start phase.
+///
+/// Warm-start epochs cost ~1.6 s on ~120 segments; a validation pass costs ~80 s on the
+/// whole 45,805-segment evaluation split. Validating every epoch made warm-start ~11 h, of
+/// which ~98 % was validation nothing consumed — the phase saves no checkpoints and its only
+/// decision is the [`WARM_START_MIN_PRED_STD_MMR`] basin check, which reads the final pass.
+/// Periodic passes are kept so a run that is failing to escape the basin is still visible
+/// while it happens rather than only in hindsight.
+const WARM_START_VALIDATE_EVERY_N_EPOCHS: usize = 50;
+
 /// Minimum prediction standard deviation (MMR) expected after a successful warm-start.
 ///
 /// If the warm-start ends with pred_std below this threshold the model is still in the
@@ -502,7 +512,16 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
             let warm_start_config = TrainingConfig::new(model_config.clone())
                 .with_learning_rate(config.learning_rate)
                 .with_epochs(WARM_START_EPOCHS)
-                .with_batch_size(WARM_START_BATCH_SIZE);
+                .with_batch_size(WARM_START_BATCH_SIZE)
+                // Must match main training, or the self-only ablation is pre-trained for
+                // 500 epochs *with* the lobby shortcut it exists to remove — contaminating
+                // the very quantity it is measuring.
+                .with_self_only_features(config.self_only_features)
+                // Warm-start trains on ~120 segments in ~1.6 s and would otherwise validate
+                // over all 45,805 evaluation segments for ~80 s after each of 500 epochs:
+                // ~11 h, ~98 % of it validation. Its only decision point is the pred_std
+                // basin check on the final epoch, which still runs.
+                .with_validate_every_n_epochs(WARM_START_VALIDATE_EVERY_N_EPOCHS);
             let warm_start_output = train(
                 &mut model,
                 warm_start_store,

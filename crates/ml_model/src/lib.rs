@@ -182,6 +182,19 @@ pub struct TrainingConfig {
     /// view, and this is what lets a later run know that.
     #[config(default = false)]
     pub self_only_features: bool,
+    /// Run a validation pass every N epochs. `1` (the default) validates every epoch.
+    ///
+    /// The final epoch always validates regardless, so the run's reported metrics and the
+    /// warm-start basin-escape check are never left undefined.
+    ///
+    /// This exists because validation cost is fixed while epoch cost is not. The warm-start
+    /// phase trains on ~120 segments in ~1.6 s and then validates over the whole 45,805-
+    /// segment evaluation split for ~80 s — 500 epochs of that is ~11 h, of which ~98 % is
+    /// validating a pre-training phase whose only decision point is a single pred_std check
+    /// at the end. Leave it at 1 for main training, where every validation feeds checkpoint
+    /// selection and the collapse cutoff.
+    #[config(default = 1)]
+    pub validate_every_n_epochs: usize,
 }
 
 /// LSTM-based sequence model with split per-player + lobby encoders.

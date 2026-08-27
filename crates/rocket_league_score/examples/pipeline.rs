@@ -14,7 +14,9 @@
 //!   `MODEL_NAME`       - Model name for saving (default: `lstm_v3`)
 //!   `TRAIN_RATIO`      - Training set ratio (default: 0.9)
 //!   EPOCHS           - Number of epochs (default: 100)
-//!   `BATCH_SIZE`       - Batch size (default: 32)
+//!   `BATCH_SIZE`       - Batch size (default: 144, the value `lstm_v20` was trained at;
+//!                       may be reduced automatically to keep the fused LSTM projection
+//!                       inside its VRAM budget)
 //!   `LEARNING_RATE`    - Learning rate (default: 0.03 — matches the `overfit_wgpu`
 //!                       harness; combined with the warmup + 0.10 floor in
 //!                       `training::cosine_lr`, this is the schedule validated end-to-end

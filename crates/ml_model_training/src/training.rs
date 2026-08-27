@@ -374,6 +374,18 @@ pub fn lookup_rank_weights(mean_target_mmr_slice: &[f32], rank_weights: &[f32]) 
 /// # Errors
 ///
 /// Returns an error if training fails.
+/// Whether the 0-based `epoch` should run a validation pass.
+///
+/// The final epoch always validates, whatever the cadence, so a run can never finish with
+/// undefined validation metrics — `TrainingOutput::final_valid_loss` and the warm-start
+/// basin check both read them, and a `None` there would be indistinguishable from "no
+/// validation set was supplied".
+fn should_validate_epoch(epoch: usize, total_epochs: usize, every_n_epochs: usize) -> bool {
+    every_n_epochs <= 1
+        || epoch + 1 >= total_epochs
+        || (epoch + 1).is_multiple_of(every_n_epochs)
+}
+
 pub fn train<B: AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend>(
     model: &mut SequenceModel<B>,
     train_dataset: Arc<SegmentStore>,
@@ -701,9 +713,13 @@ where
             approx_train_rmse,
         );
 
-        // Validation
+        // Validation. Always runs on the final epoch so the metrics this function returns
+        // — and the warm-start basin-escape check that reads them — are never undefined.
+        let should_validate =
+            should_validate_epoch(epoch, config.epochs, config.validate_every_n_epochs);
+
         let mut improved = false;
-        if let Some(valid_ds) = valid_dataset {
+        if let Some(valid_ds) = valid_dataset.filter(|_| should_validate) {
             let valid_start = Instant::now();
             let inner_model = model.valid();
             let inner_device = inner_model.device();
@@ -1849,6 +1865,49 @@ fn log_progress(epoch: usize, train_loss: f32, valid_loss: Option<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// The default cadence validates every epoch — production behaviour must be unchanged.
+    #[test]
+    fn validation_cadence_default_validates_every_epoch() {
+        for epoch in 0..10 {
+            assert!(should_validate_epoch(epoch, 10, 1));
+            assert!(should_validate_epoch(epoch, 10, 0), "0 must behave as 1");
+        }
+    }
+
+    /// A wide cadence validates on the multiples and always on the last epoch, so the run
+    /// cannot end without the metrics the warm-start basin check reads.
+    #[test]
+    fn validation_cadence_skips_but_always_ends_on_a_pass() {
+        let total = 500;
+        let every = 50;
+        assert!(should_validate_epoch(49, total, every)); // epoch 50 of 500
+        assert!(should_validate_epoch(99, total, every));
+        assert!(!should_validate_epoch(0, total, every));
+        assert!(!should_validate_epoch(48, total, every));
+        assert!(should_validate_epoch(total - 1, total, every), "final epoch");
+
+        let passes = (0..total)
+            .filter(|&epoch| should_validate_epoch(epoch, total, every))
+            .count();
+        assert_eq!(passes, total / every, "expected one pass per cadence window");
+    }
+
+    /// The final-epoch guarantee must hold even when the total is not a multiple of the
+    /// cadence, which is the case a naive modulo check gets wrong.
+    #[test]
+    fn validation_cadence_covers_a_ragged_final_window() {
+        assert!(should_validate_epoch(59, 60, 50), "epoch 60 of 60");
+        assert!(should_validate_epoch(6, 7, 3));
+        // Cadence hits epochs 3 and 6 (1-based); epoch 7 is the final one and is added by
+        // the guarantee even though 7 is not a multiple of 3.
+        let passes: Vec<usize> = (0..7)
+            .filter(|&epoch| should_validate_epoch(epoch, 7, 3))
+            .map(|epoch| epoch + 1)
+            .collect();
+        assert_eq!(passes, vec![3, 6, 7]);
+    }
 
     #[test]
     fn test_pseudo_random_f32_range() {
