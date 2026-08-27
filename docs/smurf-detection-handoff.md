@@ -313,15 +313,26 @@ Either way this is still the right next experiment, and still the gate on steps 
 **After step 2.5 came back negative it is also the *only* remaining experiment** — there is
 no cheaper move left to try first.
 
-#### 🔴 IN FLIGHT as of 2026-08-26 22:26 EDT
+#### 🟡 Control done, ablation IN FLIGHT as of 2026-08-27 03:43 EDT
 
-Both arms were launched sequentially and should finish ~08:50 EDT. **Check these before
-starting any new work** — if they completed, the go/no-go verdict is sitting in the logs.
+Ablation arm should finish ~09:00 EDT. **Check it before starting any new work** — if it
+completed, the go/no-go verdict is sitting in its log.
 
-| arm | model name | feature view | log |
-|---|---|---|---|
-| control | `lstm_v22_full` | full-106 | `models/20260826_222608.txt` |
-| ablation | `lstm_v22_self` | self-only-27 | the next `models/*.txt` after it |
+| arm | model name | feature view | log | result |
+|---|---|---|---|---|
+| control | `lstm_v22_full` | full-106 | `models/20260826_222608.txt` | ✅ `conc=0.621`, `top1=28.7 %` |
+| ablation | `lstm_v22_self` | self-only-27 | `models/20260827_034256.txt` | 🔴 running |
+
+**The control result is itself worth recording.** At 3,000 replays and 60 epochs it reaches
+`conc=0.621` on mixed lobbies — statistically the same as the **0.619** that the epoch-255
+checkpoint reached on all 27,150 replays. Within-lobby ordering apparently saturates at ~11 %
+of the data and ~24 % of the epochs, which is direct support for F9's fixed-dev-subset
+proposal: this metric does not need a 6-day run to be measured. It also means the control is
+a fair stand-in for the production model, so the ablation delta reads as a real effect rather
+than an artefact of a starved budget.
+
+Run health was good — `pred_std=431.5 MMR`, `pearson_r=0.802`, no collapse; 560 epochs
+(500 warm-start + 60 main) and exactly 70 validation passes, confirming the cadence fix.
 
 Both: 3,000-replay dev subset (45,759 segments), 60 epochs, batch 144, `lr=3e-2`,
 validation on the whole evaluation split.
