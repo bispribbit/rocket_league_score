@@ -64,6 +64,15 @@ changes described here; append a new row for anything further.
 > - **F9 is answered.** The control matched the 255-epoch full-data run's `0.619` using 11 %
 >   of the replays and 24 % of the epochs, so the fixed dev subset is now the eval protocol
 >   and this metric never needs a 6-day run again.
+>
+> **The product is still not there** (row 27). Re-fitting the threshold on the self-only
+> checkpoint takes the shipped `+200` rule from **3.2 % precision (1.3× base rate, i.e.
+> random) to 8.1 % (3.3×)** — 5.5× the true positives, rule unchanged — and held-out average
+> precision from 1.71× to 2.17× base rate. But at the best operating point **~92 % of flags
+> are still wrong**. The reason is now precisely named: the ablation works by lifting the
+> *positives* into the tail (p99 `+206` → `+304`) while the **negatives barely move**
+> (`+436` → `+386`). That surviving negative right tail is the next obstacle, and it is a
+> target for step 6 as tail compression — not for any further threshold work.
 
 Companion doc: [`overfit_wgpu.md`](overfit_wgpu.md) for the regression harness.
 
@@ -403,7 +412,46 @@ regression here is the ablation working, not the model failing. Read the
 resulting checkpoint with `revalidate --self-only --dump-predictions` → `fit_threshold` to
 see whether the margin distribution's shape improved.
 
-### 4–8. Conditional on step 3
+### 4–8. Conditional on step 3 — **unblocked, but re-order them (2026-08-27)**
+
+Step 3 came back GO and changed what several of these are worth. The original ordering was
+written when the lobby shortcut was believed to be something the model *leans on*; it is
+actually a nuisance input that *suppresses* the signal. Recommended order now:
+
+**0. Re-baseline on self-only, at full data.** Not in the original list because nobody
+expected it to be a change on its own. It is the single biggest proven win available and
+costs one flag (`SELF_ONLY_FEATURES=true`) on a normal production run. Do this first;
+everything below should be measured against it, not against `lstm_v20`.
+
+**1. Step 7 — cross-lobby ranking supervision (F8).** Its stated precondition, "valid only
+once the skill tower is self-only", is **now met**. Any two players from any two lobbies form
+a ranking pair valid at their own match times, which is abundant supervision aimed directly
+at the ordinal objective rather than at RMSE. Highest expected value of anything remaining.
+
+**2. Step 6, but specifically as tail compression.** Row 27 named the residual obstacle
+precisely: after removing lobby context the positives climb into the tail (p99 `+206` →
+`+304`) while the **negatives barely move** (`+436` → `+386`). A heavy negative right tail is
+what still makes strict thresholds useless — the top 1 % of margins scores zero true
+positives on *both* arms. Rank-index or percentile targets attack exactly that. Note this is
+a different motivation from the original F6 framing, which has now been revised twice.
+
+**3. Step 4 — head parameterisation (F5).** Unaffected by the step-3 result and still worth
+doing, but it is de-risking rather than upside: both step-3 arms had healthy `pred_std`
+(431.5 / 414.6), so the mean-collapse attractor was not binding. Cheap; fold it in alongside.
+
+**4. Step 5 — two-tower.** Partly superseded. The "skill tower on self-only features" half is
+proven and is achieved by a flag, so building a second tower to reach it is over-engineering.
+What survives is the **centered residual as a direct training target**
+(`prediction = lobby_level + (skill − lobby_median(skill))`), which trains the smurf score
+itself rather than subtracting it out afterwards. Worth doing for that reason alone.
+
+**5. Step 8 — asymmetric trimmed loss.** Still the most speculative; leave it last.
+
+Also promoted by this result: **match-level per-player features** (from Longer bets). Now
+that per-player features are proven to carry the signal on their own, enriching them is far
+more attractive than it looked when the lobby shortcut was thought to dominate.
+
+Original list, for reference:
 
 4. **Head parameterisation (F5)** — predict in normalised space, scale by `MMR_SCALE` on
    output, initialise the output bias to the training mean. Do this before the architecture
