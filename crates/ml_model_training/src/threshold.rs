@@ -434,11 +434,16 @@ pub fn mixed_lobby_cross_check(predictions: &[PlayerPrediction]) -> MixedLobbyCr
     }
 }
 
-/// Deterministic 64-bit hash of a replay id (FNV-1a).
+/// Deterministic 64-bit hash of a replay id (FNV-1a plus a splitmix64 finalizer).
 ///
-/// Hand-rolled so the fit/held-out split is reproducible across runs, machines and
-/// toolchains — `DefaultHasher` guarantees none of those.
-fn hash_replay_id(replay_id: Uuid) -> u64 {
+/// Hand-rolled so that any reproducible subset keyed off a replay — this module's
+/// fit/held-out split, the pipeline's fixed dev subset — is stable across runs, machines
+/// and toolchains. `DefaultHasher` guarantees none of those: it is explicitly allowed to
+/// differ between releases and is randomly seeded per process in some configurations.
+///
+/// Uniform enough in the top bits to compare directly against a scaled cutoff, which is how
+/// both callers select a fraction.
+pub fn stable_replay_hash(replay_id: Uuid) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in replay_id.as_bytes() {
         hash ^= u64::from(*byte);
@@ -470,7 +475,7 @@ pub fn split_by_replay(
     let mut fit = Vec::new();
     let mut held_out = Vec::new();
     for prediction in predictions {
-        if hash_replay_id(prediction.replay_id) < cutoff {
+        if stable_replay_hash(prediction.replay_id) < cutoff {
             fit.push(*prediction);
         } else {
             held_out.push(*prediction);

@@ -207,6 +207,23 @@ fn main() -> Result<()> {
         cross_check.mean_margin_mmr,
     );
 
+    // What the shipped rule does over every scored player, not just the half held out.
+    // The in-training `detection_rate` only ever looks at the top-labelled player of a
+    // mixed lobby, so by construction every firing it counts is a true positive and it
+    // cannot see a single false one. This can.
+    let all_samples = threshold::margin_samples(&predictions);
+    let shipped_all =
+        threshold::evaluate_threshold(&all_samples, ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR);
+    println!(
+        "shipped +{:.0} MMR rule over all {} scored players: flagged={} ({:.2} %)  correct={}  precision={:.1} %",
+        ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR,
+        all_samples.len(),
+        shipped_all.flagged,
+        100.0 * shipped_all.flag_rate,
+        shipped_all.true_positives,
+        100.0 * shipped_all.precision,
+    );
+
     let (fit_rows, held_out_rows) = threshold::split_by_replay(&predictions, args.fit_fraction);
     let fit = threshold::margin_samples(&fit_rows);
     let held_out = threshold::margin_samples(&held_out_rows);

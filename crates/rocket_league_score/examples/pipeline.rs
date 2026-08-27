@@ -89,6 +89,9 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok());
     let self_only_features: bool = get_env_or_default("SELF_ONLY_FEATURES", false);
+    let dev_subset_replays: Option<usize> = std::env::var("DEV_SUBSET_REPLAYS")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
     info!("=== Full Training Pipeline ===");
     info!("Model name:    {model_name}");
@@ -129,6 +132,7 @@ async fn main() -> Result<()> {
         resume,
         checkpoint_every_n_epochs: 5,
         max_replays,
+        dev_subset_replays,
         self_only_features,
     };
     commands::full_pipeline::run_with_config(&config).await?;

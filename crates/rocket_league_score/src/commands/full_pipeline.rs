@@ -130,14 +130,35 @@ pub struct FullTrainConfig {
     /// Save checkpoint every N epochs (0 to disable).
     pub checkpoint_every_n_epochs: usize,
     /// Maximum number of replays to use (None = use all available).
-    /// When set, replays are sampled across ranks for balanced distribution.
+    ///
+    /// **Smoke-test mode, not an experiment mode.** It samples across ranks ignoring
+    /// `dataset_split`, so the sample can include evaluation replays, and it disables
+    /// validation entirely. Use [`Self::dev_subset_replays`] for anything whose numbers you
+    /// intend to compare.
     pub max_replays: Option<usize>,
+    /// Train on a fixed, reproducible subset of the **training** split, of this size.
+    ///
+    /// The fixed dev subset F9 asks for in `docs/smurf-detection-handoff.md`, and the
+    /// vehicle for the step-3 ablation. It differs from `max_replays` in the three ways
+    /// that make a comparison trustworthy:
+    ///
+    /// - It draws only from the training split, so evaluation replays cannot leak in.
+    /// - Validation stays on the **whole** evaluation split, so within-lobby concordance and
+    ///   top-1 are measured over the same 175 mixed lobbies step 1 reported `0.619` on, and
+    ///   two runs are directly comparable to each other and to that baseline.
+    /// - Selection is by a stable hash of the replay id, so every run with the same size
+    ///   gets the same replays — on any machine, in any order — and the ablation's two arms
+    ///   differ only in the thing being ablated.
+    ///
+    /// Ignored when `max_replays` is set.
+    pub dev_subset_replays: Option<usize>,
     /// Train on the self-only 27-feature view, zeroing the other five cars.
     ///
-    /// The go/no-go ablation in step 3 of `docs/smurf-detection-handoff.md`. Combine with
-    /// `max_replays` for the fixed dev subset that step asks for, and score the result on
-    /// within-lobby concordance / top-1 rather than RMSE — removing the lobby shortcut is
-    /// *expected* to make RMSE worse, since the shortcut is worth 98.4 % of that objective.
+    /// The go/no-go ablation in step 3 of `docs/smurf-detection-handoff.md`. Pair it with
+    /// [`Self::dev_subset_replays`] for the fixed dev subset that step asks for, and score
+    /// the result on within-lobby concordance / top-1 rather than RMSE — removing the lobby
+    /// shortcut is *expected* to make RMSE worse, since the shortcut is worth 98.4 % of that
+    /// objective. An RMSE regression here is the ablation working, not the model failing.
     pub self_only_features: bool,
 }
 
@@ -156,9 +177,39 @@ impl Default for FullTrainConfig {
             resume: false,
             checkpoint_every_n_epochs: 5,
             max_replays: None,
+            dev_subset_replays: None,
             self_only_features: false,
         }
     }
+}
+
+/// Picks a reproducible subset of `replays` of size `target`.
+///
+/// Ordering the training split by `created_at` and taking a prefix would bias the sample
+/// toward whichever ranks were ingested first, so selection is by a stable hash of the
+/// replay id instead: uncorrelated with rank and date, identical on every machine, and
+/// stable across runs. That last property is what lets the step-3 ablation claim its two
+/// arms saw the same data.
+///
+/// Returns everything when `target` is at least `replays.len()`.
+fn stable_subset(replays: Vec<Replay>, target: usize) -> Vec<Replay> {
+    if target >= replays.len() {
+        return replays;
+    }
+    let mut ranked: Vec<(u64, Replay)> = replays
+        .into_iter()
+        .map(|replay| {
+            (
+                ml_model_training::threshold::stable_replay_hash(replay.id),
+                replay,
+            )
+        })
+        .collect();
+    // Sort by hash and take a prefix: an unbiased sample, and growing `target` only ever
+    // adds replays rather than reshuffling the ones already chosen.
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+    ranked.truncate(target);
+    ranked.into_iter().map(|(_, replay)| replay).collect()
 }
 
 /// Runs the full training pipeline.
@@ -196,8 +247,10 @@ pub async fn run(
         resume,
         checkpoint_every_n_epochs: 5,
         max_replays,
-        // Production always trains on the full 106-feature view. The self-only ablation
-        // goes through `run_with_config`, so it cannot be selected by accident here.
+        // Production trains on the whole training split and the full 106-feature view. The
+        // dev subset and the self-only ablation go through `run_with_config`, so neither can
+        // be selected by accident here.
+        dev_subset_replays: None,
         self_only_features: false,
     };
 
@@ -298,6 +351,17 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let training_replays = if let Some(max_replays) = config.max_replays {
         info!(max_replays, "Sampling replays across ranks for testing");
         database::list_replays_sampled(max_replays).await?
+    } else if let Some(dev_subset) = config.dev_subset_replays {
+        let all_training = database::list_replays_by_split(DatasetSplit::Training).await?;
+        let available = all_training.len();
+        let subset = stable_subset(all_training, dev_subset);
+        info!(
+            requested = dev_subset,
+            selected = subset.len(),
+            available,
+            "Fixed dev subset of the training split (stable hash selection)"
+        );
+        subset
     } else {
         database::list_replays_by_split(DatasetSplit::Training).await?
     };

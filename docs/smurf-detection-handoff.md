@@ -22,6 +22,19 @@ changes described here; append a new row for anything further.
 > of the conditional tail and is now the cheapest available win. Step 3 remains the right
 > go/no-go, but it is no longer testing "is there *any* per-player signal" — it is testing
 > whether that signal survives removing lobby context.
+>
+> **Update 2026-08-26 — step 2.5 is done and it came back negative.** The threshold was the
+> cheapest available win and it was not enough. Re-fitting on held-out data gives at best
+> 5.7 % precision at 26 % recall (lift 1.63× over a 2.4 % base rate); the shipped `+200`
+> rule turns out to be right at *exactly* the base rate. The reason revises F6: the margin
+> distribution has plenty of range, but its heavy right tail belongs to the **negatives**,
+> so the strictest thresholds score zero true positives. That is a distribution-*shape*
+> problem, which no threshold and no monotone recalibration can fix.
+>
+> **Everything now rests on step 3.** There is no remaining cheap win: the ordering signal
+> is real but weak (`conc = 0.619`, lift 1.63×), and the question of whether it is genuinely
+> per-player or an artefact of lobby context is the one that decides whether steps 4–8 are
+> worth their multi-day training runs at all.
 
 Companion doc: [`overfit_wgpu.md`](overfit_wgpu.md) for the regression harness.
 
@@ -70,7 +83,7 @@ Secondary findings, in rough priority order:
 | F3 | The pairwise hinge is the only within-lobby ordering term: weight 0.1, masks pairs closer than 25 MMR (adjacent divisions sit ~19 apart), and saturates at a flat 50 MMR margin. The spread term compares std across the **whole minibatch**, so between-lobby spread satisfies it. | `minibatch_loss.rs` |
 | F4 | ~~**Train/inference feature skew.**~~ **FIXED 2026-08-25 (row 24).** Both paths now share `extract_player_centric_frames_with_context`; clock features are always real, and every in-tree inference caller passes its `ParsedReplay`, so goal-replay exclusion and score diff match training too. Bit-identical output is enforced by a mutation-checked regression test. | `feature_extractor/src/lib.rs` |
 | F5 | `player_head_out` is `Linear(64→1)` consumed directly as raw MMR. At init it emits O(1); reaching 900 needs weights ~1000× larger, and the cheapest route is inflating the bias to the population mean — a mean-collapse attractor built into the parameterisation. | `ml_model/src/lib.rs` |
-| F6 | **No dynamic range left to flag with — now the binding constraint (see step 1).** Measured margin is `+18 MMR` against the `+200 MMR` rule. MMR spacing is uneven (C1→C2 is 130 MMR; GC3→SSL is 418), so squared error over-weights the top. At epoch 255, bronze-1 has 3,471 labels and receives **1** prediction; SSL has 2,732 and receives 517. Catching a GC in a gold lobby requires emitting a value ~800 above the lobby median, which the current output range cannot express. | `replay_structs/src/rank.rs` |
+| F6 | ~~**No dynamic range left to flag with.**~~ **REVISED 2026-08-26 (row 25): the range exists, it is the *ordering within* it that fails.** Margins reach `+996 MMR`, but the top of the distribution belongs to the negatives (their p99 is `+456` against the positives' `+178`), so the strictest thresholds score *zero* true positives and the shipped rule's precision equals the base rate. Not a range problem and not fixable by recalibration — a distribution-shape problem. Original text: measured margin is `+18 MMR` against the `+200 MMR` rule. MMR spacing is uneven (C1→C2 is 130 MMR; GC3→SSL is 418), so squared error over-weights the top. At epoch 255, bronze-1 has 3,471 labels and receives **1** prediction; SSL has 2,732 and receives 517. Catching a GC in a gold lobby requires emitting a value ~800 above the lobby median, which the current output range cannot express. | `replay_structs/src/rank.rs` |
 | F7 | `mixed_rank_eval` cannot prove what it claims — stacked segments carry their original lobby's context in their own features, so the shortcut still answers it. Becomes valid once the skill tower is self-only. | `bin/mixed_rank_eval.rs` |
 | F8 | Cross-lobby pairs are abundant supervision and need no identity: any two players from any two lobbies form a ranking pair valid at their own match times. Blocked today only because both vectors carry lobby context. | — |
 | F9 | 1,994 s/epoch × 256 epochs ≈ **6 days per configuration**. Half the rows in `experiment.md` are "pending re-train". | — |
@@ -232,15 +245,54 @@ populations are built differently (`segment_top_gap_mmr` over cached segments vs
 `list_mixed_rank_replays`'s coarse-rank SQL) and so is the coverage (cached segments vs
 whole re-parsed replays). Reconcile the two lobby sets before trusting either figure.
 
-### 2.5. Re-fit the flag threshold — do this next, it is nearly free
+### 2.5. Re-fit the flag threshold — ✅ DONE 2026-08-26, result **negative**
 
-Promoted out of step 6 by the step-1 result. Detection is 0–3 % purely because `+200 MMR` is
-unreachable when the achievable margin is `+18`. Fit the threshold as a percentile of the
-outlier-minus-lobby-median distribution on **held-out** mixed lobbies and report the
-precision/recall curve rather than a single rate. This needs no training and no new data,
-and it converts an ordering signal that already exists into a usable detector. Note the
-ceiling this implies: at `conc=0.619` the achievable operating points are modest, so publish
-the curve honestly instead of picking the threshold that flatters the detection rate.
+Done as specified, and the honest answer is that **no threshold on this checkpoint is
+shippable**. Row 25 of `experiment.md` has the full write-up.
+
+```bash
+cargo run --release --example revalidate -- \
+    --model models/lstm_v20/checkpoint_best --split evaluation \
+    --dump-predictions data/lstm_v20_eval_predictions.csv
+cargo run --release --example fit_threshold -- \
+    --predictions data/lstm_v20_eval_predictions.csv
+```
+
+Scoring costs ~1 h; fitting off the dump costs milliseconds. `mixed_lobby_cross_check`
+re-derives step 1's numbers from the dump and reproduces them exactly (`mixed=175`,
+`scored=157`, `top1=34.7 %`, `margin=+18`), so the dump is faithful.
+
+**Two definitional changes** make these numbers mean more than `mixed_detection_rate`:
+
+- **Every player is scored**, not just the top-labelled player of a mixed lobby. That metric
+  only ever inspects the one player who is a positive by construction, so it cannot observe
+  a false positive and reports no precision at all.
+- **Fitted on one set of lobbies, reported on another**, split by replay — margins are
+  lobby-relative, so a lobby split across both sides would compute its medians from a subset
+  of its own players.
+
+**Results.** The shipped rule over all 9,309 scored players: **flags 185 (1.99 %), 5 correct
+— precision 2.7 % against a 2.43 % base rate.** It is not merely too strict; when it fires
+it is right at chance. Held-out: **average precision 0.0408 vs 0.0251 base rate, lift
+1.63×**. Best operating point ≈ `+32 MMR` → precision 5.7 %, recall 26.1 %, while flagging
+11.4 % of everyone.
+
+**This revises F6.** F6 read the `+18 MMR` margin as "no dynamic range left to flag with".
+The range exists — margins reach `+996` — but it is **anti-informative at the top**:
+
+| class | p05 | p25 | median | p75 | p95 | p99 |
+|---|---|---|---|---|---|---|
+| smurf proxy (n=119) | −90 | −9 | **+10** | +36 | +81 | **+178** |
+| everyone else (n=4,625) | −59 | −12 | +0 | +12 | +61 | **+456** |
+
+The heaviest right tail belongs to the **negatives**, so the strictest thresholds are the
+*least* precise: the top 1 % (`+499`) and top 2 % (`+208`) of players both score **zero**
+true positives. The model's largest within-lobby deviations are its largest errors, not its
+best detections; the usable signal sits in modest margins (`+20`…`+80`).
+
+**So the binding constraint is the *shape* of the margin distribution, not the threshold
+value** — and no monotone recalibration can change a shape. That closes the threshold as a
+line of attack and moves the decision entirely onto step 3.
 
 ### 3. Go/no-go ablation, scored ordinally
 
@@ -258,6 +310,45 @@ when lobby context is removed?**
   split is designed to strip out, and the real work is per-player feature engineering.
 
 Either way this is still the right next experiment, and still the gate on steps 4–8.
+**After step 2.5 came back negative it is also the *only* remaining experiment** — there is
+no cheaper move left to try first.
+
+#### How to run it (machinery landed 2026-08-26)
+
+`FeatureView::SelfOnly` zeroes the 79 context features rather than narrowing the input
+tensor. Zero input contributes nothing through the LSTM's input weights, so it removes the
+same information a narrower tensor would, but leaves architecture, parameter count and
+tensor shapes identical — the two arms then differ only in what the model can see. A
+narrower tensor would confound the ablation with a capacity change.
+
+Run **both arms**; the step-1 checkpoint is not a valid control, because it saw all 27k
+replays for 255 epochs and these see 3k for 60.
+
+```bash
+# Control: same subset, same schedule, full 106-feature view.
+MODEL_NAME=lstm_v22_full DEV_SUBSET_REPLAYS=3000 EPOCHS=60 RESUME=false \
+    cargo run --release --example pipeline
+
+# Ablation: identical except the context features are zeroed.
+MODEL_NAME=lstm_v22_self DEV_SUBSET_REPLAYS=3000 EPOCHS=60 RESUME=false \
+    SELF_ONLY_FEATURES=true cargo run --release --example pipeline
+```
+
+`DEV_SUBSET_REPLAYS` — **not** `MAX_REPLAYS`, which is a smoke-test mode that leaks
+evaluation replays into training and disables validation entirely. The dev subset draws only
+from the training split, keeps validation on the **whole** evaluation split (so concordance
+is measured over the same 175 mixed lobbies as the `0.619` baseline), and selects replays by
+a stable hash so both arms see identical data.
+
+Budget, from the lstm_v20 log: 412,625 training segments → 1,940 s/epoch, validation 54.5 s.
+At 3,000 of 27,150 replays that is ≈ 4.5 min/epoch, so **≈ 4.5 h per arm, ~9 h for both**.
+
+**Score it on `concordance` / `mixed top1`, never on RMSE.** Removing the lobby shortcut is
+*expected* to make RMSE much worse — the shortcut is worth 98.4 % of that objective. An RMSE
+regression here is the ablation working, not the model failing. Read the
+`Within-lobby ordering:` line of the validation block, and re-fit the threshold on each
+resulting checkpoint with `revalidate --self-only --dump-predictions` → `fit_threshold` to
+see whether the margin distribution's shape improved.
 
 ### 4–8. Conditional on step 3
 
@@ -312,12 +403,24 @@ within-lobby separation.
 - Store the Ballchasing platform ID on `replay_players`? **Step 0 settles this: yes.** It is
   the sole blocker on trajectory mining, and without it 46 % of the fast-climber candidates
   are provable name collisions. Cheap to add at ingest.
-- ~~Is `+200 MMR` the right flag threshold?~~ **Answered: no.** The achievable margin is
-  `+10` to `+18 MMR`, so the rule cannot fire. Promoted to step 2.5 — fit it as a held-out
-  percentile and publish a precision/recall curve rather than a single detection rate.
-- **New:** reconcile the two mixed-lobby populations (`segment_top_gap_mmr` over cached
-  segments vs `list_mixed_rank_replays` coarse-rank SQL) before quoting a single top-1
-  number; they currently disagree, 34.7 % vs 22.2 %.
+- ~~Is `+200 MMR` the right flag threshold?~~ **Closed by step 2.5 (row 25): no threshold on
+  this checkpoint is worth shipping.** The shipped rule's precision equals the base rate, and
+  the best held-out operating point reaches only 5.7 % precision at 26 % recall. Re-open this
+  only after a model change moves the margin distribution; re-fitting is now a one-command
+  operation (`revalidate --dump-predictions` → `fit_threshold`) and should be re-run against
+  every future checkpoint rather than re-litigated.
+- Reconcile the two mixed-lobby populations (`segment_top_gap_mmr` over cached segments vs
+  `list_mixed_rank_replays` coarse-rank SQL); they disagree, 34.7 % vs 22.2 %. **Half-closed
+  by step 2.5:** `mixed_lobby_cross_check` reproduces the in-training 34.7 % exactly from the
+  prediction dump, so the two figures do not differ in *how* the rate is computed. What
+  remains is purely the lobby population, which is now the only place left to look.
+- **New:** `max_replays` is a smoke-test mode, not an experiment mode — it samples across
+  ranks ignoring `dataset_split` (so evaluation replays can leak into training) and it
+  disables validation entirely, which would have silently produced a step-3 run with no
+  within-lobby metrics at all. Use `dev_subset_replays` for anything comparable; it draws
+  only from the training split, keeps validation on the **whole** evaluation split so
+  concordance stays comparable to the `0.619` baseline, and selects by a stable hash so both
+  ablation arms see identical data. `max_replays` should probably be deleted.
 
 ## Build notes
 
