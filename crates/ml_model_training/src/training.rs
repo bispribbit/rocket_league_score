@@ -392,6 +392,17 @@ where
 
     let device = model.device();
 
+    // One view for the whole run: the prefetcher masks training batches and the validation
+    // batcher below masks validation batches. Scoring a self-only model on the full view
+    // would feed it context it was never trained on.
+    let feature_view = crate::dataset::FeatureView::from(config.self_only_features);
+    if feature_view != crate::dataset::FeatureView::Full {
+        info!(
+            feature_view = feature_view.label(),
+            "Ablation: context features are zeroed for both training and validation"
+        );
+    }
+
     // Adam with gradient clipping to stabilise LSTM training.
     let mut optimizer = AdamConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
@@ -456,6 +467,7 @@ where
             config.batch_size,
             config.sequence_length,
             PREFETCH_COUNT,
+            feature_view,
         );
 
         let total_batches = prefetcher.total_batches();
@@ -696,7 +708,8 @@ where
             let inner_model = model.valid();
             let inner_device = inner_model.device();
             let valid_batcher =
-                SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length);
+                SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length)
+                    .with_feature_view(feature_view);
 
             let validation_result =
                 compute_validation_loss(&inner_model, valid_ds, &valid_batcher, config.batch_size);
@@ -1077,6 +1090,11 @@ pub struct ValidationLossResult {
     /// rank-known players. These describe the shipped behaviour; every other field
     /// on this struct scores individual ~20-second segments.
     pub within_lobby: Option<WithinLobbyMetrics>,
+    /// The per-player whole-match predictions the `within_lobby` metrics were computed
+    /// from, one row per rank-known slot. Carried out of the pass so a threshold can be
+    /// re-fitted (see [`crate::threshold`]) without re-scoring the checkpoint, which costs
+    /// about an hour on CPU for the full evaluation split.
+    pub lobby_predictions: Vec<crate::threshold::PlayerPrediction>,
 }
 
 /// Collapse-detection metrics computed over the full validation set.
@@ -1301,6 +1319,44 @@ impl LobbyPredictions {
             targets,
         }
     }
+
+    /// Whole-match prediction and label for every rank-known slot that received at least
+    /// one segment prediction.
+    ///
+    /// The single definition of "this player's prediction for this match": the median over
+    /// their segments, matching `is_this_a_smurf`. Both the within-lobby metrics and the
+    /// threshold dump read it from here so the two cannot describe different numbers.
+    fn known_slots(&self) -> Vec<KnownSlot> {
+        let mut known = Vec::with_capacity(feature_extractor::TOTAL_PLAYERS);
+        for (slot, target) in self.targets.iter().enumerate() {
+            if *target <= 0.0 {
+                continue;
+            }
+            let Some(samples) = self.slot_predictions.get(slot) else {
+                continue;
+            };
+            if samples.is_empty() {
+                continue;
+            }
+            let mut sorted = samples.clone();
+            known.push(KnownSlot {
+                slot,
+                prediction_mmr: median_of(&mut sorted),
+                target_mmr: *target,
+                segments: samples.len(),
+            });
+        }
+        known
+    }
+}
+
+/// One rank-known player slot, collapsed from its segments to a whole-match prediction.
+#[derive(Debug, Clone, Copy)]
+struct KnownSlot {
+    slot: usize,
+    prediction_mmr: f32,
+    target_mmr: f32,
+    segments: usize,
 }
 
 /// Regroups per-segment validation predictions back into whole matches.
@@ -1345,6 +1401,31 @@ impl WithinLobbyAccumulator {
         }
     }
 
+    /// Every rank-known player's whole-match prediction, for threshold fitting.
+    ///
+    /// Applies the same `known.len() < 2` filter as [`Self::compute_metrics`], so the rows
+    /// emitted here are exactly the players the within-lobby metrics scored. Sorted by
+    /// `(replay_id, slot)` because the backing map is a `HashMap` and a dump has to be
+    /// reproducible.
+    fn player_predictions(&self) -> Vec<crate::threshold::PlayerPrediction> {
+        let mut rows = Vec::new();
+        for (replay_id, lobby) in &self.lobbies {
+            let known = lobby.known_slots();
+            if known.len() < 2 {
+                continue;
+            }
+            rows.extend(known.iter().map(|slot| crate::threshold::PlayerPrediction {
+                replay_id: *replay_id,
+                slot: slot.slot,
+                prediction_mmr: slot.prediction_mmr,
+                target_mmr: slot.target_mmr,
+                segments: slot.segments,
+            }));
+        }
+        rows.sort_by(|a, b| a.replay_id.cmp(&b.replay_id).then(a.slot.cmp(&b.slot)));
+        rows
+    }
+
     fn compute_metrics(&self) -> Option<WithinLobbyMetrics> {
         let mut player_sse = 0.0f64;
         let mut player_count = 0u64;
@@ -1366,20 +1447,11 @@ impl WithinLobbyAccumulator {
 
         for lobby in self.lobbies.values() {
             // (whole-match prediction, label) for rank-known slots only.
-            let mut known: Vec<(f32, f32)> = Vec::with_capacity(feature_extractor::TOTAL_PLAYERS);
-            for (slot, target) in lobby.targets.iter().enumerate() {
-                if *target <= 0.0 {
-                    continue;
-                }
-                let Some(samples) = lobby.slot_predictions.get(slot) else {
-                    continue;
-                };
-                if samples.is_empty() {
-                    continue;
-                }
-                let mut sorted = samples.clone();
-                known.push((median_of(&mut sorted), *target));
-            }
+            let known: Vec<(f32, f32)> = lobby
+                .known_slots()
+                .iter()
+                .map(|slot| (slot.prediction_mmr, slot.target_mmr))
+                .collect();
             if known.len() < 2 {
                 continue;
             }
@@ -1571,6 +1643,7 @@ pub fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBacke
             pred_std_mmr: 0.0,
             pearson_r: 0.0,
             within_lobby: None,
+            lobby_predictions: Vec::new(),
         };
     }
 
@@ -1692,6 +1765,7 @@ pub fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBacke
         pred_std_mmr,
         pearson_r,
         within_lobby: within_lobby_metrics,
+        lobby_predictions: within_lobby.player_predictions(),
     }
 }
 

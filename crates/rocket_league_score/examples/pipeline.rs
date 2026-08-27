@@ -21,6 +21,17 @@
 //!                       on T1/T2/T3.)
 //!   RESUME           - Resume from checkpoint (default: false)
 //!   `MAX_REPLAYS`      - Limit number of replays (default: None, uses all)
+//!   `SELF_ONLY_FEATURES` - Train on the self-only 27-feature view, zeroing the other
+//!                       five cars (default: false). This is the step-3 go/no-go ablation
+//!                       in `docs/smurf-detection-handoff.md`. Score it on within-lobby
+//!                       concordance / top-1, **not** RMSE: the lobby shortcut it removes
+//!                       is worth 98.4 % of the RMSE objective, so RMSE getting worse is
+//!                       the expected outcome and says nothing about the question.
+//!
+//! Step-3 ablation pair (fixed dev subset, same seed and subset for both):
+//!   `MODEL_NAME=lstm_v22_full MAX_REPLAYS=800 EPOCHS=40 cargo run --release --example pipeline`
+//!   `MODEL_NAME=lstm_v22_self SELF_ONLY_FEATURES=true MAX_REPLAYS=800 EPOCHS=40 \
+//!     cargo run --release --example pipeline`
 //!
 //! Example:
 //!   `DATABASE_URL=postgres`://... EPOCHS=50 cargo run --example pipeline
@@ -77,6 +88,7 @@ async fn main() -> Result<()> {
     let max_replays: Option<usize> = std::env::var("MAX_REPLAYS")
         .ok()
         .and_then(|s| s.parse().ok());
+    let self_only_features: bool = get_env_or_default("SELF_ONLY_FEATURES", false);
 
     info!("=== Full Training Pipeline ===");
     info!("Model name:    {model_name}");
@@ -92,23 +104,34 @@ async fn main() -> Result<()> {
         "Max replays:   {}",
         max_replays.map_or_else(|| "all".to_string(), |n| n.to_string())
     );
+    info!(
+        "Feature view:  {}",
+        if self_only_features {
+            "self-only-27 (ABLATION — context features zeroed)"
+        } else {
+            "full-106"
+        }
+    );
 
     // Initialize database
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable is required");
     initialize_pool(&database_url).await?;
 
-    // Run the full training pipeline
-    commands::full_pipeline::run(
-        &model_name,
+    // Run the full training pipeline. Built as a config rather than through
+    // `full_pipeline::run` so the ablation knobs are reachable from here.
+    let config = commands::full_pipeline::FullTrainConfig {
+        model_name,
         train_ratio,
         epochs,
         batch_size,
         learning_rate,
         resume,
+        checkpoint_every_n_epochs: 5,
         max_replays,
-    )
-    .await?;
+        self_only_features,
+    };
+    commands::full_pipeline::run_with_config(&config).await?;
 
     Ok(())
 }

@@ -20,6 +20,10 @@
 //!   cargo run --release --example revalidate -- \
 //!       --model models/lstm_v20/checkpoint_best --split evaluation
 //!
+//! Pass `--dump-predictions <CSV>` to also write the per-player whole-match predictions
+//! the within-lobby metrics were computed from. `fit_threshold` reads that file, so the
+//! flag threshold can be re-fitted as often as needed off a single scoring pass.
+//!
 //! Requires `DATABASE_URL`. Does not require the replay object store.
 
 use anyhow::{Context, Result};
@@ -33,7 +37,7 @@ use ml_model::SequenceModel;
 use ml_model_training::segment_cache::{SegmentStore, SegmentStoreBuilder, segment_directory};
 use ml_model_training::{SequenceBatcher, compute_validation_loss, load_checkpoint};
 use replay_structs::DatasetSplit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -65,6 +69,21 @@ struct Args {
     /// Cap the number of replays loaded (for a quick smoke run).
     #[arg(long)]
     limit: Option<usize>,
+
+    /// Write per-player whole-match predictions to this CSV.
+    ///
+    /// Scoring the full evaluation split costs about an hour on CPU; threshold fitting
+    /// costs milliseconds. Dumping the predictions once lets `fit_threshold` re-fit and
+    /// re-score any number of operating points without paying for the pass again.
+    #[arg(long)]
+    dump_predictions: Option<PathBuf>,
+
+    /// Score on the self-only 27-feature view, zeroing the other five cars.
+    ///
+    /// Must match how the checkpoint was trained (`TrainingConfig::self_only_features`).
+    /// Scoring a self-only checkpoint on the full view feeds it context it has never seen.
+    #[arg(long, default_value_t = false)]
+    self_only: bool,
 }
 
 fn parse_split(raw: &str) -> Result<DatasetSplit> {
@@ -192,7 +211,10 @@ async fn main() -> Result<()> {
     let model: SequenceModel<InferenceBackend> =
         load_checkpoint(&args.model, &device).context("Failed to load model checkpoint")?;
 
-    let batcher = SequenceBatcher::<InferenceBackend>::new(device, args.seq_len);
+    let feature_view = ml_model_training::FeatureView::from(args.self_only);
+    info!(feature_view = feature_view.label(), "Feature view");
+    let batcher =
+        SequenceBatcher::<InferenceBackend>::new(device, args.seq_len).with_feature_view(feature_view);
 
     info!("Scoring (frozen weights, no optimiser step)...");
     let result = compute_validation_loss(&model, &dataset, &batcher, args.batch_size);
@@ -224,5 +246,44 @@ async fn main() -> Result<()> {
         None => println!("within-lobby: unavailable (no lobby had two rank-known players)"),
     }
 
+    if let Some(path) = args.dump_predictions.as_ref() {
+        write_prediction_dump(path, &result.lobby_predictions)
+            .with_context(|| format!("failed to write prediction dump to {}", path.display()))?;
+        println!(
+            "dumped {} player predictions to {}",
+            result.lobby_predictions.len(),
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Writes one row per rank-known player slot.
+///
+/// Deliberately flat and self-describing: `fit_threshold` recomputes the lobby medians from
+/// these rows rather than trusting a stored margin, so the file stays valid if the
+/// centring convention ever changes.
+fn write_prediction_dump(
+    path: &Path,
+    predictions: &[ml_model_training::threshold::PlayerPrediction],
+) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = csv::Writer::from_path(path)?;
+    writer.write_record(["replay_id", "slot", "prediction_mmr", "target_mmr", "segments"])?;
+    for prediction in predictions {
+        writer.write_record([
+            prediction.replay_id.to_string(),
+            prediction.slot.to_string(),
+            format!("{:.4}", prediction.prediction_mmr),
+            format!("{:.4}", prediction.target_mmr),
+            prediction.segments.to_string(),
+        ])?;
+    }
+    writer.flush()?;
     Ok(())
 }

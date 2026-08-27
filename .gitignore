@@ -23,3 +23,7 @@ test_data/*.json
 *.pdb
 
 .env
+# Prediction dumps from `revalidate --dump-predictions` and the curves fitted off them.
+# Regenerable from a checkpoint, and large enough not to belong in git.
+data/*_predictions.csv
+data/*_curve.csv

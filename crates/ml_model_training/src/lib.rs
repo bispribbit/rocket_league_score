@@ -7,13 +7,16 @@ mod checkpoint;
 mod dataset;
 pub mod minibatch_loss;
 pub mod segment_cache;
+pub mod threshold;
 mod training;
 
 pub use checkpoint::{
     CheckpointValidationMetrics, ModelCheckpoint, ValidationRankRmseEntry, load_checkpoint,
     save_checkpoint, save_checkpoint_bin,
 };
-pub use dataset::{BatchPrefetcher, PreloadedBatchData, SequenceBatch, SequenceBatcher};
+pub use dataset::{
+    BatchPrefetcher, FeatureView, PreloadedBatchData, SequenceBatch, SequenceBatcher,
+};
 pub use minibatch_loss::{LabelJitterStep, MseExtremeMmrRowBoost};
 pub use training::{
     CheckpointConfig, TrainingOutput, TrainingState, ValidationLossResult, WithinLobbyMetrics,

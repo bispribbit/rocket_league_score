@@ -132,6 +132,13 @@ pub struct FullTrainConfig {
     /// Maximum number of replays to use (None = use all available).
     /// When set, replays are sampled across ranks for balanced distribution.
     pub max_replays: Option<usize>,
+    /// Train on the self-only 27-feature view, zeroing the other five cars.
+    ///
+    /// The go/no-go ablation in step 3 of `docs/smurf-detection-handoff.md`. Combine with
+    /// `max_replays` for the fixed dev subset that step asks for, and score the result on
+    /// within-lobby concordance / top-1 rather than RMSE — removing the lobby shortcut is
+    /// *expected* to make RMSE worse, since the shortcut is worth 98.4 % of that objective.
+    pub self_only_features: bool,
 }
 
 impl Default for FullTrainConfig {
@@ -149,6 +156,7 @@ impl Default for FullTrainConfig {
             resume: false,
             checkpoint_every_n_epochs: 5,
             max_replays: None,
+            self_only_features: false,
         }
     }
 }
@@ -188,6 +196,9 @@ pub async fn run(
         resume,
         checkpoint_every_n_epochs: 5,
         max_replays,
+        // Production always trains on the full 106-feature view. The self-only ablation
+        // goes through `run_with_config`, so it cannot be selected by accident here.
+        self_only_features: false,
     };
 
     Box::pin(run_with_config(&config)).await?;
@@ -216,7 +227,8 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     let mut training_config = TrainingConfig::new(model_config.clone())
         .with_learning_rate(config.learning_rate)
         .with_epochs(config.epochs)
-        .with_batch_size(config.batch_size);
+        .with_batch_size(config.batch_size)
+        .with_self_only_features(config.self_only_features);
 
     let fused_projection_estimate = estimate_fused_projection_memory(
         training_config.batch_size,

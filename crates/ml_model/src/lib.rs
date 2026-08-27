@@ -169,6 +169,19 @@ pub struct TrainingConfig {
     /// 300 frames ≈ 20 seconds of gameplay per segment.
     #[config(default = 300)]
     pub sequence_length: usize,
+    /// Zero the 79 context features (the other five cars) before the model sees them,
+    /// leaving only the focal player's own [`feature_extractor::SELF_PLAYER_FEATURE_COUNT`].
+    ///
+    /// This is the go/no-go ablation in step 3 of `docs/smurf-detection-handoff.md`: the
+    /// lobby shortcut is worth 98.4 % of the RMSE objective and is only reachable *through*
+    /// those context features, so removing them asks how much of the measured within-lobby
+    /// ordering (`concordance = 0.619`) was per-player signal all along.
+    ///
+    /// Lives on the training config rather than staying a CLI flag so it is written into
+    /// the checkpoint's config JSON — a self-only checkpoint must be scored on the self-only
+    /// view, and this is what lets a later run know that.
+    #[config(default = false)]
+    pub self_only_features: bool,
 }
 
 /// LSTM-based sequence model with split per-player + lobby encoders.
