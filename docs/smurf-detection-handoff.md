@@ -313,6 +313,34 @@ Either way this is still the right next experiment, and still the gate on steps 
 **After step 2.5 came back negative it is also the *only* remaining experiment** — there is
 no cheaper move left to try first.
 
+#### 🔴 IN FLIGHT as of 2026-08-26 22:26 EDT
+
+Both arms were launched sequentially and should finish ~08:50 EDT. **Check these before
+starting any new work** — if they completed, the go/no-go verdict is sitting in the logs.
+
+| arm | model name | feature view | log |
+|---|---|---|---|
+| control | `lstm_v22_full` | full-106 | `models/20260826_222608.txt` |
+| ablation | `lstm_v22_self` | self-only-27 | the next `models/*.txt` after it |
+
+Both: 3,000-replay dev subset (45,759 segments), 60 epochs, batch 144, `lr=3e-2`,
+validation on the whole evaluation split.
+
+```bash
+# The verdict. Compare the last one of these from each arm.
+grep "Within-lobby ordering" models/20260826_222608.txt | tail -3
+```
+
+Read `mixed lobbies (gap>=150): ... conc=`. **Control tells you what this data budget can
+reach at all** — it is not expected to match the `0.619` of the 255-epoch full-data run, and
+comparing the ablation against `0.619` instead of against its own control would be the easy
+mistake here. The comparison that answers step 3 is **ablation vs control**, both at 60
+epochs on the same 3,000 replays.
+
+If either arm died, `grep -c "completed in"` its log to see how far it got; `RESUME=true`
+with the same `MODEL_NAME` picks up from the last checkpoint (saved every 5 epochs), and
+skips warm-start by design.
+
 #### How to run it (machinery landed 2026-08-26)
 
 `FeatureView::SelfOnly` zeroes the 79 context features rather than narrowing the input
