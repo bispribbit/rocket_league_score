@@ -35,6 +35,35 @@ changes described here; append a new row for anything further.
 > is real but weak (`conc = 0.619`, lift 1.63×), and the question of whether it is genuinely
 > per-player or an artefact of lobby context is the one that decides whether steps 4–8 are
 > worth their multi-day training runs at all.
+>
+> ---
+>
+> ## ⭐ **Update 2026-08-27 — step 3 is done: GO, and it inverts the diagnosis above.**
+>
+> **Deleting the lobby context makes the model *better* at every ordinal metric.** Matched
+> 3,000-replay / 60-epoch pair, identical but for zeroing the 79 context features:
+>
+> | | mixed `conc` | `top1` | `detect` | `margin` |
+> |---|---|---|---|---|
+> | full-106 control | 0.621 | 28.7 % | 1.9 % | +21 MMR |
+> | **self-only-27** | **0.699** | **43.3 %** | **16.6 %** | **+82 MMR** |
+>
+> Detection ×8.7, margin ×4, top-1 2.6× chance. **Read the rest of this document with that
+> in mind, because several of its framings are now wrong:**
+>
+> - The lobby context is **not** merely "a shortcut worth 98.4 % of the objective that the
+>   model leans on". It is an active *nuisance input* that suppresses the per-player signal.
+>   The fix is not to out-compete the shortcut — it is to delete the input.
+> - **F3's "within-lobby variance is 1.6 % of total" is a fact about the RMSE objective, not
+>   about what is learnable.** The ordinal signal is perfectly healthy without the 98.4 %.
+>   Most of the "specification problem" framing below over-reads this number.
+> - **F6/step 2.5's "distribution-shape problem" is a context problem and it is fixable.**
+>   The heavy negative tail that made strict thresholds useless was lobby-context noise.
+> - **Step 5 may be over-engineered.** A plain self-only model beats the full-context one
+>   outright; try that before building two towers.
+> - **F9 is answered.** The control matched the 255-epoch full-data run's `0.619` using 11 %
+>   of the replays and 24 % of the epochs, so the fixed dev subset is now the eval protocol
+>   and this metric never needs a 6-day run again.
 
 Companion doc: [`overfit_wgpu.md`](overfit_wgpu.md) for the regression harness.
 
@@ -294,63 +323,48 @@ best detections; the usable signal sits in modest margins (`+20`…`+80`).
 value** — and no monotone recalibration can change a shape. That closes the threshold as a
 line of attack and moves the decision entirely onto step 3.
 
-### 3. Go/no-go ablation, scored ordinally
+### 3. Go/no-go ablation, scored ordinally — ✅ DONE 2026-08-27, verdict **GO**
 
-On a fixed dev subset, train the existing architecture on the **self-only 27-feature
-slice**, scored by **within-lobby concordance / top-1 on held-out mixed lobbies**, not RMSE.
+Matched pair on a fixed 3,000-replay dev subset, 60 epochs each, differing in exactly one
+thing. Row 26 of `experiment.md` has the full write-up.
 
-**Re-framed by step 1.** The original question was "is per-player skill legible at all",
-and step 1 answered yes — `conc=0.619` on mixed lobbies is not reachable through the lobby
-shortcut. The live question is now narrower and sharper: **how much of that 0.619 survives
-when lobby context is removed?**
+| arm | mixed `conc` | `top1` | `detect` | `margin` | `pred_std` | `pearson_r` |
+|---|---|---|---|---|---|---|
+| control `lstm_v22_full` (full-106) | 0.621 | 28.7 % | 1.9 % | +21 MMR | 431.5 | 0.802 |
+| **ablation `lstm_v22_self` (self-only-27)** | **0.699** | **43.3 %** | **16.6 %** | **+82 MMR** | 414.6 | 0.774 |
 
-- Self-only holds near 0.619 → the signal was per-player all along; the two-tower plan is
-  sound and F7's objection to `mixed_rank_eval` dissolves.
-- Self-only collapses toward 0.500 → the current edge is coming from context the two-tower
-  split is designed to strip out, and the real work is per-player feature engineering.
+**Removing the lobby context improves every ordinal metric.** Concordance +0.078, top-1
++14.6 points (2.6× the 16.7 % chance rate), detection **8.7×**, mean margin roughly **4×**.
+`pearson_r` and RMSE degrade, exactly as predicted — the shortcut is worth 98.4 % of the
+*RMSE* objective, so losing it must cost there. That regression is the ablation working.
 
-Either way this is still the right next experiment, and still the gate on steps 4–8.
-**After step 2.5 came back negative it is also the *only* remaining experiment** — there is
-no cheaper move left to try first.
+**This document enumerated two outcomes and got neither.** It expected self-only either to
+hold near 0.619 or to collapse toward 0.500. It **exceeded** the control instead, which
+means the per-player signal was not merely *diluted* by lobby context but **suppressed** by
+it: the other five cars act as a high-variance nuisance input that the shared LSTM mixes
+into every slot's representation.
 
-#### 🟡 Control done, ablation IN FLIGHT as of 2026-08-27 03:43 EDT
+**It also retro-explains step 2.5.** That step found the margin distribution's heavy right
+tail belonged to the *negatives* (p99 `+456` for non-smurfs vs `+178` for smurfs), which is
+why the strictest thresholds were the least precise. That tail is lobby-context noise: strip
+it and the mean margin goes `+21 → +82 MMR` with the `+200` rule untouched. **The shape
+problem step 2.5 identified is a context problem, and it is fixable.**
 
-Ablation arm should finish ~09:00 EDT. **Check it before starting any new work** — if it
-completed, the go/no-go verdict is sitting in its log.
+Consequences:
 
-| arm | model name | feature view | log | result |
-|---|---|---|---|---|
-| control | `lstm_v22_full` | full-106 | `models/20260826_222608.txt` | ✅ `conc=0.621`, `top1=28.7 %` |
-| ablation | `lstm_v22_self` | self-only-27 | `models/20260827_034256.txt` | 🔴 running |
+- **Step 5's two-tower design is validated — but the cheaper reading is that the skill tower
+  should simply not see context at all.** A plain self-only model already beats the
+  full-context one on everything that matters here. Try that before building two towers.
+- **F7 dissolves.** `mixed_rank_eval` is a valid instrument once the tower is self-only.
+- **F3 needs restating.** "1.6 % of label variance is within-lobby" describes the RMSE
+  objective, not what is learnable; the ordinal signal survives fine without the 98.4 %.
+- **Steps 4–8 are unblocked**, and step 2.5's threshold fit should be re-run on every new
+  checkpoint (it is one command now) rather than re-litigated.
 
-**The control result is itself worth recording.** At 3,000 replays and 60 epochs it reaches
-`conc=0.621` on mixed lobbies — statistically the same as the **0.619** that the epoch-255
-checkpoint reached on all 27,150 replays. Within-lobby ordering apparently saturates at ~11 %
-of the data and ~24 % of the epochs, which is direct support for F9's fixed-dev-subset
-proposal: this metric does not need a 6-day run to be measured. It also means the control is
-a fair stand-in for the production model, so the ablation delta reads as a real effect rather
-than an artefact of a starved budget.
-
-Run health was good — `pred_std=431.5 MMR`, `pearson_r=0.802`, no collapse; 560 epochs
-(500 warm-start + 60 main) and exactly 70 validation passes, confirming the cadence fix.
-
-Both: 3,000-replay dev subset (45,759 segments), 60 epochs, batch 144, `lr=3e-2`,
-validation on the whole evaluation split.
-
-```bash
-# The verdict. Compare the last one of these from each arm.
-grep "Within-lobby ordering" models/20260826_222608.txt | tail -3
-```
-
-Read `mixed lobbies (gap>=150): ... conc=`. **Control tells you what this data budget can
-reach at all** — it is not expected to match the `0.619` of the 255-epoch full-data run, and
-comparing the ablation against `0.619` instead of against its own control would be the easy
-mistake here. The comparison that answers step 3 is **ablation vs control**, both at 60
-epochs on the same 3,000 replays.
-
-If either arm died, `grep -c "completed in"` its log to see how far it got; `RESUME=true`
-with the same `MODEL_NAME` picks up from the last checkpoint (saved every 5 epochs), and
-skips warm-start by design.
+**Secondary finding — F9 is validated.** The control reached `conc=0.621` at 11 % of the
+replays and 24 % of the epochs, against the epoch-255 full-data run's `0.619`. Within-lobby
+ordering saturates far below the full budget, so **the fixed dev subset should become the
+standard eval protocol** and this metric never needs a 6-day run again.
 
 #### How to run it (machinery landed 2026-08-26)
 
