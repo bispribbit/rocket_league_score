@@ -5,9 +5,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 
 use burn::prelude::*;
-use feature_extractor::{
-    PLAYER_CENTRIC_FEATURE_COUNT, SELF_PLAYER_FEATURE_COUNT, TOTAL_PLAYERS,
-};
+use feature_extractor::{PLAYER_CENTRIC_FEATURE_COUNT, SELF_PLAYER_FEATURE_COUNT, TOTAL_PLAYERS};
 use rayon::prelude::*;
 use tracing::info;
 
@@ -81,7 +79,11 @@ impl FeatureView {
 impl From<bool> for FeatureView {
     /// Maps `TrainingConfig::self_only_features` onto the view it selects.
     fn from(self_only: bool) -> Self {
-        if self_only { Self::SelfOnly } else { Self::Full }
+        if self_only {
+            Self::SelfOnly
+        } else {
+            Self::Full
+        }
     }
 }
 
@@ -412,7 +414,10 @@ mod tests {
         for (index, (masked, before)) in data.iter().zip(original.iter()).enumerate() {
             let column = index % PLAYER_CENTRIC_FEATURE_COUNT;
             if column < SELF_PLAYER_FEATURE_COUNT {
-                assert_eq!(masked, before, "self feature at column {column} was altered");
+                assert_eq!(
+                    masked, before,
+                    "self feature at column {column} was altered"
+                );
             } else {
                 assert_eq!(*masked, 0.0, "context feature at column {column} survived");
             }

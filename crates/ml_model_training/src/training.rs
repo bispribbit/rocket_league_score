@@ -61,11 +61,44 @@ pub struct TrainingState {
     pub best_pred_std_mmr: f32,
     /// Highest validation Pearson correlation recorded at the last collapse-progress reset.
     pub best_pearson_r: f32,
+    /// Best within-lobby concordance seen so far, or `-1.0` before any validation pass
+    /// reported enough comparable pairs to trust.
+    ///
+    /// Tracked separately from [`Self::best_valid_loss`] because the two disagree by
+    /// design. Validation loss is dominated by getting the lobby *level* right, which is
+    /// 98.4 % of the label variance; concordance measures ordering *inside* the lobby,
+    /// which is the entire product. A run that trades the former for the latter — the
+    /// self-only feature view does exactly that — looks like a regression to
+    /// `best_valid_loss` and like progress here.
+    pub best_concordance: f32,
     /// Validation passes since the last collapse-progress gain (spread or correlation).
     pub epochs_without_collapse_progress: usize,
     /// When `true`, the collapse-aware smart cutoff is armed. Set only for the main
     /// training run so it never truncates the warm-start escape phase or ad-hoc callers.
     pub collapse_cutoff_enabled: bool,
+}
+
+/// Minimum comparable within-lobby pairs before [`ordinal_selection_score`] will report
+/// a number. Guards against an early or thin validation pass setting a bogus best from a
+/// handful of pairs; the full evaluation split supplies ~5,800.
+const ORDINAL_MIN_COMPARABLE_PAIRS: usize = 500;
+
+/// Minimum concordance gain that counts as ordinal progress.
+///
+/// Concordance moves in small increments (the step-3 ablation was worth +0.078 in total),
+/// so this is deliberately far below that — it only filters out numerical noise.
+const ORDINAL_PROGRESS_MIN_GAIN: f32 = 0.001;
+
+/// The scalar checkpoint selection uses when the goal is within-lobby ordering rather
+/// than per-segment accuracy.
+///
+/// Uses overall concordance rather than the mixed-lobby restriction: the mixed subset is
+/// only ~157 scored lobbies, far too noisy to select a checkpoint on, while overall
+/// concordance is computed over thousands of pairs and moves in the same direction.
+fn ordinal_selection_score(within: Option<&WithinLobbyMetrics>) -> Option<f32> {
+    within
+        .filter(|metrics| metrics.comparable_pairs >= ORDINAL_MIN_COMPARABLE_PAIRS)
+        .map(|metrics| metrics.concordance)
 }
 
 fn checkpoint_validation_metrics_from_state(
@@ -92,6 +125,7 @@ impl TrainingState {
             tail_rank_baseline: None,
             best_pred_std_mmr: 0.0,
             best_pearson_r: -1.0,
+            best_concordance: -1.0,
             epochs_without_collapse_progress: 0,
             collapse_cutoff_enabled: false,
         }
@@ -381,9 +415,7 @@ pub fn lookup_rank_weights(mean_target_mmr_slice: &[f32], rank_weights: &[f32]) 
 /// basin check both read them, and a `None` there would be indistinguishable from "no
 /// validation set was supplied".
 fn should_validate_epoch(epoch: usize, total_epochs: usize, every_n_epochs: usize) -> bool {
-    every_n_epochs <= 1
-        || epoch + 1 >= total_epochs
-        || (epoch + 1).is_multiple_of(every_n_epochs)
+    every_n_epochs <= 1 || epoch + 1 >= total_epochs || (epoch + 1).is_multiple_of(every_n_epochs)
 }
 
 pub fn train<B: AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend>(
@@ -719,6 +751,7 @@ where
             should_validate_epoch(epoch, config.epochs, config.validate_every_n_epochs);
 
         let mut improved = false;
+        let mut ordinal_improved = false;
         if let Some(valid_ds) = valid_dataset.filter(|_| should_validate) {
             let valid_start = Instant::now();
             let inner_model = model.valid();
@@ -733,6 +766,22 @@ where
             state.current_valid_loss = Some(validation_result.loss);
             state.last_validation_pred_std_mmr = Some(validation_result.pred_std_mmr);
             state.last_validation_within_lobby = validation_result.within_lobby;
+
+            // Ordinal progress, tracked independently of validation loss. On a self-only
+            // run the two move in opposite directions by construction, so selecting and
+            // stopping on loss alone would discard the checkpoint that is best at the job.
+            if let Some(concordance) =
+                ordinal_selection_score(state.last_validation_within_lobby.as_ref())
+                && concordance - state.best_concordance >= ORDINAL_PROGRESS_MIN_GAIN
+            {
+                info!(
+                    concordance,
+                    previous_best = state.best_concordance,
+                    "Within-lobby concordance improved"
+                );
+                state.best_concordance = concordance;
+                ordinal_improved = true;
+            }
             if let Some(baseline) = state.tail_rank_baseline.as_deref() {
                 log_tail_rank_guard(baseline, &validation_result.rank_rmse_entries);
             }
@@ -804,6 +853,12 @@ where
                 state.best_valid_loss = validation_result.loss;
                 state.epochs_without_improvement = 0;
                 improved = true;
+            } else if ordinal_improved {
+                // Validation loss stalled while within-lobby ordering is still climbing.
+                // That is the expected shape of a run that trades lobby-level accuracy for
+                // per-player discrimination, so it must not count against patience —
+                // otherwise early stopping kills exactly the runs we are trying to produce.
+                state.epochs_without_improvement = 0;
             } else {
                 state.epochs_without_improvement += 1;
                 if state.epochs_without_improvement >= EARLY_STOPPING_PATIENCE {
@@ -846,18 +901,29 @@ where
             state.current_valid_loss,
         );
 
-        // Checkpoint saving
+        // Checkpoint saving. The three suffixes are independent and a single epoch may
+        // write more than one: `_epochN` on the periodic cadence, `_best` on validation
+        // loss, `_best_ordinal` on within-lobby concordance. `_best` and `_epochN` used to
+        // be mutually exclusive, which silently dropped every loss improvement that landed
+        // on a multiple of `save_every_n_epochs`.
         if let Some(ckpt_cfg) = &checkpoint_config {
             let should_save_periodic =
                 ckpt_cfg.save_every_n_epochs > 0 && (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0;
             let should_save_improvement = ckpt_cfg.save_on_improvement && improved;
+            let should_save_ordinal = ckpt_cfg.save_on_improvement && ordinal_improved;
 
-            if should_save_periodic || should_save_improvement {
-                let suffix = if should_save_improvement && !should_save_periodic {
-                    "best".to_string()
-                } else {
-                    format!("epoch{}", epoch + 1)
-                };
+            let mut suffixes: Vec<String> = Vec::new();
+            if should_save_periodic {
+                suffixes.push(format!("epoch{}", epoch + 1));
+            }
+            if should_save_improvement {
+                suffixes.push("best".to_string());
+            }
+            if should_save_ordinal {
+                suffixes.push("best_ordinal".to_string());
+            }
+
+            for suffix in suffixes {
                 let path = format!("{}_{}", ckpt_cfg.path_prefix, suffix);
 
                 let validation_metrics = checkpoint_validation_metrics_from_state(&state);
@@ -1866,7 +1932,64 @@ fn log_progress(epoch: usize, train_loss: f32, valid_loss: Option<f32>) {
 mod tests {
     use super::*;
 
+    /// Builds a `WithinLobbyMetrics` carrying only the two fields checkpoint selection
+    /// reads; everything else is irrelevant to `ordinal_selection_score` and is zeroed.
+    fn within_lobby_with(concordance: f32, comparable_pairs: usize) -> WithinLobbyMetrics {
+        WithinLobbyMetrics {
+            lobbies: 0,
+            player_match_rmse_mmr: 0.0,
+            lobby_rmse_mmr: 0.0,
+            between_rmse_mmr: 0.0,
+            within_rmse_mmr: 0.0,
+            concordance,
+            comparable_pairs,
+            mixed_lobbies: 0,
+            mixed_concordance: 0.0,
+            mixed_scored_lobbies: 0,
+            mixed_top1_rate: 0.0,
+            mixed_detection_rate: 0.0,
+            mixed_mean_margin_mmr: 0.0,
+        }
+    }
+
+    /// A validation pass with no lobby metrics at all cannot select a checkpoint.
     #[test]
+    fn ordinal_score_is_absent_without_lobby_metrics() {
+        assert!(ordinal_selection_score(None).is_none());
+    }
+
+    /// A thin pass must not be able to set a bogus best from a handful of pairs — a
+    /// checkpoint chosen off 3 lucky pairs would outrank every honest one for the rest
+    /// of the run, since `best_concordance` never decreases.
+    #[test]
+    fn ordinal_score_rejects_too_few_pairs() {
+        let thin = within_lobby_with(1.0, ORDINAL_MIN_COMPARABLE_PAIRS - 1);
+        assert!(ordinal_selection_score(Some(&thin)).is_none());
+
+        let enough = within_lobby_with(0.55, ORDINAL_MIN_COMPARABLE_PAIRS);
+        assert_eq!(ordinal_selection_score(Some(&enough)), Some(0.55));
+    }
+
+    /// Selection reads overall concordance, not the mixed-lobby restriction: the mixed
+    /// subset is ~157 scored lobbies and far too noisy to checkpoint on.
+    #[test]
+    fn ordinal_score_uses_overall_not_mixed_concordance() {
+        let mut metrics = within_lobby_with(0.60, 5_777);
+        metrics.mixed_concordance = 0.95;
+        assert_eq!(ordinal_selection_score(Some(&metrics)), Some(0.60));
+    }
+
+    /// The step-3 gap (0.621 → 0.699) must register as progress, while numerical jitter
+    /// well below it must not.
+    #[test]
+    fn ordinal_progress_threshold_admits_real_gains_and_rejects_noise() {
+        let step_three_gain = 0.699_f32 - 0.621_f32;
+        assert!(step_three_gain >= ORDINAL_PROGRESS_MIN_GAIN);
+
+        let noise = 0.000_1_f32;
+        assert!(noise < ORDINAL_PROGRESS_MIN_GAIN);
+    }
+
     /// The default cadence validates every epoch — production behaviour must be unchanged.
     #[test]
     fn validation_cadence_default_validates_every_epoch() {
@@ -1886,12 +2009,19 @@ mod tests {
         assert!(should_validate_epoch(99, total, every));
         assert!(!should_validate_epoch(0, total, every));
         assert!(!should_validate_epoch(48, total, every));
-        assert!(should_validate_epoch(total - 1, total, every), "final epoch");
+        assert!(
+            should_validate_epoch(total - 1, total, every),
+            "final epoch"
+        );
 
         let passes = (0..total)
             .filter(|&epoch| should_validate_epoch(epoch, total, every))
             .count();
-        assert_eq!(passes, total / every, "expected one pass per cadence window");
+        assert_eq!(
+            passes,
+            total / every,
+            "expected one pass per cadence window"
+        );
     }
 
     /// The final-epoch guarantee must hold even when the total is not a multiple of the

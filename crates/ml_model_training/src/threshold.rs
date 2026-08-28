@@ -637,10 +637,12 @@ mod tests {
             point.flag_rate
         );
         // Nobody tied at the boundary got flagged.
-        assert!(samples
-            .iter()
-            .filter(|s| s.margin_mmr > point.threshold_mmr)
-            .all(|s| s.margin_mmr.abs() > 1e-6));
+        assert!(
+            samples
+                .iter()
+                .filter(|s| s.margin_mmr > point.threshold_mmr)
+                .all(|s| s.margin_mmr.abs() > 1e-6)
+        );
     }
 
     /// The split keeps every lobby whole, is deterministic, and loses nobody.
