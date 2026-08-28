@@ -418,10 +418,42 @@ Step 3 came back GO and changed what several of these are worth. The original or
 written when the lobby shortcut was believed to be something the model *leans on*; it is
 actually a nuisance input that *suppresses* the signal. Recommended order now:
 
-**0. Re-baseline on self-only, at full data.** Not in the original list because nobody
-expected it to be a change on its own. It is the single biggest proven win available and
-costs one flag (`SELF_ONLY_FEATURES=true`) on a normal production run. Do this first;
-everything below should be measured against it, not against `lstm_v20`.
+**0. Re-baseline on self-only, at full data.** — 🟡 **RUNNING, launched 2026-08-27 20:29 EDT
+(`lstm_v23_self`)**, `SELF_ONLY_FEATURES=true`, all 27,150 training replays, 100 epochs,
+batch 144, `lr=3e-2`. ETA ~2–3 days. Not in the original list because nobody expected the
+ablation to be an improvement on its own. It is the single biggest proven win available and
+costs one flag on a normal production run; everything below should be measured against it,
+not against `lstm_v20`.
+
+*Read it on `checkpoint_best_ordinal`, not `checkpoint_best`* — see the checkpoint-selection
+note below. *What the run decides:* the 3,000-replay arm reached `conc=0.699` / `top1=43.3 %`.
+Materially past that means data volume is still buying ordinal signal and is worth spending
+on; landing flat at ~0.70 means data is **not** the constraint and the negative right tail
+(item 2) is the only remaining lever. Either answer is directional.
+
+#### Checkpoint selection had to be fixed first (2026-08-27, commits `f9c2858`, `33383cd`)
+
+Two defects that would have silently spoiled this run, both found before spending the GPU
+time and neither specific to it:
+
+1. **`checkpoint_best` is selected on per-segment validation loss**, which is ~98.4 %
+   lobby-level accuracy — precisely the objective the self-only view trades away. On a
+   self-only run that rule selects *against* the thing the run exists to produce, and
+   `EARLY_STOPPING_PATIENCE` could terminate the run while concordance was still climbing.
+   `TrainingState::best_concordance` now tracks overall within-lobby concordance (~5,800
+   pairs — the mixed-lobby restriction is ~157 scored lobbies, far too noisy to checkpoint
+   on), writes a separate **`_best_ordinal`** checkpoint, and resets early-stopping patience
+   on ordinal progress. **Implication for rows 26–27: both step-3 arms were scored on
+   loss-selected checkpoints, so those numbers are, if anything, understated.**
+2. **`revalidate --self-only` was a flag you had to remember.** Omitting it on a self-only
+   checkpoint scores the model on context it has never seen and produces a wrong number that
+   looks entirely normal. It now defaults from the checkpoint's own `.config.json`
+   (`self_only_features`), with the flag retained as an explicit override. Checkpoints
+   predating the field parse as `false`, which is correct — they were full-view.
+
+Also fixed in the same block: `_best` and `_epochN` were mutually exclusive suffixes, so any
+validation-loss improvement landing on a multiple of `save_every_n_epochs` was silently
+dropped from `_best`.
 
 **1. Step 7 — cross-lobby ranking supervision (F8).** Its stated precondition, "valid only
 once the skill tower is self-only", is **now met**. Any two players from any two lobbies form
