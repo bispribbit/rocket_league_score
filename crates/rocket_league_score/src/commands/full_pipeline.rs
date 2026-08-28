@@ -1142,6 +1142,18 @@ fn build_target_mmr_from_players(players: &[replay_structs::ReplayPlayer]) -> [f
 }
 
 /// Finds the latest checkpoint file for a given prefix.
+/// Finds the checkpoint to resume from.
+///
+/// Prefers the highest **numbered** checkpoint (`checkpoint_epoch{N}`) over any unnumbered
+/// one, falling back to modification time only when no numbered checkpoint exists.
+///
+/// Modification time alone is not enough. A single epoch can write `_epochN`, `_best` and
+/// `_best_ordinal` together, and only the first carries its epoch in the filename — so the
+/// newest file on disk is routinely one whose epoch [`extract_epoch_from_checkpoint`]
+/// cannot read. Resuming from that restarts `start_epoch` at 0, which silently resets the
+/// cosine LR schedule: the run re-warms to peak LR instead of continuing into decay. The
+/// weights are correct either way, which is exactly why this is worth pinning down — the
+/// symptom is a wrong learning-rate trajectory, not an obviously broken model.
 fn find_latest_checkpoint(prefix: &str) -> Result<Option<String>> {
     let parent = std::path::Path::new(prefix)
         .parent()
@@ -1174,24 +1186,25 @@ fn find_latest_checkpoint(prefix: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    // Sort by modification time (newest first)
+    // Highest known epoch first; unnumbered checkpoints last, ordered by mtime among
+    // themselves so the old behaviour still applies when nothing is numbered.
     checkpoints.sort_by(|a, b| {
-        let a_time = std::fs::metadata(a)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let b_time = std::fs::metadata(b)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        b_time.cmp(&a_time)
+        let a_epoch = extract_epoch_from_checkpoint(a);
+        let b_epoch = extract_epoch_from_checkpoint(b);
+        b_epoch.cmp(&a_epoch).then_with(|| {
+            let modified = |path: &String| {
+                std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            };
+            modified(b).cmp(&modified(a))
+        })
     });
 
     // Return the path without the .mpk extension (as expected by load_checkpoint)
-    if let Some(latest) = checkpoints.first() {
-        let path = latest.trim_end_matches(".mpk");
-        Ok(Some(path.to_string()))
-    } else {
-        Ok(None)
-    }
+    Ok(checkpoints
+        .first()
+        .map(|latest| latest.trim_end_matches(".mpk").to_string()))
 }
 
 /// Extracts the epoch number from a checkpoint filename.
@@ -1210,6 +1223,78 @@ fn extract_epoch_from_checkpoint(path: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// A numbered checkpoint must win over a newer unnumbered one. Writing `_epochN`,
+    /// `_best` and `_best_ordinal` in the same epoch leaves the unnumbered files newest on
+    /// disk; resuming from those loses `start_epoch` and silently restarts the LR schedule.
+    #[test]
+    fn latest_checkpoint_prefers_a_numbered_epoch_over_a_newer_unnumbered_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ckpt_pref_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Written in the order the training loop writes them, so the unnumbered files
+        // genuinely carry the newer mtime.
+        for name in [
+            "checkpoint_epoch10.mpk",
+            "checkpoint_epoch15.mpk",
+            "checkpoint_best.mpk",
+            "checkpoint_best_ordinal.mpk",
+        ] {
+            std::fs::write(dir.join(name), b"x").expect("write checkpoint");
+        }
+
+        let prefix = dir.join("checkpoint").to_string_lossy().to_string();
+        let latest = find_latest_checkpoint(&prefix)
+            .expect("find_latest_checkpoint")
+            .expect("a checkpoint");
+
+        assert!(
+            latest.ends_with("checkpoint_epoch15"),
+            "expected the highest numbered epoch, got {latest}"
+        );
+        assert_eq!(extract_epoch_from_checkpoint(&latest), Some(15));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With nothing numbered, fall back to the previous modification-time behaviour rather
+    /// than refusing to resume.
+    #[test]
+    fn latest_checkpoint_falls_back_to_mtime_when_nothing_is_numbered() {
+        let dir = std::env::temp_dir().join(format!(
+            "ckpt_fallback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        std::fs::write(dir.join("checkpoint_best.mpk"), b"x").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("checkpoint_best_ordinal.mpk"), b"x").expect("write");
+
+        let prefix = dir.join("checkpoint").to_string_lossy().to_string();
+        let latest = find_latest_checkpoint(&prefix)
+            .expect("find_latest_checkpoint")
+            .expect("a checkpoint");
+
+        assert!(
+            latest.ends_with("checkpoint_best_ordinal"),
+            "expected the newest unnumbered checkpoint, got {latest}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_extract_epoch_from_checkpoint() {
