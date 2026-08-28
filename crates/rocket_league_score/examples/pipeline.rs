@@ -31,9 +31,16 @@
 //!                       the expected outcome and says nothing about the question.
 //!
 //! Step-3 ablation pair (fixed dev subset, same seed and subset for both):
-//!   `MODEL_NAME=lstm_v22_full MAX_REPLAYS=800 EPOCHS=40 cargo run --release --example pipeline`
-//!   `MODEL_NAME=lstm_v22_self SELF_ONLY_FEATURES=true MAX_REPLAYS=800 EPOCHS=40 \
-//!     cargo run --release --example pipeline`
+//!   `MODEL_NAME=lstm_v22_full DEV_SUBSET_REPLAYS=3000 EPOCHS=60 cargo run --release --example pipeline`
+//!   `MODEL_NAME=lstm_v22_self SELF_ONLY_FEATURES=true DEV_SUBSET_REPLAYS=3000 EPOCHS=60 cargo run --release --example pipeline`
+//!
+//! Self-only re-baseline at full data (step-3 follow-up, `lstm_v23_self`):
+//!   `MODEL_NAME=lstm_v23_self SELF_ONLY_FEATURES=true EPOCHS=100 cargo run --release --example pipeline`
+//!
+//! **Score a self-only run on `checkpoint_best_ordinal`, not `checkpoint_best`.** The
+//! latter is selected on per-segment validation loss, which is ~98.4 % lobby-level
+//! accuracy — precisely the objective this feature view gives up. `_best_ordinal` is
+//! selected on within-lobby concordance instead.
 //!
 //! Example:
 //!   `DATABASE_URL=postgres`://... EPOCHS=50 cargo run --example pipeline

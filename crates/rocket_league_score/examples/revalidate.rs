@@ -39,7 +39,7 @@ use ml_model_training::{SequenceBatcher, compute_validation_loss, load_checkpoin
 use replay_structs::DatasetSplit;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Eval-only path: NdArray on CPU avoids GPU autotune issues (e.g. WSL `dzn` lacking
@@ -80,10 +80,31 @@ struct Args {
 
     /// Score on the self-only 27-feature view, zeroing the other five cars.
     ///
-    /// Must match how the checkpoint was trained (`TrainingConfig::self_only_features`).
-    /// Scoring a self-only checkpoint on the full view feeds it context it has never seen.
-    #[arg(long, default_value_t = false)]
-    self_only: bool,
+    /// Defaults to whatever the checkpoint was trained with, read from its
+    /// `.config.json`. Scoring a self-only checkpoint on the full view feeds it context it
+    /// has never seen and silently understates it, so this is deliberately not a flag you
+    /// have to remember — pass it only to override the recorded value.
+    #[arg(long)]
+    self_only: Option<bool>,
+}
+
+/// Reads `self_only_features` back out of a checkpoint's `.config.json`.
+///
+/// Returns `false` when the file predates the field or cannot be parsed: every checkpoint
+/// written before the step-3 ablation existed was trained on the full view.
+fn checkpoint_self_only(model_path: &str) -> bool {
+    let config_path = format!("{model_path}.config.json");
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        warn!(
+            config_path,
+            "No checkpoint config found; assuming the full-106 feature view"
+        );
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("self_only_features")?.as_bool())
+        .unwrap_or(false)
 }
 
 fn parse_split(raw: &str) -> Result<DatasetSplit> {
@@ -211,8 +232,13 @@ async fn main() -> Result<()> {
     let model: SequenceModel<InferenceBackend> =
         load_checkpoint(&args.model, &device).context("Failed to load model checkpoint")?;
 
-    let feature_view = ml_model_training::FeatureView::from(args.self_only);
-    info!(feature_view = feature_view.label(), "Feature view");
+    let self_only = args.self_only.unwrap_or_else(|| checkpoint_self_only(&args.model));
+    let feature_view = ml_model_training::FeatureView::from(self_only);
+    info!(
+        feature_view = feature_view.label(),
+        source = if args.self_only.is_some() { "--self-only" } else { "checkpoint config" },
+        "Feature view"
+    );
     let batcher =
         SequenceBatcher::<InferenceBackend>::new(device, args.seq_len).with_feature_view(feature_view);
 
