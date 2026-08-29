@@ -418,18 +418,34 @@ Step 3 came back GO and changed what several of these are worth. The original or
 written when the lobby shortcut was believed to be something the model *leans on*; it is
 actually a nuisance input that *suppresses* the signal. Recommended order now:
 
-**0. Re-baseline on self-only, at full data.** — 🟡 **RUNNING, launched 2026-08-27 20:29 EDT
-(`lstm_v23_self`)**, `SELF_ONLY_FEATURES=true`, all 27,150 training replays, 100 epochs,
-batch 144, `lr=3e-2`. ETA ~2–3 days. Not in the original list because nobody expected the
-ablation to be an improvement on its own. It is the single biggest proven win available and
-costs one flag on a normal production run; everything below should be measured against it,
-not against `lstm_v20`.
+**0. Re-baseline on self-only, at full data.** — ✅ **DONE 2026-08-29 (`lstm_v23_self`), verdict
+split: ordinal GO, detection NO-GO.** 27,150 replays, 30 epochs, `SELF_ONLY_FEATURES=true`,
+scored on `checkpoint_best_ordinal` (epoch 28). Full detail in experiment.md row 28.
 
-*Read it on `checkpoint_best_ordinal`, not `checkpoint_best`* — see the checkpoint-selection
-note below. *What the run decides:* the 3,000-replay arm reached `conc=0.699` / `top1=43.3 %`.
-Materially past that means data volume is still buying ordinal signal and is worth spending
-on; landing flat at ~0.70 means data is **not** the constraint and the negative right tail
-(item 2) is the only remaining lever. Either answer is directional.
+| | `lstm_v22_self` (3k, 60 ep) | `lstm_v23_self` (27k, 30 ep) |
+|---|---|---|
+| overall concordance | 0.600 | **0.611** |
+| mixed concordance | 0.696 | **0.734** |
+| top-1 | 46.2 % | **47.8 %** |
+| shipped `+200` precision | 8.1 % (33/408) | 7.3 % (30/409) |
+| average precision / lift | 0.0543 / 2.17× | 0.0543 / **2.16×** |
+| best held-out F1 | 0.125 | 0.111 |
+| held-out negatives p99 | +385.5 | **+434.3** |
+
+**The ordinal metrics improved and the detection metrics did not move at all** — average
+precision is identical to three significant figures. Nine times the data bought `+0.011`
+concordance and **zero** precision, and the negative right tail actually pushed *further* out
+(p99 `+386 → +434`) while the positive tail pulled *in* (`+304 → +271`).
+
+**This is the cleanest separation of the two problems so far, and it should govern what comes
+next.** Ranking quality (does the model order lobbymates correctly?) and tail shape (does a
+threshold on the margin isolate smurfs?) are **independent axes**. Only the first responds to
+scale. The extreme right tail is populated by ordinary players the model over-rates, and more
+data does not thin it — so **"train on more data" is retired as a lever for the product
+metric**, and item 2 below (tail compression) is now the only well-motivated direction.
+
+*Also settled:* full data is not required to measure ordinal changes — but a **completed LR
+schedule is**. See the schedule warning in the build notes.
 
 #### Checkpoint selection had to be fixed first (2026-08-27, commits `f9c2858`, `33383cd`)
 
@@ -556,6 +572,29 @@ within-lobby separation.
   ablation arms see identical data. `max_replays` should probably be deleted.
 
 ## Build notes
+
+### LR schedule: never judge an ordinal metric before decay
+
+`cosine_lr` warms up linearly over `min(25 % of total epochs, 20)` epochs before decaying.
+At `EPOCHS=100` that is **epochs 0–19 of pure ramp** — the model does not even reach peak LR
+until epoch 20, let alone decay.
+
+During `lstm_v23_self` this cost most of a day. Twelve consecutive epochs of flat concordance
+(0.584–0.594) were read as a plateau and the run was nearly stopped at epoch 15 on that
+basis. It was the ramp. After resuming with a 30-epoch schedule, the decisive gain
+(`0.604 → 0.611`) landed at **epoch 28 of 30**, in the final 7 % of decay — the same shape as
+`lstm_v20`'s step change at epochs 200–250 of 255.
+
+**Rules that follow.** (1) A flat ordinal metric before the LR peak carries no information;
+do not stop on it. (2) Size `EPOCHS` so the schedule *completes* — a 100-epoch schedule
+abandoned at epoch 30 is strictly worse than a 30-epoch schedule run to the floor, because
+only the latter includes a decay phase. (3) When comparing two runs, compare **completed
+schedules**; a finished 60-epoch arm against a mid-ramp 100-epoch arm is not a comparison.
+
+Resuming re-derives the schedule from `start_epoch`, so a resumed run with a smaller `EPOCHS`
+is a cheap way to force a full decay onto existing weights. Note that optimiser state is
+**not** checkpointed — Adam moments restart on resume, the same discontinuity the
+warm-start → main handoff already carries.
 
 The `database` crate uses sqlx compile-time macros. Without a reachable Postgres, use the
 checked-in offline cache:
