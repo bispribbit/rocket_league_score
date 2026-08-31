@@ -476,12 +476,58 @@ once the skill tower is self-only", is **now met**. Any two players from any two
 a ranking pair valid at their own match times, which is abundant supervision aimed directly
 at the ordinal objective rather than at RMSE. Highest expected value of anything remaining.
 
-**2. Step 6, but specifically as tail compression.** Row 27 named the residual obstacle
-precisely: after removing lobby context the positives climb into the tail (p99 `+206` →
-`+304`) while the **negatives barely move** (`+436` → `+386`). A heavy negative right tail is
-what still makes strict thresholds useless — the top 1 % of margins scores zero true
-positives on *both* arms. Rank-index or percentile targets attack exactly that. Note this is
-a different motivation from the original F6 framing, which has now been revised twice.
+**2. Step 6, as tail compression.** — ❌ **DONE 2026-08-31 (`lstm_v24_rank` vs `lstm_v24_raw`),
+verdict NO-GO on detection.** Rank-index targets (`ml_model::label_warp`, `PERCENTILE_TARGETS=true`),
+matched pair on the same 3,000-replay subset, 30 epochs, self-only, differing only in label
+space. Full detail in experiment.md row 29.
+
+| | raw-MMR control | rank-index |
+|---|---|---|
+| concordance | 0.595 | **0.602** |
+| top-1 | 39.8 % | **45.5 %** |
+| **average precision** | **0.0419** | **0.0418** |
+| lift | 1.67× | 1.67× |
+| held-out negatives p99 | +208.8 | +552.3 |
+
+Ranking improved; **average precision is identical to three significant figures**. The warp
+did not compress the tail — it expanded everything (`pred_std` 354 → 528) and the
+negative/positive p99 ratio got *worse* (1.20 → 1.62). Equalising ladder-step width does not
+equalise the prediction distribution, because the tail is not caused by MMR spacing.
+
+*The matched control was necessary:* at 3k/30 epochs the raw control scores AP `0.0419` where
+`lstm_v22_self` at 3k/**60** epochs scored `0.0543`. AP **is** budget-sensitive, contrary to
+what rows 27–28 suggested. Reusing the older arm as control would have manufactured a
+spurious 23 % drop caused entirely by the epoch budget.
+
+---
+
+## ⛔ Stop proposing model changes — the pattern says the label is the problem
+
+Three independent interventions have now been run to completion, each with a matched control:
+
+| intervention | ranking | average precision |
+|---|---|---|
+| remove lobby context (row 26) | **improved** | 0.0543 |
+| 9× training data (row 28) | **improved** | 0.0543 |
+| rank-index targets (row 29) | **improved** | 0.0418 / 0.0419 (matched pair, no difference) |
+
+**Every one moved ranking. Not one moved average precision**, which has sat in 0.042–0.054
+across every arm since row 25. Ranking quality and detection precision are decoupled to a
+degree no longer explicable by capacity, loss geometry or data volume.
+
+**The remaining suspect is the label itself.** A "smurf proxy" is any player whose label sits
+≥150 MMR above their lobby's median label. That is just a **mixed lobby**, which happens
+constantly for innocent reasons — party queue, rank disparity, wide matchmaking off-peak. The
+positive class is therefore mostly ordinary players in mismatched lobbies, who are
+behaviourally indistinguishable from negatives **because they are not smurfing**. If that is
+right, AP ≈ 0.05 is the label's own signal content, not a model ceiling, and no architecture,
+loss or data change can beat it.
+
+**Do this before any of steps 4/5/7/8.** Hand-inspect a sample of high-margin flags and of
+high-margin positives and estimate what fraction of the proxy class is genuinely smurfing.
+Costs no GPU and decides whether the remaining steps are worth running at all. If the proxy
+is mostly innocent mixed lobbies, the project needs a **better label** (account age, ranked
+history, win-rate anomaly, reported-smurf lists) rather than a better model.
 
 **3. Step 4 — head parameterisation (F5).** Unaffected by the step-3 result and still worth
 doing, but it is de-risking rather than upside: both step-3 arms had healthy `pred_std`
