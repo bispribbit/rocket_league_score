@@ -759,13 +759,11 @@ pub fn extract_player_centric_frames_with_context(
     context: Option<SequenceContext<'_>>,
 ) -> Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> {
     // Only meaningful with context; without it nothing is excluded.
-    let excluded = context.map(|ctx| {
-        build_goal_replay_excluded_set(ctx.goal_frames, ctx.kickoff_frames)
-    });
+    let excluded =
+        context.map(|ctx| build_goal_replay_excluded_set(ctx.goal_frames, ctx.kickoff_frames));
 
     // Only meaningful with context; without it the score stays 0-0 for every frame.
-    let cumulative_score =
-        context.map(|ctx| precompute_cumulative_score(ctx.goals, frames.len()));
+    let cumulative_score = context.map(|ctx| precompute_cumulative_score(ctx.goals, frames.len()));
 
     let mut cumulatives = core::array::from_fn(|_| CumulativePlayerState::default());
     let mut player_frames: Vec<[PlayerCentricFrameFeatures; TOTAL_PLAYERS]> = Vec::new();
@@ -848,7 +846,6 @@ pub fn extract_player_centric_frames_with_context(
 
     player_frames
 }
-
 
 /// Builds the set of original frame indices that fall inside goal-replay windows.
 ///
@@ -1009,7 +1006,6 @@ pub fn extract_player_centric_game_sequence_inference_with_context(
         Some(SequenceContext::from_parsed(parsed)),
     )
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1390,9 +1386,15 @@ mod tests {
         // And every feature of every slot of every frame is bit-for-bit identical.
         // Exact equality is deliberate: the two paths run the same arithmetic on the
         // same inputs, so any difference at all is the skew reappearing.
-        #[expect(clippy::float_cmp, reason = "bit-identical output is the property under test")]
-        for (frame_idx, (train_frame, inf_frame)) in
-            training.player_frames.iter().zip(inference.iter()).enumerate()
+        #[expect(
+            clippy::float_cmp,
+            reason = "bit-identical output is the property under test"
+        )]
+        for (frame_idx, (train_frame, inf_frame)) in training
+            .player_frames
+            .iter()
+            .zip(inference.iter())
+            .enumerate()
         {
             for (slot, (train_slot, inf_slot)) in
                 train_frame.iter().zip(inf_frame.iter()).enumerate()
@@ -1437,8 +1439,7 @@ mod tests {
         let overtime_idx = SCORE_TIME_CONTEXT_FEATURE_OFFSET + 2;
 
         let with_context = extract_player_centric_game_sequence_inference_with_context(&parsed, 10);
-        let without_context =
-            extract_player_centric_game_sequence_inference(&parsed.frames, 10);
+        let without_context = extract_player_centric_game_sequence_inference(&parsed.frames, 10);
 
         let mut saw_overtime = false;
         for (label, frames) in [
@@ -1479,8 +1480,7 @@ mod tests {
         let score_idx = SCORE_TIME_CONTEXT_FEATURE_OFFSET;
 
         let with_context = extract_player_centric_game_sequence_inference_with_context(&parsed, 10);
-        let without_context =
-            extract_player_centric_game_sequence_inference(&parsed.frames, 10);
+        let without_context = extract_player_centric_game_sequence_inference(&parsed.frames, 10);
 
         assert!(
             without_context
@@ -1495,5 +1495,4 @@ mod tests {
             "score differential should be reconstructed from the goal list"
         );
     }
-
 }

@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
     let dev_subset_replays: Option<usize> = std::env::var("DEV_SUBSET_REPLAYS")
         .ok()
         .and_then(|s| s.parse().ok());
+    let percentile_targets: bool = get_env_or_default("PERCENTILE_TARGETS", false);
 
     info!("=== Full Training Pipeline ===");
     info!("Model name:    {model_name}");
@@ -115,6 +116,14 @@ async fn main() -> Result<()> {
     info!(
         "Max replays:   {}",
         max_replays.map_or_else(|| "all".to_string(), |n| n.to_string())
+    );
+    info!(
+        "Label space:   {}",
+        if percentile_targets {
+            "rank-index (STEP 6 — tail compression)"
+        } else {
+            "raw MMR"
+        }
     );
     info!(
         "Feature view:  {}",
@@ -143,6 +152,7 @@ async fn main() -> Result<()> {
         max_replays,
         dev_subset_replays,
         self_only_features,
+        percentile_targets,
     };
     commands::full_pipeline::run_with_config(&config).await?;
 

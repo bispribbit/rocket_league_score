@@ -571,6 +571,7 @@ where
                     epoch: epoch as u64,
                     batch_in_epoch: batch_count as u64,
                 },
+                config.percentile_targets,
             );
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 

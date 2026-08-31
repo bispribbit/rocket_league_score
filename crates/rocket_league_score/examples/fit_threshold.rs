@@ -127,9 +127,7 @@ fn print_margin_distribution(samples: &[MarginSample]) {
         .map(|s| s.margin_mmr)
         .collect();
 
-    println!(
-        "\n--- Held-out margin distribution (prediction − lobby median prediction, MMR) ---"
-    );
+    println!("\n--- Held-out margin distribution (prediction − lobby median prediction, MMR) ---");
     println!(
         "  {:<12} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "class", "n", "p05", "p25", "median", "p75", "p95", "p99"

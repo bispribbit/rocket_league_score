@@ -22,6 +22,7 @@
 //! different predictions for each player.
 
 pub mod fused_lstm;
+pub mod label_warp;
 
 use burn::config::Config;
 use burn::module::Module;
@@ -195,6 +196,15 @@ pub struct TrainingConfig {
     /// selection and the collapse cutoff.
     #[config(default = 1)]
     pub validate_every_n_epochs: usize,
+
+    /// Train the regression head against rank-index targets instead of raw MMR.
+    ///
+    /// The step-6 tail-compression intervention; see [`crate::label_warp`]. Predictions are
+    /// then in warped units, so `detect` and `margin` are no longer comparable in MMR to
+    /// earlier runs — score this arm on concordance, top-1 and average precision, which are
+    /// all invariant to the units.
+    #[config(default = false)]
+    pub percentile_targets: bool,
 }
 
 /// LSTM-based sequence model with split per-player + lobby encoders.

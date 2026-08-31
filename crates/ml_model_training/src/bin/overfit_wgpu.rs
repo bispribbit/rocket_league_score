@@ -422,6 +422,7 @@ fn run_training(
                         epoch: epoch as u64,
                         batch_in_epoch: batch_count as u64,
                     },
+                    false,
                 );
                 epoch_sq_err_sum += f64::from(out.harness_sum_sq_error_norm)
                     * f64::from(MMR_SCALE)

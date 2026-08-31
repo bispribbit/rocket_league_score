@@ -232,15 +232,21 @@ async fn main() -> Result<()> {
     let model: SequenceModel<InferenceBackend> =
         load_checkpoint(&args.model, &device).context("Failed to load model checkpoint")?;
 
-    let self_only = args.self_only.unwrap_or_else(|| checkpoint_self_only(&args.model));
+    let self_only = args
+        .self_only
+        .unwrap_or_else(|| checkpoint_self_only(&args.model));
     let feature_view = ml_model_training::FeatureView::from(self_only);
     info!(
         feature_view = feature_view.label(),
-        source = if args.self_only.is_some() { "--self-only" } else { "checkpoint config" },
+        source = if args.self_only.is_some() {
+            "--self-only"
+        } else {
+            "checkpoint config"
+        },
         "Feature view"
     );
-    let batcher =
-        SequenceBatcher::<InferenceBackend>::new(device, args.seq_len).with_feature_view(feature_view);
+    let batcher = SequenceBatcher::<InferenceBackend>::new(device, args.seq_len)
+        .with_feature_view(feature_view);
 
     info!("Scoring (frozen weights, no optimiser step)...");
     let result = compute_validation_loss(&model, &dataset, &batcher, args.batch_size);
@@ -300,7 +306,13 @@ fn write_prediction_dump(
         std::fs::create_dir_all(parent)?;
     }
     let mut writer = csv::Writer::from_path(path)?;
-    writer.write_record(["replay_id", "slot", "prediction_mmr", "target_mmr", "segments"])?;
+    writer.write_record([
+        "replay_id",
+        "slot",
+        "prediction_mmr",
+        "target_mmr",
+        "segments",
+    ])?;
     for prediction in predictions {
         writer.write_record([
             prediction.replay_id.to_string(),

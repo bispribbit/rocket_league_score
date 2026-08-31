@@ -162,6 +162,12 @@ pub struct FullTrainConfig {
     ///
     /// Ignored when `max_replays` is set.
     pub dev_subset_replays: Option<usize>,
+
+    /// Train the regression head on rank-index targets instead of raw MMR (step 6).
+    ///
+    /// See `ml_model::label_warp`. Predictions land in warped units, so score this arm on
+    /// concordance / top-1 / average precision, never on RMSE or a raw-MMR margin.
+    pub percentile_targets: bool,
     /// Train on the self-only 27-feature view, zeroing the other five cars.
     ///
     /// The go/no-go ablation in step 3 of `docs/smurf-detection-handoff.md`. Pair it with
@@ -188,6 +194,7 @@ impl Default for FullTrainConfig {
             checkpoint_every_n_epochs: 5,
             max_replays: None,
             dev_subset_replays: None,
+            percentile_targets: false,
             self_only_features: false,
         }
     }
@@ -262,6 +269,7 @@ pub async fn run(
         // be selected by accident here.
         dev_subset_replays: None,
         self_only_features: false,
+        percentile_targets: false,
     };
 
     Box::pin(run_with_config(&config)).await?;
@@ -291,7 +299,8 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         .with_learning_rate(config.learning_rate)
         .with_epochs(config.epochs)
         .with_batch_size(config.batch_size)
-        .with_self_only_features(config.self_only_features);
+        .with_self_only_features(config.self_only_features)
+        .with_percentile_targets(config.percentile_targets);
 
     let fused_projection_estimate = estimate_fused_projection_memory(
         training_config.batch_size,
@@ -517,6 +526,10 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
                 // 500 epochs *with* the lobby shortcut it exists to remove — contaminating
                 // the very quantity it is measuring.
                 .with_self_only_features(config.self_only_features)
+                // Same reasoning as the feature view: warm-starting on raw MMR and then
+                // switching to rank-index targets would hand main training a head
+                // calibrated to the wrong output space.
+                .with_percentile_targets(config.percentile_targets)
                 // Warm-start trains on ~120 segments in ~1.6 s and would otherwise validate
                 // over all 45,805 evaluation segments for ~80 s after each of 500 epochs:
                 // ~11 h, ~98 % of it validation. Its only decision point is the pred_std
@@ -1223,7 +1236,6 @@ fn extract_epoch_from_checkpoint(path: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     /// A numbered checkpoint must win over a newer unnumbered one. Writing `_epochN`,
     /// `_best` and `_best_ordinal` in the same epoch leaves the unnumbered files newest on

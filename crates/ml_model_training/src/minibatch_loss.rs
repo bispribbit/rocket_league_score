@@ -198,6 +198,34 @@ pub struct ProductionMinibatchLossOutput<B: burn::tensor::backend::Backend> {
 
 /// Full production training loss: Huber + τ-averaged pinball, inverse-frequency row weights,
 /// ordinal BCE, pairwise hinge, using [`SequenceModel::forward_with_ordinal_scale`].
+/// Applies the rank-index warp to a target tensor, elementwise.
+///
+/// Expressed as a sum of clamped linear ramps — one per ladder segment — because that is
+/// the piecewise-linear warp in a form the tensor backends can evaluate without a gather or
+/// a host round-trip. `sum_i clamp((m - start_i) / width_i, 0, 1)` is exactly
+/// [`ml_model::label_warp::mmr_to_rank_index`], which the tests pin.
+///
+/// Applied to **targets only**, so no gradient flows through it.
+fn warp_targets_to_rank_index<B: burn::tensor::backend::Backend, const D: usize>(
+    targets: Tensor<B, D>,
+) -> Tensor<B, D> {
+    let segments = ml_model::label_warp::rank_index_segments();
+    let mut index: Option<Tensor<B, D>> = None;
+
+    for (start, width) in segments {
+        let ramp = (targets.clone() - start).div_scalar(width).clamp(0.0, 1.0);
+        index = Some(match index {
+            Some(accumulated) => accumulated + ramp,
+            None => ramp,
+        });
+    }
+
+    index.map_or_else(
+        || targets.zeros_like(),
+        |accumulated| accumulated.mul_scalar(MMR_SCALE / ml_model::label_warp::RANK_INDEX_SPAN),
+    )
+}
+
 pub fn production_training_minibatch_loss<
     B: burn::tensor::backend::AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend,
 >(
@@ -207,6 +235,7 @@ pub fn production_training_minibatch_loss<
     rank_weights: &[f32],
     lobby_scale: f32,
     jitter_step: LabelJitterStep,
+    percentile_targets: bool,
 ) -> ProductionMinibatchLossOutput<B>
 where
     B::FloatElem: From<f32>,
@@ -248,7 +277,16 @@ where
         mean_zero_label_jitter_normalized::<B>(device, batch_size_local, mask.clone(), jitter_step);
     let raw_targets = batch.targets.clone();
     let raw_predictions = predictions.clone();
-    let targets_norm = batch.targets.clone() / MMR_SCALE + jitter_norm;
+    // The step-6 intervention, and the only place the warp is applied. Downstream terms
+    // deliberately keep raw targets: the ordinal head thresholds targets against raw-MMR
+    // boundaries and never sees a prediction, rank weights are keyed on raw MMR, and the
+    // pairwise hinge needs only the target *ordering*, which a monotone warp preserves.
+    let regression_targets = if percentile_targets {
+        warp_targets_to_rank_index(batch.targets.clone())
+    } else {
+        batch.targets.clone()
+    };
+    let targets_norm = regression_targets / MMR_SCALE + jitter_norm;
     let predictions_norm = predictions / MMR_SCALE;
     let diff = predictions_norm.clone() - targets_norm.clone();
     let per_row_mse_for_smurf = (diff.clone().powf_scalar(2.0) * mask.clone()).sum_dim(1);
@@ -531,6 +569,57 @@ where
 #[cfg(test)]
 mod tests {
     use ml_model::{MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES};
+
+    /// The tensor warp must agree with the scalar reference the `ml_model` tests pin.
+    ///
+    /// They are written differently — a sum of clamped ramps over a tensor versus an
+    /// iterator over segments — so this is a real cross-check, and it is the only thing
+    /// standing between a silent indexing error and a run trained on wrong targets.
+    #[test]
+    fn tensor_warp_matches_the_scalar_reference() {
+        type B = burn::backend::NdArray<f32>;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+        let probes: Vec<f32> = vec![
+            0.0, 50.0, 194.0, 200.0, 500.0, 900.0, 1030.0, 1500.0, 2200.0, 2400.0,
+        ];
+        let input = burn::tensor::Tensor::<B, 1>::from_floats(probes.as_slice(), &device);
+        let warped: Vec<f32> = super::warp_targets_to_rank_index(input)
+            .into_data()
+            .to_vec()
+            .unwrap();
+
+        for (raw, actual) in probes.iter().zip(warped.iter()) {
+            let expected = ml_model::label_warp::warp_mmr(*raw);
+            assert!(
+                (actual - expected).abs() < 1e-2,
+                "{raw} MMR: tensor gave {actual}, scalar gave {expected}"
+            );
+        }
+    }
+
+    /// Warping must preserve ordering on a tensor, since concordance depends on it.
+    #[test]
+    fn tensor_warp_preserves_ordering() {
+        type B = burn::backend::NdArray<f32>;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+        let ascending: Vec<f32> = (0..40).map(|step| step as f32 * 65.0).collect();
+        let input = burn::tensor::Tensor::<B, 1>::from_floats(ascending.as_slice(), &device);
+        let warped: Vec<f32> = super::warp_targets_to_rank_index(input)
+            .into_data()
+            .to_vec()
+            .unwrap();
+
+        for pair in warped.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "warp reordered: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
 
     // ── Ordinal target correctness ───────────────────────────────────────────
 
