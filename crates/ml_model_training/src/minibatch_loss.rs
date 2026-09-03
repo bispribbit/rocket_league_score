@@ -236,6 +236,7 @@ pub fn production_training_minibatch_loss<
     lobby_scale: f32,
     jitter_step: LabelJitterStep,
     percentile_targets: bool,
+    segment_tolerance_mmr: f32,
 ) -> ProductionMinibatchLossOutput<B>
 where
     B::FloatElem: From<f32>,
@@ -288,7 +289,19 @@ where
     };
     let targets_norm = regression_targets / MMR_SCALE + jitter_norm;
     let predictions_norm = predictions / MMR_SCALE;
-    let diff = predictions_norm.clone() - targets_norm.clone();
+    let raw_diff = predictions_norm.clone() - targets_norm.clone();
+    // Dead zone: residuals inside the tolerance band contribute no gradient, so a segment is
+    // free to sit anywhere in the band while still being pulled back once it leaves. Applied
+    // by soft-thresholding the magnitude and restoring the sign, which keeps the residual
+    // continuous at the band edge (a hard mask would put a step in the gradient there).
+    let diff = if segment_tolerance_mmr > 0.0 {
+        let tolerance_norm = segment_tolerance_mmr / MMR_SCALE;
+        let magnitude = raw_diff.clone().abs();
+        let shrunk = magnitude.clone().sub_scalar(tolerance_norm).clamp_min(0.0);
+        raw_diff.clone() * (shrunk / magnitude.clamp_min(1e-6))
+    } else {
+        raw_diff.clone()
+    };
     let per_row_mse_for_smurf = (diff.clone().powf_scalar(2.0) * mask.clone()).sum_dim(1);
     let abs_diff = diff.clone().abs();
     let clamped = abs_diff.clone().clamp_min(0.0).clamp_max(huber_delta);
@@ -569,6 +582,54 @@ where
 #[cfg(test)]
 mod tests {
     use ml_model::{MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES};
+
+    /// The dead zone must zero the gradient inside the band and preserve it outside, with the
+    /// sign intact — a sign flip would push segments the wrong way.
+    #[test]
+    fn dead_zone_soft_thresholds_the_residual() {
+        type B = burn::backend::NdArray<f32>;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+        let tolerance_mmr = 175.0_f32;
+        let tolerance_norm = tolerance_mmr / MMR_SCALE;
+        let raw: Vec<f32> = vec![0.0, 50.0, 175.0, 300.0, -50.0, -300.0]
+            .into_iter()
+            .map(|mmr: f32| mmr / MMR_SCALE)
+            .collect();
+
+        let raw_diff = burn::tensor::Tensor::<B, 1>::from_floats(raw.as_slice(), &device);
+        let magnitude = raw_diff.clone().abs();
+        let shrunk = magnitude.clone().sub_scalar(tolerance_norm).clamp_min(0.0);
+        let out: Vec<f32> = (raw_diff * (shrunk / magnitude.clamp_min(1e-6)))
+            .into_data()
+            .to_vec()
+            .unwrap();
+
+        // Inside the band: no residual at all.
+        assert!(out[0].abs() < 1e-6, "0 MMR: {}", out[0]);
+        assert!(out[1].abs() < 1e-6, "50 MMR inside band: {}", out[1]);
+        assert!(out[2].abs() < 1e-6, "at the band edge: {}", out[2]);
+
+        // Outside: magnitude reduced by exactly the tolerance, sign preserved.
+        let expected = (300.0 - tolerance_mmr) / MMR_SCALE;
+        assert!((out[3] - expected).abs() < 1e-5, "300 MMR: {}", out[3]);
+        assert!(out[4].abs() < 1e-6, "-50 MMR inside band: {}", out[4]);
+        assert!((out[5] + expected).abs() < 1e-5, "-300 MMR: {}", out[5]);
+    }
+
+    /// A zero tolerance must leave the residual exactly as it was, so the default path is
+    /// bit-for-bit the previous behaviour.
+    #[test]
+    fn zero_tolerance_is_the_identity() {
+        type B = burn::backend::NdArray<f32>;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let raw: Vec<f32> = vec![0.02, -0.13, 0.4];
+        let raw_diff = burn::tensor::Tensor::<B, 1>::from_floats(raw.as_slice(), &device);
+        let out: Vec<f32> = raw_diff.clone().into_data().to_vec().unwrap();
+        for (got, want) in out.iter().zip(raw.iter()) {
+            assert!((got - want).abs() < 1e-7);
+        }
+    }
 
     /// The tensor warp must agree with the scalar reference the `ml_model` tests pin.
     ///

@@ -205,6 +205,21 @@ pub struct TrainingConfig {
     /// all invariant to the units.
     #[config(default = false)]
     pub percentile_targets: bool,
+
+    /// Dead-zone half-width, in MMR, on the per-segment regression residual. `0` disables it.
+    ///
+    /// The training target is a player's **account rank**, and it is applied to every one of
+    /// their ~15 segments identically. A Champion's weak 20 seconds is therefore a gradient
+    /// saying "this looked weak, call it Champion anyway" — training actively flattens the
+    /// within-game variation the app's per-segment readout exists to display, and row 31
+    /// measured the result: 24 % of player-games come out completely flat.
+    ///
+    /// With a tolerance set, residuals smaller than this contribute **no gradient**, so the
+    /// model may place a segment anywhere inside the band without penalty while still being
+    /// pulled back if it leaves. The anchor to the absolute ladder is kept; the pressure to
+    /// make every segment identical is removed.
+    #[config(default = 0.0)]
+    pub segment_tolerance_mmr: f32,
 }
 
 /// LSTM-based sequence model with split per-player + lobby encoders.

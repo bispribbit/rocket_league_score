@@ -168,6 +168,13 @@ pub struct FullTrainConfig {
     /// See `ml_model::label_warp`. Predictions land in warped units, so score this arm on
     /// concordance / top-1 / average precision, never on RMSE or a raw-MMR margin.
     pub percentile_targets: bool,
+
+    /// Dead-zone half-width in MMR on the per-segment residual; `0` keeps current behaviour.
+    ///
+    /// See `ml_model::TrainingConfig::segment_tolerance_mmr`. Scored on within-lobby
+    /// concordance and average precision, not RMSE — the band deliberately gives up
+    /// per-segment RMSE to buy within-game variation.
+    pub segment_tolerance_mmr: f32,
     /// Train on the self-only 27-feature view, zeroing the other five cars.
     ///
     /// The go/no-go ablation in step 3 of `docs/smurf-detection-handoff.md`. Pair it with
@@ -195,6 +202,7 @@ impl Default for FullTrainConfig {
             max_replays: None,
             dev_subset_replays: None,
             percentile_targets: false,
+            segment_tolerance_mmr: 0.0,
             self_only_features: false,
         }
     }
@@ -270,6 +278,7 @@ pub async fn run(
         dev_subset_replays: None,
         self_only_features: false,
         percentile_targets: false,
+        segment_tolerance_mmr: 0.0,
     };
 
     Box::pin(run_with_config(&config)).await?;
@@ -300,7 +309,8 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         .with_epochs(config.epochs)
         .with_batch_size(config.batch_size)
         .with_self_only_features(config.self_only_features)
-        .with_percentile_targets(config.percentile_targets);
+        .with_percentile_targets(config.percentile_targets)
+        .with_segment_tolerance_mmr(config.segment_tolerance_mmr);
 
     let fused_projection_estimate = estimate_fused_projection_memory(
         training_config.batch_size,
@@ -530,6 +540,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
                 // switching to rank-index targets would hand main training a head
                 // calibrated to the wrong output space.
                 .with_percentile_targets(config.percentile_targets)
+                .with_segment_tolerance_mmr(config.segment_tolerance_mmr)
                 // Warm-start trains on ~120 segments in ~1.6 s and would otherwise validate
                 // over all 45,805 evaluation segments for ~80 s after each of 500 epochs:
                 // ~11 h, ~98 % of it validation. Its only decision point is the pred_std

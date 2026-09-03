@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok());
     let percentile_targets: bool = get_env_or_default("PERCENTILE_TARGETS", false);
+    let segment_tolerance_mmr: f32 = get_env_or_default("SEGMENT_TOLERANCE_MMR", 0.0);
 
     info!("=== Full Training Pipeline ===");
     info!("Model name:    {model_name}");
@@ -153,6 +154,7 @@ async fn main() -> Result<()> {
         dev_subset_replays,
         self_only_features,
         percentile_targets,
+        segment_tolerance_mmr,
     };
     commands::full_pipeline::run_with_config(&config).await?;
 

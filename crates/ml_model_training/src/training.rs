@@ -572,6 +572,7 @@ where
                     batch_in_epoch: batch_count as u64,
                 },
                 config.percentile_targets,
+                config.segment_tolerance_mmr,
             );
             time_forward_us += t_forward_start.elapsed().as_micros() as u64;
 
