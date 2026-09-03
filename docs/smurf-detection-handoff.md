@@ -617,6 +617,73 @@ within-lobby separation.
   concordance stays comparable to the `0.619` baseline, and selects by a stable hash so both
   ablation arms see identical data. `max_replays` should probably be deleted.
 
+---
+
+## ✅ 2026-09-02 — The label was the problem, and the project is in better shape than row 29 said
+
+Row 29 ended with "stop proposing model changes". That was **half right and badly framed**:
+the thing to stop was *model* changes, but the conclusion should have been *change the label*,
+not *stop*. The audit below was run instead, costs no GPU, and materially improves the picture.
+
+**The mismatch.** Every metric through row 29 scored **account rank** — "is this player ≥150 MMR
+above their lobby median". The project's actual premise is *"one guy playing like a platinum
+and exterminating the competition"*, which is about **how they played**. Those disagree both
+ways, and neither disagreement was observable:
+
+| | account rank | played like | old label | product wants |
+|---|---|---|---|---|
+| A | platinum | platinum, dominating | positive ✓ | flag ✓ |
+| B | platinum | ordinary game | positive ✗ | don't flag |
+| C | silver | platinum, exterminating | **negative** ✗ | **flag** ✓ |
+
+**Case B is 57 % of the positive class.** Of 197 account-rank positives, only 85 (43 %) were
+also their lobby's top-possession player, against a 23.6 % base rate.
+
+**Cleaning the label doubles measured lift with no retraining** (`lstm_v23_self`, same
+predictions):
+
+| label | AP | lift |
+|---|---|---|
+| `acct` — account rank ≥150 over lobby median | 0.0714 | 3.23× |
+| `both` — account-positive **and** top possession | 0.0544 | **5.70×** |
+
+**And the product-shaped question is answered well.** In the 156 mixed lobbies, picking the
+single highest-margin player:
+
+* pick is account-positive **63.5 %** (random pick: **31.0 %**) — 2.05×
+* pick is top-possession **53.2 %** (chance **25.2 %**) — 2.11×
+
+Row 29's "~92 % of flags are wrong" measured a *global* `+200 MMR` rule over all 9,309 players.
+The product never asks that question. It asks "who in *this* lobby", and there the answer is
+roughly 2× chance and right about six times in ten.
+
+**Model selection was not distorted.** Arm ordering is identical under every label — self-only
+arms lead at 5.69× / 5.70× against `lstm_v20` 2.82× and `lstm_v22_full` 2.32× — so rows 26–29
+picked the right checkpoints while mismeasuring them. Row 28 also survives: 9× data is worth
+`5.69× → 5.70×`, still nothing.
+
+**Partial walk-back of row 29.** Under this fuller evaluation `lstm_v24_rank` beats
+`lstm_v24_raw` (`both` 3.70× vs 3.26×) where the held-out-half comparison showed a dead heat.
+Small enough that the subset flips the sign, so "no meaningful difference" stands — but the
+flat **NO-GO** was stronger than the evidence supported.
+
+**The model reads possession, not scoreboard.** Across all 1,890 lobbies the highest-margin
+pick is top-possession 33.2 % of the time (chance 23.6 %) but the unique top scorer only
+17.1 % — *below* chance. It has learned control of play, not who finished.
+
+### What to do next
+
+1. **Retrain against the `both` label** rather than account rank. This is the first training
+   run in the project aimed at the question actually being asked, and every prior arm was
+   optimising a target 57 % of whose positives were noise.
+2. **Ship the per-lobby ranking, not the global flag.** "Most suspicious player in this lobby"
+   is 2× chance today; "flag anyone above +200 MMR anywhere" is not, and never was the product.
+3. **Caveat on `both`:** only 85 positives on the evaluation split. Treat lift differences
+   under ~20 % as inconclusive, and widen the label (possession margin rather than strict
+   top-1) before leaning on it hard.
+
+Tooling: `examples/match_performance` + `scripts/label_audit/`.
+
 ## Build notes
 
 ### LR schedule: never judge an ordinal metric before decay
