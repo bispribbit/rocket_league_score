@@ -737,7 +737,13 @@ pub fn predict_player_centric_per_segment<B: FusedLstmBackend>(
 ///
 /// Shared by the frame-only and parsed-replay prediction entry points so the two cannot
 /// diverge in batching or segment-bound arithmetic.
-fn predict_from_player_centric_frames<B: FusedLstmBackend>(
+/// Scores pre-extracted player-centric frames.
+///
+/// Public so a caller can transform the features before inference — specifically, to zero the
+/// context columns and score a checkpoint trained with
+/// `ml_model_training::FeatureView::SelfOnly`. Feeding such a checkpoint the full 106-feature
+/// view hands it context it never trained on and quietly understates it.
+pub fn predict_from_player_centric_frames<B: FusedLstmBackend>(
     model: &SequenceModel<B>,
     player_centric_frames: &[[PlayerCentricFrameFeatures; TOTAL_PLAYERS]],
     original_frame_count: usize,

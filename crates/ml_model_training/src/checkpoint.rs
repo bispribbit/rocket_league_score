@@ -177,15 +177,40 @@ pub fn save_checkpoint_bin<B: ml_model::fused_lstm::FusedLstmBackend>(
 /// # Errors
 ///
 /// Returns an error if the checkpoint cannot be loaded.
+/// Reads just the `ModelConfig` out of a checkpoint's config JSON.
+///
+/// Deliberately does **not** deserialise the whole [`TrainingConfig`]. Weight loading depends
+/// only on the architecture, but a strict `TrainingConfig::load` also demands every training
+/// field — so adding one (`self_only_features`, `validate_every_n_epochs`,
+/// `percentile_targets`) silently made every earlier checkpoint unloadable, `lstm_v20`
+/// included. burn's `#[config(default)]` supplies a builder default, not a deserialisation
+/// one, and its `Config` derive does not forward `#[serde(default)]`, so the fix belongs at
+/// the read site.
+///
+/// Falls back to the full parse, then to defaults, so a config written by some other tool
+/// still has two chances to work.
+fn model_config_from_checkpoint(config_path: &str) -> ModelConfig {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return ModelConfig::new();
+    };
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(model) = value.get("model")
+        && let Ok(model_config) = serde_json::from_value::<ModelConfig>(model.clone())
+    {
+        return model_config;
+    }
+
+    TrainingConfig::load(config_path).map_or_else(|_| ModelConfig::new(), |config| config.model)
+}
+
 pub fn load_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
     path: &str,
     device: &B::Device,
 ) -> anyhow::Result<SequenceModel<B>> {
     let config_path = format!("{path}.config.json");
     let model_config = if Path::new(&config_path).exists() {
-        let training_config = TrainingConfig::load(&config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-        training_config.model
+        model_config_from_checkpoint(&config_path)
     } else {
         ModelConfig::new()
     };
