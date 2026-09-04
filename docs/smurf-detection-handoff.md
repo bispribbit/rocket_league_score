@@ -684,6 +684,61 @@ pick is top-possession 33.2 % of the time (chance 23.6 %) but the unique top sco
 
 Tooling: `examples/match_performance` + `scripts/label_audit/`.
 
+---
+
+## 2026-09-03 — Dead-zone tolerance: keep the change, reject the reasoning
+
+`SEGMENT_TOLERANCE_MMR=175`, matched against row 29's `lstm_v24_raw` (same 3,000-replay
+subset, 30 epochs, self-only, raw MMR — differing *only* in the band).
+
+| | control | **band** |
+|---|---|---|
+| overall concordance | 0.595 | **0.602** |
+| mixed concordance | 0.712 | **0.724** |
+| top-1 | 48.1 % | **51.9 %** |
+| checkpoint validation RMSE | 391.9 MMR | **356.2 MMR** |
+| held-out AP (`fit_threshold`) | 0.0419 | **0.0487** |
+| shipped `+200` rule | 1 TP / 50 flags | **11 TP / 176 flags** |
+| joined AP, `both` label | 3.26× | **5.31×** |
+
+**Average precision moved for the first time since row 25.** Through rows 26–30 it sat at
+0.042–0.054 no matter what was changed — removing lobby context, 9× data, rank-index targets.
+A loss change moved it. At 3,000 replays and 30 epochs the band arm reaches what
+`lstm_v22_self` needed 60 epochs and `lstm_v23_self` needed 9× the corpus to reach.
+
+**But the hypothesis behind it is false.** It was built to *increase* within-game variation.
+Variation **fell 33 %** (mean spread 527.2 → 354.3 MMR) and segment concordance drifted
+*toward* chance. The band does not encourage variation, it only stops penalising it — so the
+optimiser has less reason to fit segment-specific detail and smooths out. **It is a
+regulariser that was described as an expressiveness mechanism.** Keep it; drop the story.
+
+### What this says about the per-segment display
+
+Bad news, and it is the more useful half. Relieving per-segment label pressure made the
+readout *flatter*, not richer. That is evidence **against** "the loss is suppressing a
+per-segment signal that exists" and **for** "'positioned well' is not recoverable from these
+features with this architecture". The remaining lever for the segment view is **features and
+architecture**, not the training target — which is where the project's own diagnosis has been
+pointing.
+
+### Caveats
+
+Single matched pair, one seed. The `both` label has 85 positives, so its 63 % lift gain is the
+weakest figure; the held-out AP gain (+16 %, 119 positives) is the conservative one. What makes
+this credible is four largely independent metrics moving together, not any one of them.
+
+### Next
+
+1. **Second seed on the band** (~3 h) — cheapest way to confirm the first AP movement in the
+   project is real rather than a lucky draw.
+2. **Sweep the tolerance** (~90, 175, 300 MMR). It was picked by eye; if it behaves like a
+   regularisation strength there is probably a better setting.
+3. **Then features/architecture** for the segment readout, since the target has now been ruled
+   out as the cause of flatness.
+
+Do **not** spend more runs on label or target reshaping for the segment display specifically —
+rows 29, 31 and 32 have each pointed away from it.
+
 ## Build notes
 
 ### LR schedule: never judge an ordinal metric before decay
