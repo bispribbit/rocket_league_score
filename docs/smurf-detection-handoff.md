@@ -739,6 +739,58 @@ this credible is four largely independent metrics moving together, not any one o
 Do **not** spend more runs on label or target reshaping for the segment display specifically —
 rows 29, 31 and 32 have each pointed away from it.
 
+---
+
+## 2026-09-04 — Row 32 partially retracted: the AP gain was a control draw
+
+Second matched pair at `ROCKET_LEAGUE_WGPU_SEED=1234` (seeds weight init — `init_device()` at
+`full_pipeline.rs:457` runs before `create_model` at 477; the row-32 pair set no seed, so this
+is an independent draw). Same subset, epochs and feature view; tolerance 0 vs 175 is the only
+within-pair difference.
+
+**Held-out average precision, all four arms:**
+
+| | control | band | Δ |
+|---|---|---|---|
+| pair 1 (unseeded) | 0.0419 | 0.0487 | **+0.0068** |
+| pair 2 (seed 1234) | 0.0477 | 0.0492 | **+0.0015** |
+
+**Control-to-control spread (0.0058) is as large as the pair-1 effect (0.0068).** The effect is
+the size of the noise, so it is not established. The gain in row 32 came mostly from pair 1's
+control being the weakest of the four draws, not from the band being strong.
+
+**The shipped-rule claim collapses identically.** Row 32 said "1 TP / 50 flags → 11 TP / 176".
+Across all four arms: control 1/121 (0.8 %), band 24/361 (6.6 %), **control-s2 27/376 (7.2 %)**,
+band-s2 15/305 (4.9 %). The best arm on that metric is a *control*.
+
+**Top-1 reverses:** band +3.8 points in pair 1, **−2.9** in pair 2. Foreseeable — top-1 rides on
+157 scored lobbies and was already noted as swinging ~7× harder than overall concordance — and
+quoting it in a single-seed headline was a mistake.
+
+**What replicates:** overall within-lobby concordance (5,777 pairs), band above control in both
+pairs by +0.007 and +0.009. Small, consistent, and on the metric that deserved the most trust
+a priori.
+
+**Hypothesis, not a finding:** band arms are far more consistent across seeds (0.0487 / 0.0492,
+spread 0.0005) than controls (0.0419 / 0.0477, spread 0.0058) — ~10× less run-to-run spread.
+That is what a regulariser should do and fits row 32's finding that the band *reduced*
+within-game variation. It rests on n=2 per arm and needs ≥4 seeds to test.
+
+**Verdict:** keep the band for the replicated concordance gain and plausible variance reduction.
+Retract the AP, shipped-rule and top-1 claims.
+
+### The process lesson, which is the valuable part
+
+Row 32 was matched on subset, epochs, feature view and label space — every confound that was
+thought about, and none of the one that mattered. **A single matched pair establishes direction
+at best. Any effect smaller than between-seed spread must be replicated before it is written
+down as a number.**
+
+Concretely, for this project: between-seed spread on held-out AP is **~0.006** at 3,000 replays /
+30 epochs. Treat any AP difference below that as unmeasured until replicated. Prefer overall
+concordance (5,777 pairs) over mixed concordance (175 lobbies) or top-1 (157 lobbies) for any
+single-run claim.
+
 ## Build notes
 
 ### LR schedule: never judge an ordinal metric before decay
