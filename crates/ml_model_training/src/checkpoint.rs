@@ -1,13 +1,30 @@
-//! Checkpoint save/load for the sequence model (disk and binary formats).
+//! Checkpoint save/load for the sequence model.
+//!
+//! Checkpoints are written in **burnpack**, the only weight format burn 0.22
+//! reads. The same file serves disk loading and web embedding, so there is no
+//! longer a separate binary format for the WASM build.
 
 use std::path::Path;
 
 use burn::config::Config;
 use burn::module::Module;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+use burn::prelude::Device;
 use ml_model::{MMR_SCALE, ModelConfig, SequenceModel, TrainingConfig};
 use serde::Serialize;
 use serde_json::json;
+
+/// Extension for burnpack weight files.
+///
+/// Callers pass checkpoint paths *without* an extension (burn 0.21's recorders
+/// appended one; `Module::save_file` in 0.22 writes the path verbatim), so the
+/// suffix is applied here and nowhere else.
+pub const CHECKPOINT_EXTENSION: &str = "bpk";
+
+/// The weight-file path for a checkpoint named `path` (no extension).
+#[must_use]
+pub fn checkpoint_weights_path(path: &str) -> String {
+    format!("{path}.{CHECKPOINT_EXTENSION}")
+}
 
 /// One rank bucket from validation: RMSE in MMR units and sample count.
 #[derive(Debug, Clone, Serialize)]
@@ -105,13 +122,16 @@ pub struct ModelCheckpoint {
     pub training_config: TrainingConfig,
 }
 
-/// Saves the model checkpoint to disk in NamedMpk format.
+/// Saves the model checkpoint to disk in burnpack format.
+///
+/// `path` carries no extension; the weights land at `{path}.bpk` and the
+/// training config beside them at `{path}.config.json`.
 ///
 /// # Errors
 ///
 /// Returns an error if the checkpoint cannot be saved.
-pub fn save_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
-    model: &SequenceModel<B>,
+pub fn save_checkpoint(
+    model: &SequenceModel,
     path: &str,
     config: &TrainingConfig,
     validation_metrics: Option<CheckpointValidationMetrics>,
@@ -120,10 +140,9 @@ pub fn save_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
         std::fs::create_dir_all(parent)?;
     }
 
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     model
         .clone()
-        .save_file(path, &recorder)
+        .save_file(checkpoint_weights_path(path))
         .map_err(|e| anyhow::anyhow!("Failed to save model: {e}"))?;
 
     let config_path = format!("{path}.config.json");
@@ -139,32 +158,6 @@ pub fn save_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
         version: 1,
         training_config: config.clone(),
     })
-}
-
-/// Saves the model checkpoint to disk in binary format (for web embedding).
-///
-/// The binary format can be loaded with `ml_model::load_checkpoint_from_bytes` using `include_bytes!`.
-///
-/// # Errors
-///
-/// Returns an error if the checkpoint cannot be saved.
-pub fn save_checkpoint_bin<B: ml_model::fused_lstm::FusedLstmBackend>(
-    model: &SequenceModel<B>,
-    path: &str,
-) -> anyhow::Result<()> {
-    use burn::record::BinFileRecorder;
-
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    model
-        .clone()
-        .save_file(path, &recorder)
-        .map_err(|e| anyhow::anyhow!("Failed to save model as bin: {e}"))?;
-
-    Ok(())
 }
 
 /// Loads a model checkpoint from disk.
@@ -204,10 +197,7 @@ fn model_config_from_checkpoint(config_path: &str) -> ModelConfig {
     TrainingConfig::load(config_path).map_or_else(|_| ModelConfig::new(), |config| config.model)
 }
 
-pub fn load_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
-    path: &str,
-    device: &B::Device,
-) -> anyhow::Result<SequenceModel<B>> {
+pub fn load_checkpoint(path: &str, device: &Device) -> anyhow::Result<SequenceModel> {
     let config_path = format!("{path}.config.json");
     let model_config = if Path::new(&config_path).exists() {
         model_config_from_checkpoint(&config_path)
@@ -217,10 +207,7 @@ pub fn load_checkpoint<B: ml_model::fused_lstm::FusedLstmBackend>(
 
     let model = SequenceModel::new(device, &model_config);
 
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    let model = model
-        .load_file(path, &recorder, device)
-        .map_err(|e| anyhow::anyhow!("Failed to load model weights: {e}"))?;
-
-    Ok(model)
+    model
+        .try_load_file(checkpoint_weights_path(path))
+        .map_err(|e| anyhow::anyhow!("Failed to load model weights: {e}"))
 }

@@ -109,12 +109,12 @@ fn gaussian_noise_for_label_cell(step: LabelJitterStep, row: usize, slot: usize)
     jitter_standard_normal_from_seed(key) as f32
 }
 
-fn mean_zero_label_jitter_normalized<B: burn::tensor::backend::Backend>(
-    device: &B::Device,
+fn mean_zero_label_jitter_normalized(
+    device: &Device,
     batch_size: usize,
-    mask: Tensor<B, 2>,
+    mask: Tensor<2>,
     jitter_step: LabelJitterStep,
-) -> Tensor<B, 2> {
+) -> Tensor<2> {
     let sigma = (LABEL_JITTER_STD / f64::from(MMR_SCALE)) as f32;
     let mut flat = Vec::with_capacity(batch_size * TOTAL_PLAYERS);
     for row in 0..batch_size {
@@ -123,7 +123,7 @@ fn mean_zero_label_jitter_normalized<B: burn::tensor::backend::Backend>(
         }
     }
     let jitter =
-        Tensor::<B, 1>::from_floats(flat.as_slice(), device).reshape([batch_size, TOTAL_PLAYERS]);
+        Tensor::<1>::from_floats(flat.as_slice(), device).reshape([batch_size, TOTAL_PLAYERS]);
     let row_sum = (jitter.clone() * mask.clone()).sum_dim(1);
     let known = mask.clone().sum_dim(1).clamp_min(1.0);
     let row_mean = row_sum / known;
@@ -132,10 +132,7 @@ fn mean_zero_label_jitter_normalized<B: burn::tensor::backend::Backend>(
 
 /// Mean pinball loss over several quantiles. `diff` = prediction − target (normalised). For each
 /// `quantile`, uses `quantile · relu(−diff) + (1 − quantile) · relu(diff)` (standard check loss).
-fn multi_quantile_pinball<B: burn::tensor::backend::Backend>(
-    diff: Tensor<B, 2>,
-    quantiles: &[f32],
-) -> Tensor<B, 2> {
+fn multi_quantile_pinball(diff: Tensor<2>, quantiles: &[f32]) -> Tensor<2> {
     let target_above_prediction = activation::relu(diff.clone().neg());
     let prediction_above_target = activation::relu(diff);
     let mut quantile_iter = quantiles.iter().copied();
@@ -154,11 +151,11 @@ fn multi_quantile_pinball<B: burn::tensor::backend::Backend>(
 
 /// Masked slots only. Compares standard deviation of **clean** targets vs predictions in
 /// normalised space; returns squared `relu(std_target − std_prediction)`.
-fn masked_minibatch_spread_loss_squared<B: burn::tensor::backend::Backend>(
-    predictions_norm: Tensor<B, 2>,
-    targets_norm_clean: Tensor<B, 2>,
-    mask: Tensor<B, 2>,
-) -> Tensor<B, 1> {
+fn masked_minibatch_spread_loss_squared(
+    predictions_norm: Tensor<2>,
+    targets_norm_clean: Tensor<2>,
+    mask: Tensor<2>,
+) -> Tensor<1> {
     let known_tensor_spread = mask.clone().sum().clamp_min(1.0);
     let mean_slot_target =
         (targets_norm_clean.clone() * mask.clone()).sum() / known_tensor_spread.clone();
@@ -181,12 +178,12 @@ fn masked_minibatch_spread_loss_squared<B: burn::tensor::backend::Backend>(
 
 /// Output of the production (full training) loss: combined scalar loss and per-row
 /// squared error sums in normalised space for smurf EMA in [`super::training::train`].
-pub struct ProductionMinibatchLossOutput<B: burn::tensor::backend::Backend> {
+pub struct ProductionMinibatchLossOutput {
     /// Scalar loss tensor (shape `[1]`, ready for `backward()`).
-    pub loss: Tensor<B, 1>,
+    pub loss: Tensor<1>,
     /// For each batch row, sum of squared (pred−target) on normalised, **jittered** targets
     /// (same definition as the previous inline training loop for smurf masking).
-    pub per_row_mse_for_smurf: Tensor<B, 2>,
+    pub per_row_mse_for_smurf: Tensor<2>,
     /// Sum of `(pred_norm − target_norm_clean)²` over masked elements (overfit harness metrics;
     /// [`super::training::train`] ignores these when destructuring).
     pub harness_sum_sq_error_norm: f32,
@@ -206,11 +203,9 @@ pub struct ProductionMinibatchLossOutput<B: burn::tensor::backend::Backend> {
 /// [`ml_model::label_warp::mmr_to_rank_index`], which the tests pin.
 ///
 /// Applied to **targets only**, so no gradient flows through it.
-fn warp_targets_to_rank_index<B: burn::tensor::backend::Backend, const D: usize>(
-    targets: Tensor<B, D>,
-) -> Tensor<B, D> {
+fn warp_targets_to_rank_index<const D: usize>(targets: Tensor<D>) -> Tensor<D> {
     let segments = ml_model::label_warp::rank_index_segments();
-    let mut index: Option<Tensor<B, D>> = None;
+    let mut index: Option<Tensor<D>> = None;
 
     for (start, width) in segments {
         let ramp = (targets.clone() - start).div_scalar(width).clamp(0.0, 1.0);
@@ -226,22 +221,16 @@ fn warp_targets_to_rank_index<B: burn::tensor::backend::Backend, const D: usize>
     )
 }
 
-pub fn production_training_minibatch_loss<
-    B: burn::tensor::backend::AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend,
->(
-    model: &SequenceModel<B>,
-    batch: &SequenceBatch<B>,
-    device: &B::Device,
+pub fn production_training_minibatch_loss(
+    model: &SequenceModel,
+    batch: &SequenceBatch,
+    device: &Device,
     rank_weights: &[f32],
     lobby_scale: f32,
     jitter_step: LabelJitterStep,
     percentile_targets: bool,
     segment_tolerance_mmr: f32,
-) -> ProductionMinibatchLossOutput<B>
-where
-    B::FloatElem: From<f32>,
-    B::InnerBackend: ml_model::fused_lstm::FusedLstmBackend,
-{
+) -> ProductionMinibatchLossOutput {
     let huber_delta = 1.0_f32;
     let (predictions, ordinal_logits) =
         model.forward_with_ordinal_scale(batch.inputs.clone(), lobby_scale);
@@ -271,11 +260,11 @@ where
         .to_vec()
         .unwrap_or_default();
     let per_element_weights_vec = lookup_rank_weights_slice(&raw_target_mmr_vec, rank_weights);
-    let weights = Tensor::<B, 1>::from_floats(per_element_weights_vec.as_slice(), device)
+    let weights = Tensor::<1>::from_floats(per_element_weights_vec.as_slice(), device)
         .reshape([batch_size_local, TOTAL_PLAYERS]);
 
     let jitter_norm =
-        mean_zero_label_jitter_normalized::<B>(device, batch_size_local, mask.clone(), jitter_step);
+        mean_zero_label_jitter_normalized(device, batch_size_local, mask.clone(), jitter_step);
     let raw_targets = batch.targets.clone();
     let raw_predictions = predictions.clone();
     // The step-6 intervention, and the only place the warp is applied. Downstream terms
@@ -327,7 +316,7 @@ where
     let flat_targets_mmr = raw_targets.clone().reshape([flat_row_count, 1]);
 
     let boundaries_vec: Vec<f32> = ORDINAL_BOUNDARIES_MMR.to_vec();
-    let boundaries = Tensor::<B, 1>::from_floats(boundaries_vec.as_slice(), device)
+    let boundaries = Tensor::<1>::from_floats(boundaries_vec.as_slice(), device)
         .unsqueeze::<2>()
         .transpose();
 
@@ -355,7 +344,7 @@ where
         .clone()
         .sum()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default();
     let ordinal_known_count = ordinal_known_count.first().copied().unwrap_or(1.0).max(1.0);
     let ordinal_loss =
@@ -398,7 +387,7 @@ where
     let pair_count = pair_mask
         .sum()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default();
     let pair_count = pair_count.first().copied().unwrap_or(1.0).max(1.0);
     let pairwise_loss = pairwise_loss_elements / pair_count;
@@ -417,14 +406,14 @@ where
     let known_slots = mask.clone().sum();
     let harness_sum_sq_error_norm: f32 = harness_sum_sq
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
         .unwrap_or(0.0);
     let harness_known_slots: f32 = known_slots
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
@@ -432,7 +421,7 @@ where
     let harness_pred_sum_norm: f32 = (predictions_norm * mask.clone())
         .sum()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
@@ -440,7 +429,7 @@ where
     let harness_target_sum_norm: f32 = (targets_norm_clean * mask)
         .sum()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
@@ -462,8 +451,8 @@ where
 }
 
 /// MSE ablation: scalar loss and harness diagnostics (clean-target RMSE stats).
-pub struct MseAblationOutput<B: burn::tensor::backend::Backend> {
-    pub loss: Tensor<B, 1>,
+pub struct MseAblationOutput {
+    pub loss: Tensor<1>,
     pub harness_sum_sq_error_norm: f32,
     pub harness_known_slots: f32,
     pub harness_pred_sum_norm: f32,
@@ -477,28 +466,22 @@ pub struct MseAblationOutput<B: burn::tensor::backend::Backend> {
 /// No Huber, pinball, ordinal, or pairwise. Uses [`SequenceModel::forward_with_lobby_scale`] (same
 /// MMR head path as [`SequenceModel::forward`]) so training matches `eval_per_rank_rmse` and
 /// leaves the ordinal head out of the autodiff graph.
-pub fn mse_ablation_minibatch_loss<
-    B: burn::tensor::backend::AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend,
->(
-    model: &SequenceModel<B>,
-    batch: &SequenceBatch<B>,
-    device: &B::Device,
+pub fn mse_ablation_minibatch_loss(
+    model: &SequenceModel,
+    batch: &SequenceBatch,
+    device: &Device,
     lobby_scale: f32,
     extreme_mmr: Option<MseExtremeMmrRowBoost>,
     jitter_step: LabelJitterStep,
-) -> MseAblationOutput<B>
-where
-    B::FloatElem: From<f32>,
-    B::InnerBackend: ml_model::fused_lstm::FusedLstmBackend,
-{
+) -> MseAblationOutput {
     let predictions = model.forward_with_lobby_scale(batch.inputs.clone(), lobby_scale);
     let mask = batch.targets.clone().greater_elem(0.0).float();
     let actual_batch_size = batch.targets.dims()[0];
 
-    let weights: Tensor<B, 2> = {
+    let weights: Tensor<2> = {
         let unit_row: Vec<f32> = vec![1.0f32; actual_batch_size];
-        let base = Tensor::<B, 1>::from_floats(unit_row.as_slice(), device)
-            .reshape([actual_batch_size, 1]);
+        let base =
+            Tensor::<1>::from_floats(unit_row.as_slice(), device).reshape([actual_batch_size, 1]);
         if let Some(boost) = extreme_mmr.as_ref() {
             let known_per_row = mask.clone().sum_dim(1).clamp_min(1.0);
             let mean_target_mmr = (batch.targets.clone() * mask.clone()).sum_dim(1) / known_per_row;
@@ -511,12 +494,8 @@ where
     };
 
     let targets_norm_clean = batch.targets.clone() / MMR_SCALE;
-    let jitter_norm = mean_zero_label_jitter_normalized::<B>(
-        device,
-        actual_batch_size,
-        mask.clone(),
-        jitter_step,
-    );
+    let jitter_norm =
+        mean_zero_label_jitter_normalized(device, actual_batch_size, mask.clone(), jitter_step);
     let targets_norm_train = targets_norm_clean.clone() + jitter_norm;
     let preds_norm = predictions / MMR_SCALE;
     let diff_loss = preds_norm.clone() - targets_norm_train;
@@ -538,14 +517,14 @@ where
     let sum_sq = (diff_harness.powf_scalar(2.0) * mask.clone()).sum();
     let harness_sum_sq_error_norm: f32 = sum_sq
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
         .unwrap_or(0.0);
     let harness_known_slots: f32 = known_count_tensor
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
@@ -553,7 +532,7 @@ where
     let harness_pred_sum_norm: f32 = (preds_norm * mask.clone())
         .sum()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
@@ -561,7 +540,7 @@ where
     let harness_target_sum_norm: f32 = (targets_norm_clean * mask)
         .sum()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap_or_default()
         .first()
         .copied()
@@ -581,14 +560,14 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    use burn::prelude::*;
     use ml_model::{MMR_SCALE, ORDINAL_BOUNDARIES_MMR, ORDINAL_NUM_BOUNDARIES};
 
     /// The dead zone must zero the gradient inside the band and preserve it outside, with the
     /// sign intact — a sign flip would push segments the wrong way.
     #[test]
     fn dead_zone_soft_thresholds_the_residual() {
-        type B = burn::backend::NdArray<f32>;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let device = Device::flex();
 
         let tolerance_mmr = 175.0_f32;
         let tolerance_norm = tolerance_mmr / MMR_SCALE;
@@ -597,7 +576,7 @@ mod tests {
             .map(|mmr: f32| mmr / MMR_SCALE)
             .collect();
 
-        let raw_diff = burn::tensor::Tensor::<B, 1>::from_floats(raw.as_slice(), &device);
+        let raw_diff = burn::tensor::Tensor::<1>::from_floats(raw.as_slice(), &device);
         let magnitude = raw_diff.clone().abs();
         let shrunk = magnitude.clone().sub_scalar(tolerance_norm).clamp_min(0.0);
         let out: Vec<f32> = (raw_diff * (shrunk / magnitude.clamp_min(1e-6)))
@@ -621,10 +600,9 @@ mod tests {
     /// bit-for-bit the previous behaviour.
     #[test]
     fn zero_tolerance_is_the_identity() {
-        type B = burn::backend::NdArray<f32>;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let device = Device::flex();
         let raw: Vec<f32> = vec![0.02, -0.13, 0.4];
-        let raw_diff = burn::tensor::Tensor::<B, 1>::from_floats(raw.as_slice(), &device);
+        let raw_diff = burn::tensor::Tensor::<1>::from_floats(raw.as_slice(), &device);
         let out: Vec<f32> = raw_diff.clone().into_data().to_vec().unwrap();
         for (got, want) in out.iter().zip(raw.iter()) {
             assert!((got - want).abs() < 1e-7);
@@ -638,13 +616,12 @@ mod tests {
     /// standing between a silent indexing error and a run trained on wrong targets.
     #[test]
     fn tensor_warp_matches_the_scalar_reference() {
-        type B = burn::backend::NdArray<f32>;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let device = Device::flex();
 
         let probes: Vec<f32> = vec![
             0.0, 50.0, 194.0, 200.0, 500.0, 900.0, 1030.0, 1500.0, 2200.0, 2400.0,
         ];
-        let input = burn::tensor::Tensor::<B, 1>::from_floats(probes.as_slice(), &device);
+        let input = burn::tensor::Tensor::<1>::from_floats(probes.as_slice(), &device);
         let warped: Vec<f32> = super::warp_targets_to_rank_index(input)
             .into_data()
             .to_vec()
@@ -662,11 +639,10 @@ mod tests {
     /// Warping must preserve ordering on a tensor, since concordance depends on it.
     #[test]
     fn tensor_warp_preserves_ordering() {
-        type B = burn::backend::NdArray<f32>;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let device = Device::flex();
 
         let ascending: Vec<f32> = (0..40).map(|step| step as f32 * 65.0).collect();
-        let input = burn::tensor::Tensor::<B, 1>::from_floats(ascending.as_slice(), &device);
+        let input = burn::tensor::Tensor::<1>::from_floats(ascending.as_slice(), &device);
         let warped: Vec<f32> = super::warp_targets_to_rank_index(input)
             .into_data()
             .to_vec()

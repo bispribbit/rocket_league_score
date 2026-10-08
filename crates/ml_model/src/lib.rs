@@ -28,14 +28,13 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, Relu};
 use burn::prelude::*;
-use burn::record::FullPrecisionSettings;
 use burn::tensor::activation::softmax;
 use feature_extractor::{
     FRAME_SUBSAMPLE_RATE, PLAYER_CENTRIC_FEATURE_COUNT, PlayerCentricFrameFeatures, TOTAL_PLAYERS,
     extract_player_centric_game_sequence_inference,
     extract_player_centric_game_sequence_inference_with_context,
 };
-use fused_lstm::{FusedLstm, FusedLstmBackend, FusedLstmConfig};
+use fused_lstm::{FusedLstm, FusedLstmConfig};
 
 /// Scale factor to normalise MMR values to [0, 1] range.
 ///
@@ -239,28 +238,28 @@ pub struct TrainingConfig {
 ///
 /// The final output is `[batch_size, 6]` predicted MMR values (raw, not normalised).
 #[derive(Module, Debug)]
-pub struct SequenceModel<B: Backend> {
+pub struct SequenceModel {
     /// First LSTM layer for full per-player feature stream.
-    lstm1: FusedLstm<B>,
+    lstm1: FusedLstm,
     /// Second LSTM layer for deeper temporal patterns.
-    lstm2: FusedLstm<B>,
+    lstm2: FusedLstm,
     /// Learned attention query for temporal pooling.
     /// Maps `[batch*6, seq, lstm2_hidden]` → `[batch*6, seq, 1]`.
-    attention_query: Linear<B>,
+    attention_query: Linear,
     /// Per-player feedforward: attention-pool + last hidden → player representation.
     /// Input size: `lstm2_hidden * 2`.
-    player_fc1: Linear<B>,
+    player_fc1: Linear,
     /// Per-player prediction head layer 1.
-    player_head_fc: Linear<B>,
+    player_head_fc: Linear,
     /// Per-player prediction head output: → 1 MMR scalar.
-    player_head_out: Linear<B>,
+    player_head_out: Linear,
     /// Lobby bias head: takes the mean of all 6 players' feedforward representations
     /// and produces a per-slot adjustment.  Input: `feedforward_hidden`, output: 1.
-    lobby_bias_head: Linear<B>,
+    lobby_bias_head: Linear,
     /// Ordinal classification head: maps per-player feedforward representation to
     /// [`ORDINAL_NUM_BOUNDARIES`] cumulative-logit boundaries used for auxiliary
     /// rank-classification loss.  Not used during inference.
-    ordinal_head: Linear<B>,
+    ordinal_head: Linear,
     /// Dropout for regularization.
     dropout: Dropout,
     /// `ReLU` activation.
@@ -269,9 +268,9 @@ pub struct SequenceModel<B: Backend> {
     lstm2_hidden: usize,
 }
 
-impl<B: FusedLstmBackend> SequenceModel<B> {
+impl SequenceModel {
     /// Creates a new sequence model with the given configuration.
-    pub fn new(device: &B::Device, config: &ModelConfig) -> Self {
+    pub fn new(device: &Device, config: &ModelConfig) -> Self {
         let lstm1 = FusedLstmConfig::new(PLAYER_CENTRIC_FEATURE_COUNT, config.lstm_hidden_1, true)
             .init(device);
         let lstm2 =
@@ -320,11 +319,7 @@ impl<B: FusedLstmBackend> SequenceModel<B> {
     ///   training batches) forcing the skill encoder to work standalone.
     ///
     /// Returns `[batch_size, 6]` raw MMR predictions.
-    pub fn forward_with_lobby_scale(
-        &self,
-        input: Tensor<B, 3>,
-        lobby_bias_scale: f32,
-    ) -> Tensor<B, 2> {
+    pub fn forward_with_lobby_scale(&self, input: Tensor<3>, lobby_bias_scale: f32) -> Tensor<2> {
         let [batch_times_players, seq_len, _] = input.dims();
         let batch_size = batch_times_players / TOTAL_PLAYERS;
 
@@ -386,9 +381,9 @@ impl<B: FusedLstmBackend> SequenceModel<B> {
     ///   boundary logits for the auxiliary ordinal rank-classification loss.
     pub fn forward_with_ordinal_scale(
         &self,
-        input: Tensor<B, 3>,
+        input: Tensor<3>,
         lobby_bias_scale: f32,
-    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    ) -> (Tensor<2>, Tensor<2>) {
         let [batch_times_players, seq_len, _] = input.dims();
         let batch_size = batch_times_players / TOTAL_PLAYERS;
 
@@ -444,18 +439,18 @@ impl<B: FusedLstmBackend> SequenceModel<B> {
     }
 
     /// Forward pass (lobby bias active — use during validation and inference).
-    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
+    pub fn forward(&self, input: Tensor<3>) -> Tensor<2> {
         self.forward_with_lobby_scale(input, 1.0)
     }
 
     /// Forward pass for inference (dropout disabled in eval mode).
-    pub fn forward_inference(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
+    pub fn forward_inference(&self, input: Tensor<3>) -> Tensor<2> {
         self.forward(input)
     }
 
     /// Returns the device this model is on.
     #[must_use]
-    pub fn device(&self) -> B::Device {
+    pub fn device(&self) -> Device {
         self.player_fc1.weight.device()
     }
 }
@@ -536,10 +531,7 @@ impl PlayerCentricSequenceTrainingData {
 }
 
 /// Creates a new sequence model with the given configuration.
-pub fn create_model<B: FusedLstmBackend>(
-    device: &B::Device,
-    config: &ModelConfig,
-) -> SequenceModel<B> {
+pub fn create_model(device: &Device, config: &ModelConfig) -> SequenceModel {
     SequenceModel::new(device, config)
 }
 
@@ -632,10 +624,10 @@ impl ExtractedSegmentFeatures {
     ///
     /// This method is `async` so GPU backends (for example WGPU) can read outputs with
     /// [`Tensor::into_data_async`] on targets such as WASM where synchronous reads are not supported.
-    pub async fn predict_single_segment<B: FusedLstmBackend>(
+    pub async fn predict_single_segment(
         &self,
-        model: &SequenceModel<B>,
-        device: &B::Device,
+        model: &SequenceModel,
+        device: &Device,
         segment_length: usize,
         segment_index: usize,
     ) -> Option<SegmentPrediction> {
@@ -657,7 +649,7 @@ impl ExtractedSegmentFeatures {
             }
         }
 
-        let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
+        let input = Tensor::<1>::from_floats(input_data.as_slice(), device).reshape([
             6,
             segment_length,
             PLAYER_CENTRIC_FEATURE_COUNT,
@@ -666,7 +658,7 @@ impl ExtractedSegmentFeatures {
         // output: [1, 6] (batch_size=1, 6 players) — raw MMR scale (see training loss).
         let output = model.forward_inference(input);
         let output_data = output.into_data_async().await.ok()?;
-        let values = output_data.to_vec::<f32>().ok()?;
+        let values = output_data.try_to_vec::<f32>().ok()?;
         let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
         for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
             if let Some(pred) = player_predictions.get_mut(i) {
@@ -689,10 +681,10 @@ impl ExtractedSegmentFeatures {
 /// Prefer this over [`predict_player_centric_per_segment`]: the goal list lets the
 /// features be built exactly as they were in training (goal-replay frames excluded,
 /// real score differential), so the model is scored on vectors of a kind it has seen.
-pub fn predict_player_centric_per_segment_from_parsed<B: FusedLstmBackend>(
-    model: &SequenceModel<B>,
+pub fn predict_player_centric_per_segment_from_parsed(
+    model: &SequenceModel,
     parsed: &replay_structs::ParsedReplay,
-    device: &B::Device,
+    device: &Device,
     segment_length: usize,
 ) -> Vec<SegmentPrediction> {
     if parsed.frames.is_empty() {
@@ -728,10 +720,10 @@ pub fn predict_player_centric_per_segment_from_parsed<B: FusedLstmBackend>(
 /// # Returns
 ///
 /// A vector of per-segment predictions.
-pub fn predict_player_centric_per_segment<B: FusedLstmBackend>(
-    model: &SequenceModel<B>,
+pub fn predict_player_centric_per_segment(
+    model: &SequenceModel,
     frames: &[replay_structs::GameFrame],
-    device: &B::Device,
+    device: &Device,
     segment_length: usize,
 ) -> Vec<SegmentPrediction> {
     if frames.is_empty() {
@@ -758,11 +750,11 @@ pub fn predict_player_centric_per_segment<B: FusedLstmBackend>(
 /// context columns and score a checkpoint trained with
 /// `ml_model_training::FeatureView::SelfOnly`. Feeding such a checkpoint the full 106-feature
 /// view hands it context it never trained on and quietly understates it.
-pub fn predict_from_player_centric_frames<B: FusedLstmBackend>(
-    model: &SequenceModel<B>,
+pub fn predict_from_player_centric_frames(
+    model: &SequenceModel,
     player_centric_frames: &[[PlayerCentricFrameFeatures; TOTAL_PLAYERS]],
     original_frame_count: usize,
-    device: &B::Device,
+    device: &Device,
     segment_length: usize,
 ) -> Vec<SegmentPrediction> {
     let num_segments = if player_centric_frames.len() >= segment_length {
@@ -790,7 +782,7 @@ pub fn predict_from_player_centric_frames<B: FusedLstmBackend>(
             }
         }
 
-        let input = Tensor::<B, 1>::from_floats(input_data.as_slice(), device).reshape([
+        let input = Tensor::<1>::from_floats(input_data.as_slice(), device).reshape([
             6,
             segment_length,
             PLAYER_CENTRIC_FEATURE_COUNT,
@@ -801,7 +793,7 @@ pub fn predict_from_player_centric_frames<B: FusedLstmBackend>(
 
         // Extract predictions
         let output_data = output.into_data();
-        if let Ok(values) = output_data.to_vec::<f32>() {
+        if let Ok(values) = output_data.try_to_vec::<f32>() {
             let mut player_predictions = [1000.0f32; TOTAL_PLAYERS];
             for (i, val) in values.iter().enumerate().take(TOTAL_PLAYERS) {
                 if let Some(pred) = player_predictions.get_mut(i) {
@@ -837,10 +829,10 @@ pub fn predict_from_player_centric_frames<B: FusedLstmBackend>(
 /// # Returns
 ///
 /// Array of predicted MMR values for each of the 6 players (averaged across segments).
-pub fn predict_player_centric<B: FusedLstmBackend>(
-    model: &SequenceModel<B>,
+pub fn predict_player_centric(
+    model: &SequenceModel,
     frames: &[replay_structs::GameFrame],
-    device: &B::Device,
+    device: &Device,
     segment_length: usize,
 ) -> [f32; TOTAL_PLAYERS] {
     let segments = predict_player_centric_per_segment(model, frames, device, segment_length);
@@ -890,14 +882,14 @@ fn get_segment_player_frames(
     segment
 }
 
-/// Loads a model checkpoint from in-memory bytes (binary format).
+/// Loads a model checkpoint from in-memory bytes (burnpack format).
 ///
 /// This function is designed for WASM / embedded model use cases where the model
 /// weights are included via `include_bytes!`.
 ///
-/// It tries **NamedMpk** format first (the default training format produced by
-/// `save_checkpoint`), then falls back to **Bin** format (produced by
-/// `save_checkpoint_bin`).
+/// The bytes must be **burnpack** (`.bpk`), the only checkpoint format burn 0.22
+/// reads and the format `save_checkpoint` writes. The pre-0.22 MessagePack
+/// (`.mpk`) and bin checkpoints are not readable here.
 ///
 /// # Arguments
 ///
@@ -908,12 +900,13 @@ fn get_segment_player_frames(
 /// # Errors
 ///
 /// Returns an error if the model cannot be loaded from bytes.
-pub fn load_checkpoint_from_bytes<B: FusedLstmBackend>(
+pub fn load_checkpoint_from_bytes(
     model_bytes: &[u8],
     config_json: &str,
-    device: &B::Device,
-) -> anyhow::Result<SequenceModel<B>> {
-    use burn::record::{BinBytesRecorder, NamedMpkBytesRecorder, Recorder};
+    device: &Device,
+) -> anyhow::Result<SequenceModel> {
+    use burn::store::ModuleRecord;
+    use burn::tensor::Bytes;
 
     let model_config = if config_json.is_empty() {
         ModelConfig::new()
@@ -926,65 +919,52 @@ pub fn load_checkpoint_from_bytes<B: FusedLstmBackend>(
     // Create model with config
     let model = SequenceModel::new(device, &model_config);
 
-    // Try NamedMpk format first (default training checkpoint format), then Bin format.
-    let mpk_recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
-    if let Ok(record) = mpk_recorder.load(model_bytes.to_vec(), device) {
-        return Ok(model.load_record(record));
-    }
+    let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(model_bytes.to_vec()))
+        .map_err(|error| anyhow::anyhow!("Failed to read burnpack model bytes: {error}"))?;
 
-    let bin_recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
-    let record = bin_recorder
-        .load(model_bytes.to_vec(), device)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to load model from bytes (tried NamedMpk and Bin formats): {error}"
-            )
-        })?;
-
-    Ok(model.load_record(record))
+    model
+        .try_load_record(record)
+        .map_err(|error| anyhow::anyhow!("Failed to apply model record: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
 
     use super::*;
 
-    type TestBackend = NdArray;
-
     #[test]
     fn test_model_creation() {
-        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let device = Device::flex();
         let config = ModelConfig::new();
-        let _model: SequenceModel<TestBackend> = create_model(&device, &config);
+        let _model: SequenceModel = create_model(&device, &config);
     }
 
     #[test]
     fn test_model_forward() {
-        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let device = Device::flex();
         let config = ModelConfig::new();
-        let model: SequenceModel<TestBackend> = create_model(&device, &config);
+        let model: SequenceModel = create_model(&device, &config);
 
         // Create a batch of 2 games × 6 players, each with 100 frames.
         // Input shape: [batch*6, seq_len, player_features]
         let batch_size = 2;
         let seq_len = 100;
-        let input = Tensor::<TestBackend, 3>::zeros(
+        let input = Tensor::<3>::zeros(
             [batch_size * 6, seq_len, PLAYER_CENTRIC_FEATURE_COUNT],
             &device,
         );
         let output = model.forward(input);
 
         assert_eq!(output.dims(), [batch_size, TOTAL_PLAYERS]);
-        let values = output.into_data().to_vec::<f32>().unwrap();
+        let values = output.into_data().try_to_vec::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn test_predict_with_player_frames() {
-        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let device = Device::flex();
         let config = ModelConfig::new();
-        let model: SequenceModel<TestBackend> = create_model(&device, &config);
+        let model: SequenceModel = create_model(&device, &config);
 
         // Create 500 frames of fake player-centric data
         let player_frames: Vec<[PlayerCentricFrameFeatures; 6]> = (0..500)
@@ -1033,8 +1013,11 @@ mod tests {
             }
         }
 
-        let input = Tensor::<TestBackend, 1>::from_floats(input_data.as_slice(), &device)
-            .reshape([6, segment_length, PLAYER_CENTRIC_FEATURE_COUNT]);
+        let input = Tensor::<1>::from_floats(input_data.as_slice(), &device).reshape([
+            6,
+            segment_length,
+            PLAYER_CENTRIC_FEATURE_COUNT,
+        ]);
 
         let output = model.forward_inference(input);
 
@@ -1042,7 +1025,7 @@ mod tests {
         assert_eq!(output.dims(), [1, TOTAL_PLAYERS]);
 
         // Verify all predictions are finite
-        let values = output.into_data().to_vec::<f32>().unwrap();
+        let values = output.into_data().try_to_vec::<f32>().unwrap();
         assert_eq!(values.len(), 6);
         assert!(values.iter().all(|s| s.is_finite()));
     }

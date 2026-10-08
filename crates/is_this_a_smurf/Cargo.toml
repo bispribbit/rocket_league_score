@@ -32,3 +32,4 @@ web-sys = { workspace = true, features = [
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom_for_transitive_rand.workspace = true
+

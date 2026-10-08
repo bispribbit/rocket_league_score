@@ -60,8 +60,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
+use burn::prelude::Device;
 use clap::Parser;
 use config::OBJECT_STORE;
 use database::{initialize_pool, list_replay_players_by_replay, list_replays_by_split};
@@ -74,8 +73,6 @@ use replay_parser::parse_replay_from_bytes;
 use replay_structs::{DatasetSplit, ParsedReplay};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
-
-type InferenceBackend = NdArray;
 
 const PLAYERS_PER_TEAM: usize = TOTAL_PLAYERS / 2;
 
@@ -283,9 +280,9 @@ async fn main() -> Result<()> {
         std::env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
     initialize_pool(&database_url).await?;
 
-    let device = NdArrayDevice::Cpu;
+    let device = Device::flex();
     info!(model = %args.model, "Loading checkpoint");
-    let model: SequenceModel<InferenceBackend> =
+    let model: SequenceModel =
         load_checkpoint(&args.model, &device).context("Failed to load checkpoint")?;
 
     let self_only = args.self_only.unwrap_or_else(|| checkpoint_self_only(&args.model));

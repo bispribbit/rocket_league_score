@@ -27,8 +27,7 @@
 //! Requires `DATABASE_URL`. Does not require the replay object store.
 
 use anyhow::{Context, Result};
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
+use burn::prelude::Device;
 use clap::Parser;
 use config::get_base_path;
 use database::{initialize_pool, list_replay_players_by_replay, list_replays_by_split};
@@ -42,9 +41,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-// Eval-only path: NdArray on CPU avoids GPU autotune issues (e.g. WSL `dzn` lacking
+// Eval-only path: the Flex CPU backend avoids GPU autotune issues (e.g. WSL `dzn` lacking
 // subgroup/"plane" instructions) and matches the other eval binaries in this crate.
-type InferenceBackend = NdArray;
 
 #[derive(Parser, Debug)]
 #[command(name = "revalidate")]
@@ -227,9 +225,9 @@ async fn main() -> Result<()> {
         "Segment store ready"
     );
 
-    let device = NdArrayDevice::Cpu;
+    let device = Device::flex();
     info!(model = %args.model, "Loading checkpoint");
-    let model: SequenceModel<InferenceBackend> =
+    let model: SequenceModel =
         load_checkpoint(&args.model, &device).context("Failed to load model checkpoint")?;
 
     let self_only = args
@@ -245,8 +243,7 @@ async fn main() -> Result<()> {
         },
         "Feature view"
     );
-    let batcher = SequenceBatcher::<InferenceBackend>::new(device, args.seq_len)
-        .with_feature_view(feature_view);
+    let batcher = SequenceBatcher::new(device, args.seq_len).with_feature_view(feature_view);
 
     info!("Scoring (frozen weights, no optimiser step)...");
     let result = compute_validation_loss(&model, &dataset, &batcher, args.batch_size);

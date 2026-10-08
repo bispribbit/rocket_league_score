@@ -4,10 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use burn::grad_clipping::GradientClippingConfig;
-use burn::module::AutodiffModule;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::tensor::backend::AutodiffBackend;
 use ml_model::{MMR_SCALE, SequenceModel, TrainingConfig};
 use replay_structs::{Rank, RankDivision};
 use tracing::{error, info, warn};
@@ -418,18 +416,14 @@ fn should_validate_epoch(epoch: usize, total_epochs: usize, every_n_epochs: usiz
     every_n_epochs <= 1 || epoch + 1 >= total_epochs || (epoch + 1).is_multiple_of(every_n_epochs)
 }
 
-pub fn train<B: AutodiffBackend + ml_model::fused_lstm::FusedLstmBackend>(
-    model: &mut SequenceModel<B>,
+pub fn train(
+    model: &mut SequenceModel,
     train_dataset: Arc<SegmentStore>,
     valid_dataset: Option<&Arc<SegmentStore>>,
     config: &TrainingConfig,
     checkpoint_config: Option<CheckpointConfig>,
     start_state: Option<TrainingState>,
-) -> anyhow::Result<TrainingOutput>
-where
-    B::FloatElem: From<f32>,
-    B::InnerBackend: ml_model::fused_lstm::FusedLstmBackend,
-{
+) -> anyhow::Result<TrainingOutput> {
     if train_dataset.is_empty() {
         return Err(anyhow::anyhow!("No training data provided"));
     }
@@ -523,7 +517,7 @@ where
         // We decide per-batch using a deterministic hash of epoch+batch_idx.
         let lobby_zero_fraction = 0.2_f32;
 
-        let mut accumulated_loss: Option<Tensor<B, 1>> = None;
+        let mut accumulated_loss: Option<Tensor<1>> = None;
         let mut accumulated_count = 0;
         let mut epoch_loss_sum = 0.0f64;
         let mut epoch_loss_count = 0usize;
@@ -549,7 +543,7 @@ where
             time_prefetch_wait_us += t_prefetch_start.elapsed().as_micros() as u64;
 
             let t_to_gpu_start = Instant::now();
-            let batch = preloaded_batch.to_batch::<B>(&device);
+            let batch = preloaded_batch.to_batch(&device);
             time_to_gpu_us += t_to_gpu_start.elapsed().as_micros() as u64;
 
             let t_forward_start = Instant::now();
@@ -603,7 +597,7 @@ where
                 let per_sample_loss = minibatch_out
                     .per_row_mse_for_smurf
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .unwrap_or_default();
                 for (batch_pos, loss_val) in per_sample_loss.iter().enumerate() {
                     let seg_idx = preloaded_batch
@@ -683,7 +677,7 @@ where
                     attempt = nan_recovery_attempts,
                     "Rolling back to last good checkpoint and resetting Adam state"
                 );
-                match load_checkpoint::<B>(ckpt_path, &device) {
+                match load_checkpoint(ckpt_path, &device) {
                     Ok(recovered) => {
                         *model = recovered;
                         optimizer = AdamConfig::new()
@@ -758,9 +752,8 @@ where
             let valid_start = Instant::now();
             let inner_model = model.valid();
             let inner_device = inner_model.device();
-            let valid_batcher =
-                SequenceBatcher::<B::InnerBackend>::new(inner_device, config.sequence_length)
-                    .with_feature_view(feature_view);
+            let valid_batcher = SequenceBatcher::new(inner_device, config.sequence_length)
+                .with_feature_view(feature_view);
 
             let validation_result =
                 compute_validation_loss(&inner_model, valid_ds, &valid_batcher, config.batch_size);
@@ -1713,10 +1706,10 @@ fn log_within_lobby_metrics(metrics: &WithinLobbyMetrics) {
 /// Public so a checkpoint can be re-scored without re-training: the `revalidate`
 /// example in `rocket_league_score` calls this directly, which guarantees the numbers
 /// it prints are produced by the same code path as an in-training validation pass.
-pub fn compute_validation_loss<B: Backend + ml_model::fused_lstm::FusedLstmBackend>(
-    model: &SequenceModel<B>,
+pub fn compute_validation_loss(
+    model: &SequenceModel,
     dataset: &Arc<SegmentStore>,
-    batcher: &SequenceBatcher<B>,
+    batcher: &SequenceBatcher,
     batch_size: usize,
 ) -> ValidationLossResult {
     let num_segments = dataset.len();

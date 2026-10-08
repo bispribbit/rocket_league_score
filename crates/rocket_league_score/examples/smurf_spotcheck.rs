@@ -20,8 +20,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
+use burn::prelude::Device;
 use clap::Parser;
 use config::OBJECT_STORE;
 use database::{initialize_pool, list_mixed_rank_replays, list_replay_players_by_replay};
@@ -34,9 +33,8 @@ use replay_parser::parse_replay_from_bytes;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-// Eval-only path: NdArray on CPU avoids GPU autotune issues (e.g. WSL `dzn`
+// Eval-only path: the Flex CPU backend avoids GPU autotune issues (e.g. WSL `dzn`
 // lacking subgroup/"plane" instructions) and is plenty fast for ~100 lobbies.
-type InferenceBackend = NdArray;
 
 /// MMR a player's prediction must exceed the lobby median by to be flagged.
 ///
@@ -103,9 +101,9 @@ async fn main() -> Result<()> {
         std::env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
     initialize_pool(&database_url).await?;
 
-    let device = NdArrayDevice::Cpu;
+    let device = Device::flex();
     info!(model = %args.model, "Loading model checkpoint");
-    let model: SequenceModel<InferenceBackend> =
+    let model: SequenceModel =
         load_checkpoint(&args.model, &device).context("Failed to load model checkpoint")?;
 
     let mut candidates = list_mixed_rank_replays(args.min_top_gap).await?;

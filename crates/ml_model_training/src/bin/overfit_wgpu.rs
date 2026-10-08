@@ -1,12 +1,12 @@
 #![allow(clippy::indexing_slicing)]
 
-//! Overfit regression-test harness that exercises the `FusedLstm` CubeCL kernel
-//! through the `burn-wgpu` backend (Vulkan via Mesa's dzn driver inside the
-//! WSL2 devcontainer, or native DX12/Metal/Vulkan on the host).
+//! Overfit regression-test harness that exercises `FusedLstm` on the wgpu
+//! backend (Vulkan via Mesa's dzn driver inside the WSL2 devcontainer, or
+//! native DX12/Metal/Vulkan on the host).
 //!
-//! Runs the full Burn stack (model + Adam + Autodiff) on GPU through the
-//! CubeCL fused-LSTM kernel across three tiers (T1/T2/T3) to validate that the
-//! fused kernel path is numerically sound and to measure its per-epoch speed.
+//! Runs the full Burn stack (model + Adam + autodiff) on GPU across three tiers
+//! (T1/T2/T3) to validate that the GPU training path is numerically sound and to
+//! measure its per-epoch speed.
 //!
 //! Usage:
 //!   cargo run --bin overfit_wgpu --release \
@@ -34,8 +34,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use burn::backend::wgpu::WgpuDevice;
-use burn::backend::{Autodiff, Wgpu};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
@@ -50,9 +48,6 @@ use ml_model_training::{
     pseudo_random_f32,
 };
 use replay_structs::Rank;
-
-type TrainBackend = Autodiff<Wgpu>;
-type TrainDevice = WgpuDevice;
 
 // =============================================================================
 // Args + config
@@ -314,7 +309,7 @@ struct OverfitTrainingLoopConfiguration {
 }
 
 fn run_training(
-    model: &mut SequenceModel<TrainBackend>,
+    model: &mut SequenceModel,
     store: &Arc<SegmentStore>,
     loop_configuration: &OverfitTrainingLoopConfiguration,
 ) -> Vec<f32> {
@@ -329,8 +324,7 @@ fn run_training(
     let mut optimizer = AdamConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Norm(grad_clip)))
         .init();
-    let batcher =
-        SequenceBatcher::<TrainBackend>::new(device.clone(), loop_configuration.sequence_length);
+    let batcher = SequenceBatcher::new(device.clone(), loop_configuration.sequence_length);
 
     let rank_weights: Vec<f32> = if loop_configuration.mse_only {
         Vec::new()
@@ -391,7 +385,7 @@ fn run_training(
                 1.0_f32
             };
 
-            let loss: Tensor<TrainBackend, 1> = if loop_configuration.mse_only {
+            let loss: Tensor<1> = if loop_configuration.mse_only {
                 let out = mse_ablation_minibatch_loss(
                     model,
                     &batch,
@@ -510,12 +504,12 @@ fn run_training(
 // =============================================================================
 
 fn eval_per_rank_rmse(
-    model: &SequenceModel<TrainBackend>,
+    model: &SequenceModel,
     store: &Arc<SegmentStore>,
     sequence_length: usize,
     batch_size: usize,
 ) -> HashMap<Rank, f32> {
-    let batcher = SequenceBatcher::<TrainBackend>::new(model.device(), sequence_length);
+    let batcher = SequenceBatcher::new(model.device(), sequence_length);
     let mut rank_sq_err: HashMap<Rank, f64> = HashMap::new();
     let mut rank_count: HashMap<Rank, usize> = HashMap::new();
 
@@ -553,14 +547,14 @@ fn eval_per_rank_rmse(
 }
 
 // =============================================================================
-// T1 / T2 / T3 runners — copied verbatim from overfit_test but typed on
-// `Autodiff<Wgpu>` so `SequenceModel` uses the FusedLstm CubeCL kernel.
+// T1 / T2 / T3 runners — copied verbatim from overfit_test but run on an
+// autodiff-enabled wgpu device, so the cell math is fused by the backend.
 // =============================================================================
 
 fn run_t1(
     all_segments: &[LabelledSegment],
     config: &HarnessConfig,
-    device: &TrainDevice,
+    device: &Device,
     model_config: &ModelConfig,
 ) -> bool {
     println!("\n=== T1: Single-SSL replay overfit (target RMSE < 50 MMR) ===");
@@ -599,7 +593,7 @@ fn run_t1(
 
     let mut no_dropout_cfg = model_config.clone();
     no_dropout_cfg.dropout = 0.0;
-    let mut model: SequenceModel<TrainBackend> = create_model(device, &no_dropout_cfg);
+    let mut model: SequenceModel = create_model(device, &no_dropout_cfg);
     let history = run_training(
         &mut model,
         &store,
@@ -629,7 +623,7 @@ fn run_t1(
 fn run_t2(
     all_segments: &[LabelledSegment],
     config: &HarnessConfig,
-    device: &TrainDevice,
+    device: &Device,
     model_config: &ModelConfig,
 ) -> bool {
     println!("\n=== T2: Bronze-1 vs SSL pair (RMSE < 300 MMR) ===");
@@ -675,7 +669,7 @@ fn run_t2(
 
     let mut no_dropout_cfg = model_config.clone();
     no_dropout_cfg.dropout = 0.0;
-    let mut model: SequenceModel<TrainBackend> = create_model(device, &no_dropout_cfg);
+    let mut model: SequenceModel = create_model(device, &no_dropout_cfg);
     let history = run_training(
         &mut model,
         &store,
@@ -705,7 +699,7 @@ fn run_t2(
 fn run_t3(
     all_segments: &[LabelledSegment],
     config: &HarnessConfig,
-    device: &TrainDevice,
+    device: &Device,
     model_config: &ModelConfig,
 ) -> bool {
     println!("\n=== T3: Balanced mini-set per rank (SSL RMSE < 350 MMR) ===");
@@ -744,7 +738,7 @@ fn run_t3(
 
     let mut no_dropout_cfg = model_config.clone();
     no_dropout_cfg.dropout = 0.0;
-    let mut model: SequenceModel<TrainBackend> = create_model(device, &no_dropout_cfg);
+    let mut model: SequenceModel = create_model(device, &no_dropout_cfg);
     let t3_learning_rate = config.learning_rate * 1.5;
     let t3_cosine_lr_floor = config.cosine_lr_floor.max(0.15);
     let history = run_training(
@@ -861,13 +855,15 @@ fn main() {
         println!("  {:>22}: {count}", format!("{rank:?}"));
     }
 
-    // `WgpuDevice::default()` picks the first adapter wgpu enumerates. Inside
-    // the WSL2 devcontainer this is the dzn adapter pointing at the host GPU
-    // (provided `WGPU_BACKEND=vulkan` is set; see `.devcontainer/docker-
-    // compose.yml`). On Windows natively, this is the DX12 NVIDIA adapter.
-    let device = WgpuDevice::default();
-    Wgpu::<f32>::seed(&device, 42);
-    println!("\nBackend: burn-wgpu (Vulkan / DX12 via wgpu) with FusedLstm CubeCL kernel");
+    // `Device::wgpu(Default::default())` picks the first adapter wgpu
+    // enumerates. Inside the WSL2 devcontainer this is the dzn adapter pointing
+    // at the host GPU (provided `WGPU_BACKEND=vulkan` is set; see
+    // `.devcontainer/docker-compose.yml`). On Windows natively, this is the
+    // DX12 NVIDIA adapter. `.autodiff()` turns on gradient recording for
+    // tensors created on it, which is what the training loop needs.
+    let device = Device::wgpu(DeviceKind::default()).autodiff();
+    device.seed(42);
+    println!("\nBackend: wgpu (Vulkan / DX12) with autodiff enabled");
 
     let model_config = ModelConfig::new();
 

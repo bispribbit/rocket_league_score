@@ -21,14 +21,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use burn::backend::{Autodiff, Wgpu};
 use config::{OBJECT_STORE, get_base_path};
 use feature_extractor::{PlayerRating, TOTAL_PLAYERS, extract_player_centric_game_sequence};
 use ml_model::{ModelConfig, TrainingConfig, create_model};
 use ml_model_training::segment_cache::{SegmentStore, SegmentStoreBuilder};
 use ml_model_training::{
-    CheckpointConfig, CheckpointValidationMetrics, TrainingState, balanced_segment_indices,
-    save_checkpoint, train,
+    CHECKPOINT_EXTENSION, CheckpointConfig, CheckpointValidationMetrics, TrainingState,
+    balanced_segment_indices, save_checkpoint, train,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
@@ -37,9 +36,6 @@ use replay_structs::{DatasetSplit, Replay};
 use tracing::{debug, error, info, warn};
 
 use super::init_device;
-
-/// Training requires Autodiff wrapper for automatic differentiation.
-type TrainBackend = Autodiff<Wgpu>;
 
 /// Soft memory budget for the largest fused LSTM projection buffer (`x_proj`) in bytes.
 ///
@@ -454,7 +450,11 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
     // Step 3: Create or load model
     let step3_start = Instant::now();
     info!("Step 3: Initializing model...");
-    let device = init_device();
+    // Gradient recording is a property of the device in burn 0.22, not of a
+    // backend type parameter: every tensor the model creates here has to come
+    // from an autodiff-enabled device or `backward()` finds nothing to
+    // differentiate and training silently makes no progress.
+    let device = init_device().autodiff();
 
     let checkpoint_dir = format!("models/{}", config.model_name);
     let checkpoint_prefix = format!("{checkpoint_dir}/checkpoint");
@@ -464,7 +464,7 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
         let latest_checkpoint = find_latest_checkpoint(&checkpoint_prefix)?;
         if let Some(checkpoint_path) = latest_checkpoint {
             info!(checkpoint = %checkpoint_path, "Resuming from checkpoint");
-            let model: ml_model::SequenceModel<TrainBackend> =
+            let model: ml_model::SequenceModel =
                 ml_model_training::load_checkpoint(&checkpoint_path, &device)?;
 
             // Extract epoch from checkpoint path
@@ -474,11 +474,11 @@ pub async fn run_with_config(config: &FullTrainConfig) -> Result<()> {
             (model, Some(state))
         } else {
             warn!("No checkpoint found, starting fresh");
-            (create_model::<TrainBackend>(&device, &model_config), None)
+            (create_model(&device, &model_config), None)
         }
     } else {
         info!("Creating new model");
-        (create_model::<TrainBackend>(&device, &model_config), None)
+        (create_model(&device, &model_config), None)
     };
     let step3_duration = step3_start.elapsed();
 
@@ -1193,11 +1193,11 @@ fn find_latest_checkpoint(prefix: &str) -> Result<Option<String>> {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
 
-            // Look for checkpoint files (ending in .mpk)
+            // Look for checkpoint weight files (ending in .bpk)
             if name.starts_with("checkpoint_")
                 && std::path::Path::new(name)
                     .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("mpk"))
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(CHECKPOINT_EXTENSION))
             {
                 Some(path.to_string_lossy().to_string())
             } else {
@@ -1225,19 +1225,21 @@ fn find_latest_checkpoint(prefix: &str) -> Result<Option<String>> {
         })
     });
 
-    // Return the path without the .mpk extension (as expected by load_checkpoint)
-    Ok(checkpoints
-        .first()
-        .map(|latest| latest.trim_end_matches(".mpk").to_string()))
+    // Return the path without the .bpk extension (as expected by load_checkpoint)
+    Ok(checkpoints.first().map(|latest| {
+        latest
+            .trim_end_matches(&format!(".{CHECKPOINT_EXTENSION}"))
+            .to_string()
+    }))
 }
 
 /// Extracts the epoch number from a checkpoint filename.
 fn extract_epoch_from_checkpoint(path: &str) -> Option<usize> {
-    // Pattern: checkpoint_epoch{N} or checkpoint_epoch{N}.mpk
+    // Pattern: checkpoint_epoch{N} or checkpoint_epoch{N}.bpk
     let filename = std::path::Path::new(path).file_name()?.to_str()?;
 
     if let Some(rest) = filename.strip_prefix("checkpoint_epoch") {
-        let epoch_str = rest.trim_end_matches(".mpk");
+        let epoch_str = rest.trim_end_matches(&format!(".{CHECKPOINT_EXTENSION}"));
         epoch_str.parse().ok()
     } else {
         None
@@ -1266,10 +1268,10 @@ mod tests {
         // Written in the order the training loop writes them, so the unnumbered files
         // genuinely carry the newer mtime.
         for name in [
-            "checkpoint_epoch10.mpk",
-            "checkpoint_epoch15.mpk",
-            "checkpoint_best.mpk",
-            "checkpoint_best_ordinal.mpk",
+            "checkpoint_epoch10.bpk",
+            "checkpoint_epoch15.bpk",
+            "checkpoint_best.bpk",
+            "checkpoint_best_ordinal.bpk",
         ] {
             std::fs::write(dir.join(name), b"x").expect("write checkpoint");
         }
@@ -1302,9 +1304,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
-        std::fs::write(dir.join("checkpoint_best.mpk"), b"x").expect("write");
+        std::fs::write(dir.join("checkpoint_best.bpk"), b"x").expect("write");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(dir.join("checkpoint_best_ordinal.mpk"), b"x").expect("write");
+        std::fs::write(dir.join("checkpoint_best_ordinal.bpk"), b"x").expect("write");
 
         let prefix = dir.join("checkpoint").to_string_lossy().to_string();
         let latest = find_latest_checkpoint(&prefix)
@@ -1323,11 +1325,11 @@ mod tests {
     fn test_extract_epoch_from_checkpoint() {
         assert_eq!(extract_epoch_from_checkpoint("checkpoint_epoch5"), Some(5));
         assert_eq!(
-            extract_epoch_from_checkpoint("checkpoint_epoch10.mpk"),
+            extract_epoch_from_checkpoint("checkpoint_epoch10.bpk"),
             Some(10)
         );
         assert_eq!(
-            extract_epoch_from_checkpoint("/path/to/checkpoint_epoch25.mpk"),
+            extract_epoch_from_checkpoint("/path/to/checkpoint_epoch25.bpk"),
             Some(25)
         );
         assert_eq!(extract_epoch_from_checkpoint("checkpoint_best"), None);

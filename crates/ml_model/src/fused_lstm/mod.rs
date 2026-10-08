@@ -2,17 +2,12 @@
 //!
 //! [`FusedLstm`] is the only LSTM implementation used in this workspace.
 //! It stores weights in a concatenated 4-gate layout (`[i, f, g, o]`,
-//! PyTorch / cuDNN convention) and dispatches the forward pass through the
-//! [`FusedLstmBackend`] trait:
+//! PyTorch / cuDNN convention) so the gate projections collapse into a
+//! single matmul, and runs the cell math in high-level burn tensor ops.
 //!
-//! - **NdArray** (CPU / WASM): generic `Tensor`-op loop — correct on every
-//!   platform, used for web inference.
-//! - **`CubeBackend<R, …>`** (non-WASM builds): one CubeCL cell-kernel
-//!   launch per timestep + full-sequence matmuls, used for training on
-//!   Wgpu (Windows/Linux/macOS).
-//! - **`Autodiff<B>`**: single tracked `Backward` op wrapping
-//!   `B::fused_lstm_forward_train`, so the autograd graph stays O(1)
-//!   regardless of sequence length.
+//! Burn's CubeCL backends fuse those elementwise ops into their own kernels,
+//! and autodiff tracks the cell math per op, so there is one forward path for
+//! every backend and device — CPU, WebGPU, CUDA and WASM alike.
 //!
 //! ## Layout conventions
 //!
@@ -27,11 +22,10 @@
 //! Gate split order after the matmul: `[i | f | g | o]`, then
 //! `i, f, o` go through sigmoid and `g` through tanh.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod backend;
+mod forward;
 mod module;
 
-#[cfg(not(target_arch = "wasm32"))]
-mod cube_kernel;
-
-pub use backend::FusedLstmBackend;
+pub use forward::{FusedLstmStateOut, fused_lstm_forward};
 pub use module::{FusedLstm, FusedLstmConfig, FusedLstmState};

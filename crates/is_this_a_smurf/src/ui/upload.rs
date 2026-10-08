@@ -16,8 +16,7 @@
 //! steps. Moving compute to a worker would be a larger architectural change (model + tensors in the
 //! worker, progress messages back to the main thread).
 
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
+use burn::prelude::Device;
 use dioxus::prelude::*;
 use ml_model::{ExtractedSegmentFeatures, SequenceModel, load_checkpoint_from_bytes};
 use replay_parser::{ReplayAcceptanceError, parse_replay_from_bytes};
@@ -38,13 +37,12 @@ use crate::prediction::{
     ranks_from_player_predictions, segment_step_infos,
 };
 
-/// Burn backend for inference. The website runs inference on pure CPU
-/// (`ndarray`) on every target: WASM needs it because cubecl-wgpu's sync
-/// tensor reads panic in-browser, and native desktop builds use the same
-/// backend so "what ships" matches "what we test". Bulk GPU inference
-/// (flag_smurfs, predict) is handled by a separate CLI that targets CUDA.
-type InferenceBackend = NdArray;
-type InferenceDevice = NdArrayDevice;
+// Burn backend for inference. The website runs inference on pure CPU (the
+// `flex` backend, which replaced the deprecated `ndarray` one) on every target:
+// WASM needs it because cubecl-wgpu's sync tensor reads panic in-browser, and
+// native desktop builds use the same backend so "what ships" matches "what we
+// test". Bulk GPU inference (flag_smurfs, predict) is handled by a separate CLI
+// that targets the GPU.
 
 /// Upload page with a centered drag-and-drop area.
 ///
@@ -310,11 +308,22 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                                 );
                             yield_to_ui().await;
                             yield_for_dom_paint().await;
+                            if MODEL_BYTES.is_empty() {
+                                tracing::info!("[replay] no embedded model");
+                                state.set(AppState::Error(
+                                    "No prediction model is built into this app yet. \
+                                     The previous model used a checkpoint format that the \
+                                     current version of Burn cannot read, so it needs to be \
+                                     retrained before predictions can run."
+                                        .to_string(),
+                                ));
+                                return;
+                            }
                             tracing::info!(
-                                "[replay] load_checkpoint_from_bytes starting (backend = NdArray)"
+                                "[replay] load_checkpoint_from_bytes starting (Flex CPU backend)"
                             );
-                            let device = InferenceDevice::default();
-                            let model: SequenceModel<InferenceBackend> = match load_checkpoint_from_bytes(
+                            let device = Device::default();
+                            let model: SequenceModel = match load_checkpoint_from_bytes(
                                 MODEL_BYTES,
                                 MODEL_CONFIG,
                                 &device,

@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use anyhow::Result;
-use burn::backend::Wgpu;
 use ml_model::{SequenceModel, predict_player_centric};
 use ml_model_training::load_checkpoint;
 use replay_parser::parse_replay;
@@ -11,8 +10,6 @@ use replay_structs::RankDivision;
 use tracing::{info, warn};
 
 use super::init_device;
-
-type Backend = Wgpu;
 
 /// Default sequence length for inference (subsampled frames per segment; must match checkpoint).
 const DEFAULT_SEQUENCE_LENGTH: usize = 150;
@@ -57,7 +54,7 @@ pub fn run(replay_path: &Path, model_path: &Path) -> Result<()> {
 
     // Load model weights
     let device = init_device();
-    let model: SequenceModel<Backend> = load_checkpoint(&model_path.to_string_lossy(), &device)?;
+    let model: SequenceModel = load_checkpoint(&model_path.to_string_lossy(), &device)?;
 
     // Parse the replay
     let parsed = parse_replay(replay_path).map_err(|error| anyhow::anyhow!("{error}"))?;

@@ -11,8 +11,8 @@ pub mod threshold;
 mod training;
 
 pub use checkpoint::{
-    CheckpointValidationMetrics, ModelCheckpoint, ValidationRankRmseEntry, load_checkpoint,
-    save_checkpoint, save_checkpoint_bin,
+    CHECKPOINT_EXTENSION, CheckpointValidationMetrics, ModelCheckpoint, ValidationRankRmseEntry,
+    checkpoint_weights_path, load_checkpoint, save_checkpoint,
 };
 pub use dataset::{
     BatchPrefetcher, FeatureView, PreloadedBatchData, SequenceBatch, SequenceBatcher,

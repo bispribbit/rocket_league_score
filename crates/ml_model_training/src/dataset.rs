@@ -93,25 +93,25 @@ impl From<bool> for FeatureView {
 
 /// Batch of sequence data ready for model input.
 #[derive(Debug, Clone)]
-pub struct SequenceBatch<B: Backend> {
+pub struct SequenceBatch {
     /// Input tensor for player-centric model.
     /// Shape: `[batch_size * 6_players, seq_len, PLAYER_CENTRIC_FEATURE_COUNT]`
     /// Already reshaped so all 6 players are processed in parallel.
-    pub inputs: Tensor<B, 3>,
+    pub inputs: Tensor<3>,
     /// Target tensor of shape `[batch_size, TOTAL_PLAYERS]`.
-    pub targets: Tensor<B, 2>,
+    pub targets: Tensor<2>,
 }
 
 /// Batcher for creating batches from segment datasets.
-pub struct SequenceBatcher<B: Backend> {
-    device: B::Device,
+pub struct SequenceBatcher {
+    device: Device,
     sequence_length: usize,
     feature_view: FeatureView,
 }
 
-impl<B: Backend> SequenceBatcher<B> {
+impl SequenceBatcher {
     /// Creates a new batcher over the full 106-feature view.
-    pub const fn new(device: B::Device, sequence_length: usize) -> Self {
+    pub const fn new(device: Device, sequence_length: usize) -> Self {
         Self {
             device,
             sequence_length,
@@ -137,7 +137,7 @@ impl<B: Backend> SequenceBatcher<B> {
         &self,
         dataset: &Arc<SegmentStore>,
         indices: &[usize],
-    ) -> Option<SequenceBatch<B>> {
+    ) -> Option<SequenceBatch> {
         if indices.is_empty() {
             return None;
         }
@@ -160,13 +160,13 @@ impl<B: Backend> SequenceBatcher<B> {
         self.feature_view.mask_in_place(&mut input_data);
 
         // Create input tensor: [batch * 6, seq_len, features]
-        let inputs = Tensor::<B, 1>::from_floats(input_data.as_slice(), &self.device).reshape([
+        let inputs = Tensor::<1>::from_floats(input_data.as_slice(), &self.device).reshape([
             batch_size * 6,
             self.sequence_length,
             PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
-        let targets = Tensor::<B, 1>::from_floats(target_data.as_slice(), &self.device)
+        let targets = Tensor::<1>::from_floats(target_data.as_slice(), &self.device)
             .reshape([batch_size, TOTAL_PLAYERS]);
 
         Some(SequenceBatch { inputs, targets })
@@ -196,14 +196,14 @@ pub struct PreloadedBatchData {
 
 impl PreloadedBatchData {
     /// Converts the preloaded data to GPU tensors.
-    pub fn to_batch<B: Backend>(&self, device: &B::Device) -> SequenceBatch<B> {
-        let inputs = Tensor::<B, 1>::from_floats(self.input_data.as_slice(), device).reshape([
+    pub fn to_batch(&self, device: &Device) -> SequenceBatch {
+        let inputs = Tensor::<1>::from_floats(self.input_data.as_slice(), device).reshape([
             self.batch_size * 6,
             self.sequence_length,
             PLAYER_CENTRIC_FEATURE_COUNT,
         ]);
 
-        let targets = Tensor::<B, 1>::from_floats(self.target_data.as_slice(), device)
+        let targets = Tensor::<1>::from_floats(self.target_data.as_slice(), device)
             .reshape([self.batch_size, TOTAL_PLAYERS]);
 
         SequenceBatch { inputs, targets }

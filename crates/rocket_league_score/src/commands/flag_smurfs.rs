@@ -20,7 +20,6 @@
 //! ```
 
 use anyhow::{Context, Result};
-use burn::backend::Wgpu;
 use config::{OBJECT_STORE, get_base_path};
 use database::{
     bulk_update_smurf_scores, initialize_pool, list_downloaded_replays,
@@ -33,8 +32,6 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use replay_parser::parse_replay_from_bytes;
 use tracing::{info, warn};
-
-type InferenceBackend = Wgpu;
 
 /// Default sequence length (must match the checkpoint).
 const DEFAULT_SEQUENCE_LENGTH: usize = 300;
@@ -73,7 +70,7 @@ pub async fn run(config: &FlagSmurfsConfig) -> Result<()> {
     let device = super::init_device();
 
     info!(model_path = %config.model_path, "Loading model checkpoint");
-    let model: SequenceModel<InferenceBackend> =
+    let model: SequenceModel =
         load_checkpoint(&config.model_path, &device).context("Failed to load model checkpoint")?;
 
     let _base_path = get_base_path();

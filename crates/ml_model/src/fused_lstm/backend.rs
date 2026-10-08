@@ -1,181 +1,204 @@
-//! Backend dispatch trait for the fused LSTM forward pass.
+//! Backend dispatch for the fused LSTM, and the single-op BPTT backward pass.
 //!
-//! All LSTM computation in this workspace goes through [`FusedLstmBackend`]:
+//! The reason this module exists is the autodiff graph. Expressed as plain
+//! tensor ops, one LSTM layer records roughly `seq_len × 13` autograd nodes —
+//! ~3900 at `seq_len = 300` — and backward then walks all of them one timestep
+//! at a time. [`FusedLstmOp`] instead registers the whole sequence as a single
+//! [`Backward`] op, so autodiff sees one edge from
+//! `(input, w_ih, w_hh, bias) → output` and backward runs as a handful of
+//! full-sequence matmuls. The graph becomes O(1) in sequence length rather than
+//! O(`seq_len`).
 //!
-//! - **`NdArray`**: [`default_fused_lstm_forward`] / [`default_fused_lstm_forward_train`]
-//!   — generic `Tensor`-op loop, used for web inference (WASM/CPU).
-//! - **`CubeBackend<R, …>`** (non-WASM): one CubeCL kernel per
-//!   timestep for the Wgpu training backend (see `cube_kernel.rs`).
-//! - **`Autodiff<B, C>`**: wraps the inner backend's training forward in a
-//!   single `Backward<B, 4>` op so the autograd graph is O(1) in sequence length.
+//! Dispatch is registered through [`backend_extension`], which generates the
+//! glue that routes a call on the runtime-selected backend to the right impl:
 //!
-//! If you add a new backend, add a `impl FusedLstmBackend for MyBackend` that
-//! routes to [`default_fused_lstm_forward`] — that's all that's required.
+//! - **`Flex`** / **`Cube`** (every CubeCL runtime): [`forward_via_tensor_ops`],
+//!   the plain-tensor cell loop from [`super::forward`].
+//! - **`Autodiff<B, C>`**: the inner backend's training forward wrapped in one
+//!   tracked [`FusedLstmOp`].
+//!
+//! The extension takes a required bias and no initial state — the shape
+//! `SequenceModel` always calls it with. [`super::module::FusedLstm::forward`]
+//! keeps every other configuration on the plain-tensor path, which stays
+//! correct (just with the per-step graph).
+//!
+//! This module is not compiled for `wasm32`: the web build has only the Flex
+//! CPU backend and runs inference without autodiff, so it routes straight to
+//! [`super::forward`].
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
 use burn::backend::autodiff::grads::Gradients;
 use burn::backend::autodiff::ops::{Backward, Ops, OpsKind};
-use burn::backend::ndarray::{
-    FloatNdArrayElement, IntNdArrayElement, NdArrayTensor, QuantElement, SharedArray,
+use burn::backend::tensor::FloatTensor;
+use burn::backend::{
+    Autodiff, Backend, Cube, Dispatch, DispatchKindConversion, ExtensionType, Flex,
+    backend_extension,
 };
-use burn::backend::{Autodiff, NdArray};
 use burn::prelude::*;
-use burn::tensor::TensorPrimitive;
+use burn::tensor::DispatchTensor;
 use burn::tensor::activation::{sigmoid, tanh};
 
-/// Final hidden / cell state produced by a fused LSTM forward pass.
-#[derive(Debug, Clone)]
-pub struct FusedLstmStateOut<B: Backend> {
-    /// Final hidden state. Shape: `[batch, hidden]`.
-    pub hidden: Tensor<B, 2>,
-    /// Final cell state. Shape: `[batch, hidden]`.
-    pub cell: Tensor<B, 2>,
+use super::forward::{FusedLstmStateOut, fused_lstm_forward};
+
+/// Output of [`FusedLstmBackend::fused_lstm_forward`].
+#[derive(ExtensionType)]
+pub struct FusedLstmForwardOut<B: Backend> {
+    /// Hidden state at every step. `[batch, seq, hidden]`.
+    pub output: FloatTensor<B>,
+    /// Final hidden state. `[batch, hidden]`.
+    pub hidden: FloatTensor<B>,
+    /// Final cell state. `[batch, hidden]`.
+    pub cell: FloatTensor<B>,
 }
 
-/// Intermediate state produced by [`FusedLstmBackend::fused_lstm_forward_train`]
-/// and saved across the forward → backward boundary for BPTT.
+/// Output of [`FusedLstmBackend::fused_lstm_forward_train`]: the per-step
+/// series BPTT needs, saved across the forward → backward boundary.
 ///
-/// Memory footprint: `batch × seq_len × (6 * hidden) × sizeof(F)`. For
-/// `batch=32`, `seq=300`, `hidden=256`, f32 that's ~60 MB per layer.
-#[derive(Debug, Clone)]
+/// Memory footprint: `batch × seq_len × (6 * hidden) × 4` bytes. For
+/// `batch=32`, `seq=300`, `hidden=256` that is ~60 MB per layer.
+#[derive(ExtensionType)]
 pub struct FusedLstmTrainOut<B: Backend> {
     /// Hidden states per step — also the module output. `[batch, seq, hidden]`.
-    pub hidden_states: Tensor<B, 3>,
+    pub hidden_states: FloatTensor<B>,
     /// Post-update cell states per step. `[batch, seq, hidden]`.
-    pub cell_states: Tensor<B, 3>,
+    pub cell_states: FloatTensor<B>,
     /// Pre-activation gate stack, layout `[i | f | g | o]`. `[batch, seq, 4*hidden]`.
-    pub pre_activations: Tensor<B, 3>,
+    pub pre_activations: FloatTensor<B>,
 }
 
-/// Extension trait implemented per backend so the forward pass can be
-/// specialised (CubeCL kernel on `CubeBackend`, generic `Tensor` ops
-/// elsewhere, single Backward-op wrapper on `Autodiff<B>`).
+/// Per-backend fused LSTM forward, specialised so the autodiff backend can
+/// record the whole sequence as one op.
+#[backend_extension(Autodiff, Flex, Cube)]
 pub trait FusedLstmBackend: Backend {
     /// Run the LSTM forward pass over a full sequence.
     ///
-    /// # Arguments
-    /// - `input`: `[batch, seq_len, input_size]`.
-    /// - `w_ih`:  `[input_size,  4 * hidden]`, gate order `[i, f, g, o]`.
-    /// - `w_hh`:  `[hidden,      4 * hidden]`, gate order `[i, f, g, o]`.
-    /// - `bias`:  optional `[4 * hidden]`.
-    /// - `h0`:    optional initial hidden state `[batch, hidden]` (zeros if `None`).
-    /// - `c0`:    optional initial cell state   `[batch, hidden]` (zeros if `None`).
-    ///
-    /// # Returns
-    /// - `output`: `[batch, seq_len, hidden]` — hidden state at every step.
-    /// - `state`:  final `(hidden, cell)`.
+    /// - `input`: `[batch, seq_len, input_size]`
+    /// - `w_ih`:  `[input_size,  4 * hidden]`, gate order `[i, f, g, o]`
+    /// - `w_hh`:  `[hidden,      4 * hidden]`, gate order `[i, f, g, o]`
+    /// - `bias`:  `[4 * hidden]`
     fn fused_lstm_forward(
-        input: Tensor<Self, 3>,
-        w_ih: Tensor<Self, 2>,
-        w_hh: Tensor<Self, 2>,
-        bias: Option<Tensor<Self, 1>>,
-        h0: Option<Tensor<Self, 2>>,
-        c0: Option<Tensor<Self, 2>>,
-    ) -> (Tensor<Self, 3>, FusedLstmStateOut<Self>);
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmForwardOut<Self>;
 
-    /// Training-aware forward that also returns the intermediate state needed
-    /// by the single-op BPTT `Backward` implementation in `Autodiff<Self>`.
+    /// Forward pass that also returns the per-step series BPTT needs.
     ///
-    /// This is the hot path actually exercised during training: the generic
-    /// `Autodiff<B>` specialisation unwraps its primitives and calls
-    /// `B::fused_lstm_forward_train(…)` on the inner backend.
-    ///
-    /// Always uses zero initial `h0` / `c0` and requires a bias — matching how
-    /// [`FusedLstm`](super::module::FusedLstm) is configured in
-    /// `SequenceModel`. Backends that specialise this method (`CubeBackend`)
-    /// dispatch a single GPU kernel per timestep; the default routes through
-    /// standard `Tensor` ops.
+    /// Only called on the backend *inside* `Autodiff`, by the tracked op.
     fn fused_lstm_forward_train(
-        input: Tensor<Self, 3>,
-        w_ih: Tensor<Self, 2>,
-        w_hh: Tensor<Self, 2>,
-        bias: Tensor<Self, 1>,
-    ) -> FusedLstmTrainOut<Self> {
-        default_fused_lstm_forward_train::<Self>(input, w_ih, w_hh, bias)
-    }
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmTrainOut<Self>;
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Reference implementation
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Reference forward pass. High-level burn tensor ops only — correct on
-/// every backend, but performs ~1 big matmul + ~10 small ops per timestep.
+/// Runs the fused LSTM forward on whichever backend the tensors live on.
 ///
-/// Beats [`burn::nn::Lstm`] on kernel count by:
-/// 1. Precomputing the full-sequence input projection `input @ W_ih + b` in
-///    one matmul outside the timestep loop (vs. 4 per step in burn-nn).
-/// 2. Performing `h_{t-1} @ W_hh` as a single batched matmul rather than
-///    four per-gate linear transforms.
-pub fn default_fused_lstm_forward<B: Backend>(
-    input: Tensor<B, 3>,
-    w_ih: Tensor<B, 2>,
-    w_hh: Tensor<B, 2>,
-    bias: Option<Tensor<B, 1>>,
-    h0: Option<Tensor<B, 2>>,
-    c0: Option<Tensor<B, 2>>,
-) -> (Tensor<B, 3>, FusedLstmStateOut<B>) {
-    let [batch, seq_len, _input_size] = input.dims();
-    let [_, four_hidden] = w_ih.dims();
-    assert!(
-        four_hidden.is_multiple_of(4),
-        "w_ih last dim must be divisible by 4 (got {four_hidden})"
+/// The bridge between the high-level [`Tensor`] the module holds and the
+/// primitive-level extension trait: `into_dispatch` erases the tensor to the
+/// runtime-selected backend, the generated `Dispatch` impl routes to the right
+/// specialisation, and `from_dispatch` wraps the results back up.
+pub(crate) fn dispatch_fused_lstm_forward(
+    input: Tensor<3>,
+    w_ih: Tensor<2>,
+    w_hh: Tensor<2>,
+    bias: Tensor<1>,
+) -> (Tensor<3>, FusedLstmStateOut) {
+    let FusedLstmForwardOut {
+        output,
+        hidden,
+        cell,
+    } = <Dispatch as FusedLstmBackend>::fused_lstm_forward(
+        input.into_dispatch(),
+        w_ih.into_dispatch(),
+        w_hh.into_dispatch(),
+        bias.into_dispatch(),
     );
-    let hidden = four_hidden / 4;
-    let device = input.device();
 
-    let mut h = h0.unwrap_or_else(|| Tensor::zeros([batch, hidden], &device));
-    let mut c = c0.unwrap_or_else(|| Tensor::zeros([batch, hidden], &device));
+    (
+        Tensor::<3>::from_dispatch(output),
+        FusedLstmStateOut {
+            hidden: Tensor::<2>::from_dispatch(hidden),
+            cell: Tensor::<2>::from_dispatch(cell),
+        },
+    )
+}
 
-    // Precompute x @ w_ih + bias over every timestep in one matmul.
-    // Shape: [batch, seq_len, 4*hidden].
-    let x_proj = input.matmul(w_ih.unsqueeze::<3>());
-    let x_proj = match bias.as_ref() {
-        Some(b) => x_proj + b.clone().unsqueeze::<3>(),
-        None => x_proj,
+/// Splits the `[i | f | g | o]` gate stack and applies the gate activations.
+///
+/// Shared by the forward recorder and the backward pass so the two can never
+/// disagree about gate order.
+struct GateActivations {
+    input_gate: Tensor<3>,
+    forget_gate: Tensor<3>,
+    cell_candidate: Tensor<3>,
+    output_gate: Tensor<3>,
+}
+
+fn gate_activations(
+    pre_activations: &Tensor<3>,
+    batch: usize,
+    seq_len: usize,
+    hidden: usize,
+) -> GateActivations {
+    let gate = |index: usize| {
+        pre_activations.clone().slice([
+            0..batch,
+            0..seq_len,
+            (index * hidden)..((index + 1) * hidden),
+        ])
     };
-
-    let mut outputs: Vec<Tensor<B, 2>> = Vec::with_capacity(seq_len);
-
-    for t in 0..seq_len {
-        let x_t: Tensor<B, 2> = x_proj
-            .clone()
-            .slice([0..batch, t..(t + 1), 0..four_hidden])
-            .reshape([batch, four_hidden]);
-
-        let z = x_t + h.clone().matmul(w_hh.clone());
-
-        let i_gate = sigmoid(z.clone().slice([0..batch, 0..hidden]));
-        let f_gate = sigmoid(z.clone().slice([0..batch, hidden..2 * hidden]));
-        let g_gate = tanh(z.clone().slice([0..batch, 2 * hidden..3 * hidden]));
-        let o_gate = sigmoid(z.slice([0..batch, 3 * hidden..4 * hidden]));
-
-        c = f_gate * c + i_gate * g_gate;
-        h = o_gate * tanh(c.clone());
-
-        outputs.push(h.clone());
+    GateActivations {
+        input_gate: sigmoid(gate(0)),
+        forget_gate: sigmoid(gate(1)),
+        cell_candidate: tanh(gate(2)),
+        output_gate: sigmoid(gate(3)),
     }
-
-    let outputs_expanded: Vec<Tensor<B, 3>> =
-        outputs.into_iter().map(|t| t.unsqueeze_dim(1)).collect();
-    let output = Tensor::cat(outputs_expanded, 1);
-
-    (output, FusedLstmStateOut { hidden: h, cell: c })
 }
 
-/// Reference training forward. Same cell math as [`default_fused_lstm_forward`]
-/// but records per-step pre-activations, cell states, and hidden states so
-/// BPTT can run as batched full-sequence ops in backward.
-///
-/// Used as the fallback path for backends that don't specialise
-/// [`FusedLstmBackend::fused_lstm_forward_train`].
-pub fn default_fused_lstm_forward_train<B: Backend>(
-    input: Tensor<B, 3>,
-    w_ih: Tensor<B, 2>,
-    w_hh: Tensor<B, 2>,
-    bias: Tensor<B, 1>,
-) -> FusedLstmTrainOut<B> {
+/// Plain-tensor forward, for the backends that have no specialised path.
+fn forward_via_tensor_ops<B: Backend>(
+    input: FloatTensor<B>,
+    w_ih: FloatTensor<B>,
+    w_hh: FloatTensor<B>,
+    bias: FloatTensor<B>,
+) -> FusedLstmForwardOut<B>
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let input = Tensor::<3>::from_primitive::<B>(input);
+    let w_ih = Tensor::<2>::from_primitive::<B>(w_ih);
+    let w_hh = Tensor::<2>::from_primitive::<B>(w_hh);
+    let bias = Tensor::<1>::from_primitive::<B>(bias);
+
+    let (output, FusedLstmStateOut { hidden, cell }) =
+        fused_lstm_forward(input, w_ih, w_hh, Some(bias), None, None);
+
+    FusedLstmForwardOut {
+        output: into_primitive::<B, 3>(output),
+        hidden: into_primitive::<B, 2>(hidden),
+        cell: into_primitive::<B, 2>(cell),
+    }
+}
+
+/// Plain-tensor forward that also records the per-step series for BPTT.
+fn forward_train_via_tensor_ops<B: Backend>(
+    input: FloatTensor<B>,
+    w_ih: FloatTensor<B>,
+    w_hh: FloatTensor<B>,
+    bias: FloatTensor<B>,
+) -> FusedLstmTrainOut<B>
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let input = Tensor::<3>::from_primitive::<B>(input);
+    let w_ih = Tensor::<2>::from_primitive::<B>(w_ih);
+    let w_hh = Tensor::<2>::from_primitive::<B>(w_hh);
+    let bias = Tensor::<1>::from_primitive::<B>(bias);
+
     let [batch, seq_len, _input_size] = input.dims();
     let [_, four_hidden] = w_ih.dims();
     assert!(
@@ -185,105 +208,134 @@ pub fn default_fused_lstm_forward_train<B: Backend>(
     let hidden = four_hidden / 4;
     let device = input.device();
 
-    let x_proj = input.matmul(w_ih.unsqueeze::<3>()) + bias.unsqueeze::<3>();
+    let x_projection = input.matmul(w_ih.unsqueeze::<3>()) + bias.unsqueeze::<3>();
 
-    let mut h = Tensor::<B, 2>::zeros([batch, hidden], &device);
-    let mut c = Tensor::<B, 2>::zeros([batch, hidden], &device);
-    let mut h_steps: Vec<Tensor<B, 3>> = Vec::with_capacity(seq_len);
-    let mut c_steps: Vec<Tensor<B, 3>> = Vec::with_capacity(seq_len);
-    let mut z_steps: Vec<Tensor<B, 3>> = Vec::with_capacity(seq_len);
+    let mut hidden_state = Tensor::<2>::zeros([batch, hidden], &device);
+    let mut cell_state = Tensor::<2>::zeros([batch, hidden], &device);
+    let mut hidden_steps: Vec<Tensor<3>> = Vec::with_capacity(seq_len);
+    let mut cell_steps: Vec<Tensor<3>> = Vec::with_capacity(seq_len);
+    let mut pre_activation_steps: Vec<Tensor<3>> = Vec::with_capacity(seq_len);
 
-    for t in 0..seq_len {
-        let x_t: Tensor<B, 2> = x_proj
+    for step in 0..seq_len {
+        let x_step: Tensor<2> = x_projection
             .clone()
-            .slice([0..batch, t..(t + 1), 0..four_hidden])
+            .slice([0..batch, step..(step + 1), 0..four_hidden])
             .reshape([batch, four_hidden]);
 
-        let z = x_t + h.clone().matmul(w_hh.clone());
-        z_steps.push(z.clone().unsqueeze_dim(1));
+        let pre_activation = x_step + hidden_state.clone().matmul(w_hh.clone());
+        pre_activation_steps.push(pre_activation.clone().unsqueeze_dim(1));
 
-        let i_gate = sigmoid(z.clone().slice([0..batch, 0..hidden]));
-        let f_gate = sigmoid(z.clone().slice([0..batch, hidden..2 * hidden]));
-        let g_gate = tanh(z.clone().slice([0..batch, 2 * hidden..3 * hidden]));
-        let o_gate = sigmoid(z.slice([0..batch, 3 * hidden..4 * hidden]));
+        let gate = |index: usize| {
+            pre_activation
+                .clone()
+                .slice([0..batch, (index * hidden)..((index + 1) * hidden)])
+        };
+        let input_gate = sigmoid(gate(0));
+        let forget_gate = sigmoid(gate(1));
+        let cell_candidate = tanh(gate(2));
+        let output_gate = sigmoid(gate(3));
 
-        c = f_gate * c + i_gate * g_gate;
-        h = o_gate * tanh(c.clone());
+        cell_state = forget_gate * cell_state + input_gate * cell_candidate;
+        hidden_state = output_gate * tanh(cell_state.clone());
 
-        h_steps.push(h.clone().unsqueeze_dim(1));
-        c_steps.push(c.clone().unsqueeze_dim(1));
+        hidden_steps.push(hidden_state.clone().unsqueeze_dim(1));
+        cell_steps.push(cell_state.clone().unsqueeze_dim(1));
     }
 
     FusedLstmTrainOut {
-        hidden_states: Tensor::cat(h_steps, 1),
-        cell_states: Tensor::cat(c_steps, 1),
-        pre_activations: Tensor::cat(z_steps, 1),
+        hidden_states: into_primitive::<B, 3>(Tensor::cat(hidden_steps, 1)),
+        cell_states: into_primitive::<B, 3>(Tensor::cat(cell_steps, 1)),
+        pre_activations: into_primitive::<B, 3>(Tensor::cat(pre_activation_steps, 1)),
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// NdArray impl (web inference + CPU tests)
-// ───────────────────────────────────────────────────────────────────────────
-
-impl<E, I, Q> FusedLstmBackend for NdArray<E, I, Q>
+/// Unwraps a tensor back to `B`'s primitive.
+///
+/// Every call site here built the tensor from a `B` primitive moments earlier,
+/// so the backend cannot have changed under it.
+fn into_primitive<B: Backend, const D: usize>(tensor: Tensor<D>) -> FloatTensor<B>
 where
-    E: FloatNdArrayElement,
-    I: IntNdArrayElement,
-    Q: QuantElement,
-    NdArrayTensor: From<SharedArray<E>> + From<SharedArray<I>>,
+    DispatchTensor: DispatchKindConversion<B>,
 {
+    tensor
+        .try_into_primitive::<B>()
+        .expect("tensor was built from this backend's own primitive")
+}
+
+impl FusedLstmBackend for Flex {
     fn fused_lstm_forward(
-        input: Tensor<Self, 3>,
-        w_ih: Tensor<Self, 2>,
-        w_hh: Tensor<Self, 2>,
-        bias: Option<Tensor<Self, 1>>,
-        h0: Option<Tensor<Self, 2>>,
-        c0: Option<Tensor<Self, 2>>,
-    ) -> (Tensor<Self, 3>, FusedLstmStateOut<Self>) {
-        default_fused_lstm_forward::<Self>(input, w_ih, w_hh, bias, h0, c0)
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmForwardOut<Self> {
+        forward_via_tensor_ops::<Self>(input, w_ih, w_hh, bias)
+    }
+
+    fn fused_lstm_forward_train(
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmTrainOut<Self> {
+        forward_train_via_tensor_ops::<Self>(input, w_ih, w_hh, bias)
+    }
+}
+
+impl FusedLstmBackend for Cube {
+    fn fused_lstm_forward(
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmForwardOut<Self> {
+        forward_via_tensor_ops::<Self>(input, w_ih, w_hh, bias)
+    }
+
+    fn fused_lstm_forward_train(
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmTrainOut<Self> {
+        forward_train_via_tensor_ops::<Self>(input, w_ih, w_hh, bias)
     }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Autodiff impl — single BPTT Backward op
+// Autodiff: the whole sequence as one tracked op
 // ───────────────────────────────────────────────────────────────────────────
-//
-// The entire LSTM forward is recorded as one `Backward<B,4>` op.
-// Autodiff only sees one edge from (input, w_ih, w_hh, bias) → output.
-// Backward executes as a handful of full-sequence matmuls, collapsing the
-// ~3900 autograd nodes that per-step tracking would produce (300 steps ×
-// ~13 ops) into ~10.
 
 /// State saved across the forward → backward boundary.
 ///
-/// Everything needed by BPTT is recomputable from `(input, w_ih, w_hh, bias)`
-/// alone, but keeping the pre-activation `z` and cell-state `c` series cached
-/// saves one full forward re-run during backward. Memory: `(batch × seq ×
-/// (input + 2 * hidden + 4 * hidden + hidden)) × 4 bytes` — for `batch=32`,
-/// `seq=300`, `hidden=256`, `input=128` that's ~12 MB per layer on GPU.
+/// All of it is recomputable from `(input, w_ih, w_hh, bias)`, but keeping the
+/// pre-activation and cell series saves a full forward re-run in backward.
 #[derive(Clone, Debug)]
-struct LstmFwdState<B: Backend> {
+struct LstmForwardState<B: Backend> {
     input: B::FloatTensorPrimitive,
     w_ih: B::FloatTensorPrimitive,
     w_hh: B::FloatTensorPrimitive,
-    /// Pre-activation gate stack, chronological: `z[:, t, :]` shape `[batch, 4*hidden]`.
-    z_all: B::FloatTensorPrimitive,
-    /// Cell states *after* each step, chronological: `c[:, t, :]` shape `[batch, hidden]`.
-    c_all: B::FloatTensorPrimitive,
-    /// Hidden states *after* each step (= forward output): `h[:, t, :]` shape `[batch, hidden]`.
-    h_all: B::FloatTensorPrimitive,
+    /// Pre-activation gate stack, chronological. `[batch, seq, 4*hidden]`.
+    pre_activations: B::FloatTensorPrimitive,
+    /// Cell states *after* each step, chronological. `[batch, seq, hidden]`.
+    cell_states: B::FloatTensorPrimitive,
+    /// Hidden states *after* each step (= forward output). `[batch, seq, hidden]`.
+    hidden_states: B::FloatTensorPrimitive,
     batch: usize,
     seq_len: usize,
     hidden: usize,
     input_size: usize,
 }
 
-/// Zero-sized marker for the LSTM Backward op registration.
+/// Zero-sized marker registering the LSTM backward pass.
 #[derive(Debug)]
 struct FusedLstmOp;
 
-impl<B: FusedLstmBackend> Backward<B, 4> for FusedLstmOp {
-    type State = LstmFwdState<B>;
+impl<B: FusedLstmBackend> Backward<B, 4> for FusedLstmOp
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    type State = LstmForwardState<B>;
 
     fn backward(
         self,
@@ -291,267 +343,260 @@ impl<B: FusedLstmBackend> Backward<B, 4> for FusedLstmOp {
         grads: &mut Gradients,
         _checkpointer: &mut Checkpointer,
     ) {
-        let st = ops.state;
-        let grad_out_prim = grads.consume::<B>(&ops.node);
-
-        let LstmFwdState {
+        let LstmForwardState {
             input,
             w_ih,
             w_hh,
-            z_all,
-            c_all,
-            h_all,
+            pre_activations,
+            cell_states,
+            hidden_states,
             batch,
             seq_len,
             hidden,
             input_size,
-        } = st;
+        } = ops.state;
         let four_hidden = 4 * hidden;
 
-        let grad_out: Tensor<B, 3> = Tensor::from_primitive(TensorPrimitive::Float(grad_out_prim));
-        let input_t: Tensor<B, 3> = Tensor::from_primitive(TensorPrimitive::Float(input));
-        let w_ih_t: Tensor<B, 2> = Tensor::from_primitive(TensorPrimitive::Float(w_ih));
-        let w_hh_t: Tensor<B, 2> = Tensor::from_primitive(TensorPrimitive::Float(w_hh));
-        let z_all_t: Tensor<B, 3> = Tensor::from_primitive(TensorPrimitive::Float(z_all));
-        let c_all_t: Tensor<B, 3> = Tensor::from_primitive(TensorPrimitive::Float(c_all));
-        let h_all_t: Tensor<B, 3> = Tensor::from_primitive(TensorPrimitive::Float(h_all));
+        let grad_output = Tensor::<3>::from_primitive::<B>(grads.consume::<B>(&ops.node));
+        let input = Tensor::<3>::from_primitive::<B>(input);
+        let w_ih = Tensor::<2>::from_primitive::<B>(w_ih);
+        let w_hh = Tensor::<2>::from_primitive::<B>(w_hh);
+        let pre_activations = Tensor::<3>::from_primitive::<B>(pre_activations);
+        let cell_states = Tensor::<3>::from_primitive::<B>(cell_states);
+        let hidden_states = Tensor::<3>::from_primitive::<B>(hidden_states);
 
-        let device = grad_out.device();
+        let device = grad_output.device();
 
-        // Recompute gate activations from the saved pre-activations, batched over the full seq.
-        let i_all = sigmoid(z_all_t.clone().slice([0..batch, 0..seq_len, 0..hidden]));
-        let f_all = sigmoid(
-            z_all_t
-                .clone()
-                .slice([0..batch, 0..seq_len, hidden..2 * hidden]),
-        );
-        let g_all = tanh(
-            z_all_t
-                .clone()
-                .slice([0..batch, 0..seq_len, 2 * hidden..3 * hidden]),
-        );
-        let o_all = sigmoid(z_all_t.slice([0..batch, 0..seq_len, 3 * hidden..4 * hidden]));
-        let tanh_c_all = tanh(c_all_t.clone());
+        // Recompute gate activations from the saved pre-activations, batched
+        // over the whole sequence rather than per step.
+        let GateActivations {
+            input_gate,
+            forget_gate,
+            cell_candidate,
+            output_gate,
+        } = gate_activations(&pre_activations, batch, seq_len, hidden);
+        let cell_tanh = tanh(cell_states.clone());
 
-        // BPTT loop. Collects per-step dz to build `dx_proj_all` as one tensor afterwards.
-        let mut dh_next: Tensor<B, 2> = Tensor::zeros([batch, hidden], &device);
-        let mut dc_next: Tensor<B, 2> = Tensor::zeros([batch, hidden], &device);
-        let mut dz_steps: Vec<Tensor<B, 3>> = Vec::with_capacity(seq_len);
+        let mut grad_hidden_next = Tensor::<2>::zeros([batch, hidden], &device);
+        let mut grad_cell_next = Tensor::<2>::zeros([batch, hidden], &device);
+        let mut grad_pre_activation_steps: Vec<Tensor<3>> = Vec::with_capacity(seq_len);
 
-        for t in (0..seq_len).rev() {
-            let slice_t = |t_big: &Tensor<B, 3>| -> Tensor<B, 2> {
-                t_big
+        for step in (0..seq_len).rev() {
+            let at_step = |series: &Tensor<3>| -> Tensor<2> {
+                series
                     .clone()
-                    .slice([0..batch, t..(t + 1), 0..hidden])
+                    .slice([0..batch, step..(step + 1), 0..hidden])
                     .reshape([batch, hidden])
             };
 
-            let i_t = slice_t(&i_all);
-            let f_t = slice_t(&f_all);
-            let g_t = slice_t(&g_all);
-            let o_t = slice_t(&o_all);
-            let tc_t = slice_t(&tanh_c_all);
+            let input_gate_step = at_step(&input_gate);
+            let forget_gate_step = at_step(&forget_gate);
+            let cell_candidate_step = at_step(&cell_candidate);
+            let output_gate_step = at_step(&output_gate);
+            let cell_tanh_step = at_step(&cell_tanh);
 
-            let c_prev = if t == 0 {
-                Tensor::<B, 2>::zeros([batch, hidden], &device)
+            let cell_previous = if step == 0 {
+                Tensor::<2>::zeros([batch, hidden], &device)
             } else {
-                c_all_t
+                cell_states
                     .clone()
-                    .slice([0..batch, (t - 1)..t, 0..hidden])
+                    .slice([0..batch, (step - 1)..step, 0..hidden])
                     .reshape([batch, hidden])
             };
 
-            // h = o * tanh(c)  →  do = dh * tanh(c);  dc += dh * o * (1 - tanh(c)^2)
-            let dh_t = slice_t(&grad_out);
-            let dh = dh_t + dh_next.clone();
-            let do_t = dh.clone() * tc_t.clone();
-            let ones_hidden = Tensor::<B, 2>::ones([batch, hidden], &device);
-            let dc = dh * o_t.clone() * (ones_hidden.clone() - tc_t.clone() * tc_t) + dc_next;
+            let ones = Tensor::<2>::ones([batch, hidden], &device);
 
-            // c = f*c_prev + i*g  →  gate gradients + dc_prev
-            let df_t = dc.clone() * c_prev;
-            let dc_prev = dc.clone() * f_t.clone();
-            let di_t = dc.clone() * g_t.clone();
-            let dg_t = dc * i_t.clone();
+            // h = o * tanh(c)  ->  do = dh * tanh(c);  dc += dh * o * (1 - tanh(c)^2)
+            let grad_hidden = at_step(&grad_output) + grad_hidden_next.clone();
+            let grad_output_gate = grad_hidden.clone() * cell_tanh_step.clone();
+            let grad_cell = grad_hidden
+                * output_gate_step.clone()
+                * (ones.clone() - cell_tanh_step.clone() * cell_tanh_step)
+                + grad_cell_next;
 
-            // Activation backward: sigmoid'(x)=σ(1-σ), tanh'(x)=1-tanh²
-            let di_pre = di_t * i_t.clone() * (ones_hidden.clone() - i_t);
-            let df_pre = df_t * f_t.clone() * (ones_hidden.clone() - f_t);
-            let dg_pre = dg_t * (ones_hidden - g_t.clone() * g_t);
-            let do_pre =
-                do_t * o_t.clone() * (Tensor::<B, 2>::ones([batch, hidden], &device) - o_t);
+            // c = f * c_prev + i * g
+            let grad_forget_gate = grad_cell.clone() * cell_previous;
+            let grad_cell_previous = grad_cell.clone() * forget_gate_step.clone();
+            let grad_input_gate = grad_cell.clone() * cell_candidate_step.clone();
+            let grad_cell_candidate = grad_cell * input_gate_step.clone();
 
-            // Gate order along last dim: [i, f, g, o], matching forward.
-            let dz_t: Tensor<B, 2> = Tensor::cat(vec![di_pre, df_pre, dg_pre, do_pre], 1);
+            // Activation backward: sigmoid'(x) = s(1 - s), tanh'(x) = 1 - tanh^2
+            let grad_input_pre =
+                grad_input_gate * input_gate_step.clone() * (ones.clone() - input_gate_step);
+            let grad_forget_pre =
+                grad_forget_gate * forget_gate_step.clone() * (ones.clone() - forget_gate_step);
+            let grad_candidate_pre = grad_cell_candidate
+                * (ones.clone() - cell_candidate_step.clone() * cell_candidate_step);
+            let grad_output_pre =
+                grad_output_gate * output_gate_step.clone() * (ones - output_gate_step);
 
-            // Contribution to next iteration via recurrent edge: h_{t-1} ← dz_t @ W_hh^T
-            dh_next = dz_t.clone().matmul(w_hh_t.clone().transpose());
-            dc_next = dc_prev;
+            // Gate order along the last dim: [i, f, g, o], matching forward.
+            let grad_pre_activation: Tensor<2> = Tensor::cat(
+                vec![
+                    grad_input_pre,
+                    grad_forget_pre,
+                    grad_candidate_pre,
+                    grad_output_pre,
+                ],
+                1,
+            );
 
-            dz_steps.push(dz_t.unsqueeze_dim(1));
+            // Recurrent edge into the previous step.
+            grad_hidden_next = grad_pre_activation.clone().matmul(w_hh.clone().transpose());
+            grad_cell_next = grad_cell_previous;
+
+            grad_pre_activation_steps.push(grad_pre_activation.unsqueeze_dim(1));
         }
 
-        dz_steps.reverse();
-        let dx_proj_all: Tensor<B, 3> = Tensor::cat(dz_steps, 1);
+        grad_pre_activation_steps.reverse();
+        let grad_x_projection: Tensor<3> = Tensor::cat(grad_pre_activation_steps, 1);
 
-        // x_proj = input @ W_ih + bias
-        //   d_input = dx_proj @ W_ih^T
-        //   d_w_ih = input^T @ dx_proj  (collapsed over batch × seq)
-        //   d_bias = sum over (batch, seq) of dx_proj
-        let d_input: Tensor<B, 3> = dx_proj_all
+        // x_projection = input @ w_ih + bias
+        let grad_input: Tensor<3> = grad_x_projection
             .clone()
-            .matmul(w_ih_t.transpose().unsqueeze::<3>());
+            .matmul(w_ih.transpose().unsqueeze::<3>());
 
-        let input_2d: Tensor<B, 2> = input_t.reshape([batch * seq_len, input_size]);
-        let dx_proj_2d: Tensor<B, 2> = dx_proj_all.reshape([batch * seq_len, four_hidden]);
-        let d_w_ih: Tensor<B, 2> = input_2d.transpose().matmul(dx_proj_2d.clone());
+        let input_flat: Tensor<2> = input.reshape([batch * seq_len, input_size]);
+        let grad_x_projection_flat: Tensor<2> =
+            grad_x_projection.reshape([batch * seq_len, four_hidden]);
+        let grad_w_ih: Tensor<2> = input_flat
+            .transpose()
+            .matmul(grad_x_projection_flat.clone());
+        let grad_bias: Tensor<1> = grad_x_projection_flat
+            .clone()
+            .sum_dim(0)
+            .reshape([four_hidden]);
 
-        let d_bias: Tensor<B, 1> = dx_proj_2d.clone().sum_dim(0).reshape([four_hidden]);
-
-        // d_w_hh = sum_t h_{t-1}^T @ dz_t
-        // Build h_prev_all by prepending a zeros "step 0 prev" and dropping the last h.
-        let h_prev_all: Tensor<B, 3> = if seq_len > 1 {
-            let zeros_first: Tensor<B, 3> = Tensor::zeros([batch, 1, hidden], &device);
-            let h_past: Tensor<B, 3> = h_all_t.slice([0..batch, 0..(seq_len - 1), 0..hidden]);
-            Tensor::cat(vec![zeros_first, h_past], 1)
+        // grad_w_hh = sum over steps of h_{t-1}^T @ dz_t. Build h_{t-1} by
+        // prepending a zero step and dropping the last hidden state.
+        let hidden_previous: Tensor<3> = if seq_len > 1 {
+            let zero_step: Tensor<3> = Tensor::zeros([batch, 1, hidden], &device);
+            let shifted: Tensor<3> = hidden_states.slice([0..batch, 0..(seq_len - 1), 0..hidden]);
+            Tensor::cat(vec![zero_step, shifted], 1)
         } else {
             Tensor::zeros([batch, 1, hidden], &device)
         };
-        let h_prev_2d: Tensor<B, 2> = h_prev_all.reshape([batch * seq_len, hidden]);
-        let d_w_hh: Tensor<B, 2> = h_prev_2d.transpose().matmul(dx_proj_2d);
+        let hidden_previous_flat: Tensor<2> = hidden_previous.reshape([batch * seq_len, hidden]);
+        let grad_w_hh: Tensor<2> = hidden_previous_flat
+            .transpose()
+            .matmul(grad_x_projection_flat);
 
-        // Register gradients on whichever parents required them.
-        let [p_input, p_w_ih, p_w_hh, p_bias] = ops.parents;
-        if let Some(node) = p_input {
-            grads.register::<B>(node.id, d_input.into_primitive().tensor());
+        let [parent_input, parent_w_ih, parent_w_hh, parent_bias] = ops.parents;
+        if let Some(node) = parent_input {
+            grads.register::<B>(node.id, into_primitive::<B, 3>(grad_input));
         }
-        if let Some(node) = p_w_ih {
-            grads.register::<B>(node.id, d_w_ih.into_primitive().tensor());
+        if let Some(node) = parent_w_ih {
+            grads.register::<B>(node.id, into_primitive::<B, 2>(grad_w_ih));
         }
-        if let Some(node) = p_w_hh {
-            grads.register::<B>(node.id, d_w_hh.into_primitive().tensor());
+        if let Some(node) = parent_w_hh {
+            grads.register::<B>(node.id, into_primitive::<B, 2>(grad_w_hh));
         }
-        if let Some(node) = p_bias {
-            grads.register::<B>(node.id, d_bias.into_primitive().tensor());
+        if let Some(node) = parent_bias {
+            grads.register::<B>(node.id, into_primitive::<B, 1>(grad_bias));
         }
     }
 }
 
-/// `Autodiff<B>` specialisation: wraps the inner backend's fused LSTM (or
-/// the default path) in a single tracked op so autodiff only sees one
-/// edge from `(input, w_ih, w_hh, bias)` → `output`.
-///
-/// The fast path requires `bias = Some` and no initial state — matches how
-/// [`FusedLstm`](super::module::FusedLstm) is used in `SequenceModel`. Any
-/// other configuration falls through to [`default_fused_lstm_forward`] so
-/// unusual call sites stay correct (just slower).
 impl<B, C> FusedLstmBackend for Autodiff<B, C>
 where
     B: FusedLstmBackend,
     C: CheckpointStrategy,
+    DispatchTensor: DispatchKindConversion<B>,
+    DispatchTensor: DispatchKindConversion<Self>,
 {
     fn fused_lstm_forward(
-        input: Tensor<Self, 3>,
-        w_ih: Tensor<Self, 2>,
-        w_hh: Tensor<Self, 2>,
-        bias: Option<Tensor<Self, 1>>,
-        h0: Option<Tensor<Self, 2>>,
-        c0: Option<Tensor<Self, 2>>,
-    ) -> (Tensor<Self, 3>, FusedLstmStateOut<Self>) {
-        // Slow-path guard: uncommon configurations fall back to the per-step
-        // tracked implementation. Our `FusedLstm` module never hits these in
-        // `SequenceModel`.
-        let Some(bias) = bias else {
-            return default_fused_lstm_forward::<Self>(input, w_ih, w_hh, None, h0, c0);
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmForwardOut<Self> {
+        let batch_and_shape = {
+            let input_tensor = Tensor::<3>::from_primitive::<Self>(input.clone());
+            let w_ih_tensor = Tensor::<2>::from_primitive::<Self>(w_ih.clone());
+            let [batch, seq_len, input_size] = input_tensor.dims();
+            let [_, four_hidden] = w_ih_tensor.dims();
+            assert!(
+                four_hidden.is_multiple_of(4),
+                "w_ih last dim must be divisible by 4 (got {four_hidden})"
+            );
+            (batch, seq_len, input_size, four_hidden / 4)
         };
-        if h0.is_some() || c0.is_some() {
-            return default_fused_lstm_forward::<Self>(input, w_ih, w_hh, Some(bias), h0, c0);
-        }
+        let (batch, seq_len, input_size, hidden) = batch_and_shape;
 
-        let [batch, seq_len, input_size] = input.dims();
-        let [_, four_hidden] = w_ih.dims();
-        assert!(
-            four_hidden.is_multiple_of(4),
-            "w_ih last dim must be divisible by 4 (got {four_hidden})"
-        );
-        let hidden = four_hidden / 4;
+        // Take a guard on each parent node before consuming its primitive.
+        let input_node = input.node();
+        let w_ih_node = w_ih.node();
+        let w_hh_node = w_hh.node();
+        let bias_node = bias.node();
 
-        // Unwrap autodiff tensors → (primitive, node) pairs.
-        let input_ad = input.into_primitive().tensor();
-        let w_ih_ad = w_ih.into_primitive().tensor();
-        let w_hh_ad = w_hh.into_primitive().tensor();
-        let bias_ad = bias.into_primitive().tensor();
-        let input_node = input_ad.node.clone();
-        let w_ih_node = w_ih_ad.node.clone();
-        let w_hh_node = w_hh_ad.node.clone();
-        let bias_node = bias_ad.node.clone();
+        let (input_primitive, _) = input.into_parts();
+        let (w_ih_primitive, _) = w_ih.into_parts();
+        let (w_hh_primitive, _) = w_hh.into_parts();
+        let (bias_primitive, _) = bias.into_parts();
 
-        // Wrap inner primitives as inner-backend tensors for the forward.
-        let input_primitive = input_ad.primitive;
-        let w_ih_primitive = w_ih_ad.primitive;
-        let w_hh_primitive = w_hh_ad.primitive;
-        let bias_primitive = bias_ad.primitive;
-
-        let input_b: Tensor<B, 3> =
-            Tensor::from_primitive(TensorPrimitive::Float(input_primitive.clone()));
-        let w_ih_b: Tensor<B, 2> =
-            Tensor::from_primitive(TensorPrimitive::Float(w_ih_primitive.clone()));
-        let w_hh_b: Tensor<B, 2> =
-            Tensor::from_primitive(TensorPrimitive::Float(w_hh_primitive.clone()));
-        let bias_b: Tensor<B, 1> = Tensor::from_primitive(TensorPrimitive::Float(bias_primitive));
-
-        // Delegate the actual LSTM math to the inner backend's specialised
-        // training forward — CubeCL kernel on `CubeBackend`, reference Tensor
-        // ops otherwise. This is what collapses the ~13-dispatch-per-step
-        // pattern into a single cell-kernel launch on GPU.
+        // The inner backend runs the real LSTM math and hands back the series
+        // backward needs.
         let FusedLstmTrainOut {
             hidden_states,
             cell_states,
             pre_activations,
-        } = B::fused_lstm_forward_train(input_b, w_ih_b, w_hh_b, bias_b);
-        let output_device = hidden_states.device();
+        } = B::fused_lstm_forward_train(
+            input_primitive.clone(),
+            w_ih_primitive.clone(),
+            w_hh_primitive.clone(),
+            bias_primitive,
+        );
 
-        let saved = LstmFwdState::<B> {
+        let saved = LstmForwardState::<B> {
             input: input_primitive,
             w_ih: w_ih_primitive,
             w_hh: w_hh_primitive,
-            z_all: pre_activations.into_primitive().tensor(),
-            c_all: cell_states.into_primitive().tensor(),
-            h_all: hidden_states.clone().into_primitive().tensor(),
+            pre_activations,
+            cell_states,
+            hidden_states: hidden_states.clone(),
             batch,
             seq_len,
             hidden,
             input_size,
         };
 
-        let output_prim = hidden_states.into_primitive().tensor();
-
-        let output_ad = match FusedLstmOp
+        let tracked_output = match FusedLstmOp
             .prepare::<C>([input_node, w_ih_node, w_hh_node, bias_node])
             .compute_bound()
             .stateful()
         {
-            OpsKind::Tracked(prep) => prep.finish(saved, output_prim),
-            OpsKind::UnTracked(prep) => prep.finish(output_prim),
+            OpsKind::Tracked(prep) => prep.finish(saved, hidden_states),
+            OpsKind::UnTracked(prep) => prep.finish(hidden_states),
         };
 
-        let output: Tensor<Self, 3> = Tensor::from_primitive(TensorPrimitive::Float(output_ad));
-        // Final hidden is the last timestep of the tracked output; slice stays
-        // on the autograd graph so downstream uses flow gradients correctly.
-        // Final cell is returned as a detached zeros leaf — `SequenceModel`
-        // never uses it; promote to a multi-output op only if that changes.
-        let final_hidden: Tensor<Self, 2> = output
+        let output = Tensor::<3>::from_primitive::<Self>(tracked_output);
+        let device = output.device();
+
+        // Final hidden is the last step of the tracked output, so it stays on
+        // the graph. Final cell is a detached zeros leaf: `SequenceModel` never
+        // reads it, and promoting this to a multi-output op would only be worth
+        // it if that changed.
+        let final_hidden: Tensor<2> = output
             .clone()
             .slice([0..batch, (seq_len - 1)..seq_len, 0..hidden])
             .reshape([batch, hidden]);
-        let final_cell: Tensor<Self, 2> = Tensor::zeros([batch, hidden], &output_device);
+        let final_cell: Tensor<2> = Tensor::zeros([batch, hidden], &device);
 
-        (
-            output,
-            FusedLstmStateOut {
-                hidden: final_hidden,
-                cell: final_cell,
-            },
-        )
+        FusedLstmForwardOut {
+            output: into_primitive::<Self, 3>(output),
+            hidden: into_primitive::<Self, 2>(final_hidden),
+            cell: into_primitive::<Self, 2>(final_cell),
+        }
+    }
+
+    fn fused_lstm_forward_train(
+        input: FloatTensor<Self>,
+        w_ih: FloatTensor<Self>,
+        w_hh: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FusedLstmTrainOut<Self> {
+        // Reached only if something asks an autodiff backend for the training
+        // series directly; the tracked op always calls the inner backend.
+        forward_train_via_tensor_ops::<Self>(input, w_ih, w_hh, bias)
     }
 }
