@@ -1,6 +1,7 @@
 # Is this a smurf?
 
-Upload a Rocket League replay and get a **rank estimate for every player**, a one-minute
+Upload a Rocket League replay (1v1, 2v2 or 3v3, ranked or casual) and get a **rank
+estimate for every player**, a one-minute
 **form timeline**, and a **roast** about what the next rank up does better. Players who look
 much stronger than their lobby get the smurf badge.
 
@@ -14,7 +15,7 @@ and the **PostgreSQL** schema (`database`) that holds the training labels.
 ```mermaid
 flowchart LR
   R[".replay"] --> P["replay_parser"]
-  P --> S["feature_extractor<br/>71 stats per player<br/>(whole match + 60 s windows)"]
+  P --> S["feature_extractor<br/>72 stats per player<br/>(whole match + 60 s windows)"]
   S --> M["skill_model<br/>gradient-boosted trees"]
   M --> C["rank per player"]
   M --> T["form timeline"]
@@ -22,8 +23,9 @@ flowchart LR
 ```
 
 Each player's game is summarised in plain stats (movement, boost, positioning, ball control,
-mechanics from controller inputs, scoreboard…). Gradient-boosted trees trained on ~27k ranked
-3v3 replays turn them into a lobby level plus each player's gap to the lobby. Accuracy on
+mechanics from controller inputs, scoreboard…). Gradient-boosted trees trained on ranked
+replays (~27k 3v3, ~7.7k each of 2v2 and 1v1) turn them into a lobby level plus each
+player's gap to the lobby. Casual replays get the competitive rank for their team size. Accuracy on
 held-out replays: ~106 MMR per player, ~95 MMR per lobby. Details, metrics and history:
 [`docs/model.md`](docs/model.md).
 
@@ -59,7 +61,10 @@ cargo run -p ballchasing_downloader
 
 The binary runs migrations, synchronizes `download_status` with replay files under your replay
 base directory (same rules as the `verify_downloaded_replays` binary), then starts the
-downloader loop.
+downloader loop. It fills every rank of ranked standard (1,200 replays per rank), doubles and
+duels (350 per rank each, see [`docs/model.md`](docs/model.md#how-much-data-each-playlist-needs)),
+downloading round-robin over playlist and rank so a partial run stays balanced. Ballchasing
+allows ~200 replay downloads an hour.
 
 ### 4. Train the model
 

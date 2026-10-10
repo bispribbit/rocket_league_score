@@ -11,7 +11,9 @@
 //! 4. Writes `data/skill_model.bin` and checks that it reloads to identical predictions.
 //!
 //! Every metric is computed on the database's evaluation split, which no part of training
-//! sees. See `docs/model.md` for what the numbers mean.
+//! sees, per playlist (duels, doubles, standard). One model serves all three: the
+//! `players_per_team` stat tells the trees which playlist a lobby is. See `docs/model.md`
+//! for what the numbers mean.
 //!
 //! Usage:
 //!   cargo run --release -p skill_model_training --bin train
@@ -22,13 +24,15 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use feature_extractor::MATCH_STAT_COUNT;
-use skill_model::coaching::{COACHING_TIPS, CoachingTable, tier_index};
+use skill_model::coaching::{COACHING_TIPS, CoachingTable, CoachingTables, tier_index};
 use skill_model::{SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR, SkillModelBundle, TabularLayout};
-use skill_model_training::coaching_table::build_coaching_table;
+use skill_model_training::coaching_table::build_coaching_tables;
 use skill_model_training::dataset::{
     Lobby, Partition, ScoredPlayer, evaluate, read_lobbies, train_model,
 };
-use skill_model_training::evaluation::{PlayerPrediction, compute_lobby_metrics, flag_metrics};
+use skill_model_training::evaluation::{
+    MINIMUM_PLAYERS_PER_LOBBY, PlayerPrediction, compute_lobby_metrics_with_minimum, flag_metrics,
+};
 use skill_model_training::gradient_boosting::GradientBoostingConfig;
 use uuid::Uuid;
 
@@ -91,8 +95,61 @@ const TIER_NAMES: [&str; 22] = [
     "Supersonic Legend",
 ];
 
-fn print_metrics(label: &str, predictions: &[PlayerPrediction]) {
-    let metrics = compute_lobby_metrics(predictions);
+/// Playlists by players per team, with their report name.
+const PLAYLISTS: [Playlist; 3] = [
+    Playlist {
+        players_per_team: 1,
+        name: "duels",
+    },
+    Playlist {
+        players_per_team: 2,
+        name: "doubles",
+    },
+    Playlist {
+        players_per_team: 3,
+        name: "standard",
+    },
+];
+
+/// One playlist size and its report name.
+struct Playlist {
+    players_per_team: usize,
+    name: &'static str,
+}
+
+impl Playlist {
+    /// Within-lobby metrics need this many rank-known players: the full lobby for duels and
+    /// doubles, [`MINIMUM_PLAYERS_PER_LOBBY`] for standard.
+    fn minimum_players_per_lobby(&self) -> usize {
+        MINIMUM_PLAYERS_PER_LOBBY.min(self.players_per_team * 2)
+    }
+}
+
+/// Metrics of each playlist present in `lobbies`.
+fn print_playlist_metrics(lobbies: &[Lobby], model: &skill_model::TabularSkillModel) {
+    for playlist in &PLAYLISTS {
+        let playlist_lobbies: Vec<Lobby> = lobbies
+            .iter()
+            .filter(|lobby| lobby.players_per_team() == Some(playlist.players_per_team))
+            .cloned()
+            .collect();
+        let predictions: Vec<PlayerPrediction> = evaluate(&playlist_lobbies, model)
+            .iter()
+            .map(|scored| scored.prediction)
+            .collect();
+        if predictions.is_empty() {
+            continue;
+        }
+        print_metrics(
+            &format!("evaluation {}", playlist.name),
+            &predictions,
+            playlist.minimum_players_per_lobby(),
+        );
+    }
+}
+
+fn print_metrics(label: &str, predictions: &[PlayerPrediction], minimum_players_per_lobby: usize) {
+    let metrics = compute_lobby_metrics_with_minimum(predictions, minimum_players_per_lobby);
     println!(
         "  {label:<22} within_r={:.3} ±{:.3}  lobby_rmse={:.0}  player_rmse={:.0}  concordance={:.3}  players={}",
         metrics.within_r,
@@ -149,6 +206,12 @@ fn print_coaching_report(lobbies: &[Lobby], bundle: &SkillModelBundle) {
         .iter()
         .filter(|l| l.partition == Partition::Evaluation)
     {
+        let Some(coaching) = lobby
+            .players_per_team()
+            .and_then(|players_per_team| bundle.coaching.for_players_per_team(players_per_team))
+        else {
+            continue;
+        };
         let predictions = bundle.match_model.predict_stats(&lobby.stat_references());
         for (slot, prediction) in predictions.iter().enumerate() {
             let Some(prediction) = prediction else {
@@ -157,7 +220,7 @@ fn print_coaching_report(lobbies: &[Lobby], bundle: &SkillModelBundle) {
             let Some(Some(stats)) = lobby.stats.get(slot) else {
                 continue;
             };
-            let Some(advice) = bundle.coaching.advise(*prediction, stats) else {
+            let Some(advice) = coaching.advise(*prediction, stats) else {
                 continue;
             };
             let group = (tier_index(*prediction) / 3).min(7);
@@ -191,6 +254,17 @@ fn print_coaching_report(lobbies: &[Lobby], bundle: &SkillModelBundle) {
         if let Some(example) = &examples[group] {
             println!("            e.g. \"{example}\"");
         }
+    }
+}
+
+fn print_all_enabled_tips(coaching: &CoachingTables) {
+    for (playlist, table) in PLAYLISTS.iter().zip(&coaching.by_players_per_team) {
+        if table.tiers.is_empty() {
+            println!("  {}: no training data", playlist.name);
+            continue;
+        }
+        println!("  {}:", playlist.name);
+        print_enabled_tips(table);
     }
 }
 
@@ -251,7 +325,7 @@ fn main() -> Result<()> {
     let match_scored = evaluate(&match_lobbies, &match_model);
     let match_predictions: Vec<PlayerPrediction> =
         match_scored.iter().map(|s| s.prediction).collect();
-    print_metrics("evaluation split", &match_predictions);
+    print_playlist_metrics(&match_lobbies, &match_model);
     println!(
         "  smurf flag (prediction > lobby median + margin) vs players ranked ≥150 over their lobby:"
     );
@@ -286,8 +360,8 @@ fn main() -> Result<()> {
     );
 
     println!("== coaching table");
-    let coaching = build_coaching_table(&match_lobbies);
-    print_enabled_tips(&coaching);
+    let coaching = build_coaching_tables(&match_lobbies);
+    print_all_enabled_tips(&coaching);
 
     let bundle = SkillModelBundle {
         match_model,
@@ -321,7 +395,11 @@ fn main() -> Result<()> {
         largest_change < MAXIMUM_RELOAD_CHANGE_MMR,
         "reloaded bundle predicts differently (by up to {largest_change:.3} MMR)"
     );
-    print_metrics("reloaded from disk", &reloaded_predictions);
+    print_metrics(
+        "reloaded from disk",
+        &reloaded_predictions,
+        MINIMUM_PLAYERS_PER_LOBBY,
+    );
     println!(
         "== wrote {} ({:.2} MB), reload verified (largest prediction change {largest_change:.4} MMR)",
         args.out.display(),

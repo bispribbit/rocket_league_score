@@ -346,13 +346,14 @@ impl BallchasingClient {
         Ok(bytes)
     }
 
-    /// Fetches replays for a specific rank, handling pagination.
+    /// Fetches replays of one playlist and rank, handling pagination.
     ///
     /// This method will fetch up to `target_count` replays, handling
     /// pagination automatically using the API's native `next` pagination.
     ///
     /// # Arguments
     ///
+    /// * `playlist` - The playlist to fetch (e.g. ranked duels)
     /// * `rank` - The rank to fetch (API format, e.g., "bronze-1")
     /// * `target_count` - Target number of replays to fetch
     /// * `existing_ids` - Replay IDs already present in the database (any rank).
@@ -368,6 +369,7 @@ impl BallchasingClient {
     /// Returns an error if any API request fails.
     pub async fn fetch_replays_for_rank(
         &self,
+        playlist: GameMode,
         rank: Rank,
         target_count: usize,
         existing_ids: &std::collections::HashSet<Uuid>,
@@ -377,7 +379,8 @@ impl BallchasingClient {
         let mut next_url: Option<String> = None;
 
         info!(
-            "Fetching replays for rank {rank}, target count: {target_count}",
+            "Fetching {playlist} replays for rank {rank}, target count: {target_count}",
+            playlist = playlist.as_api_string(),
             rank = rank,
             target_count = target_count,
         );
@@ -386,10 +389,7 @@ impl BallchasingClient {
             // Fetch either the next page or the initial request
             let response = match &next_url {
                 Some(url) => self.fetch_replay_list(url).await?,
-                None => {
-                    self.list_replays(GameMode::RankedStandard, rank, 200)
-                        .await?
-                }
+                None => self.list_replays(playlist, rank, 200).await?,
             };
 
             if response.list.is_empty() {

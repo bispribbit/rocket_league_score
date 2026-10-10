@@ -1,18 +1,33 @@
-//! Ensures only ranked standard 3v3 (soccar) replays are accepted for analysis.
+//! Accepts 1v1, 2v2 and 3v3 soccar replays, ranked or casual, and reports which it is.
 
 use std::collections::HashSet;
 
 use boxcars::{Attribute, HeaderProp, Replay, UniqueId};
-use replay_structs::UnsupportedReplayMatch;
+use replay_structs::{MatchFormat, UnsupportedReplayMatch};
 
 const SOCCAR_REPLAY_GAME_TYPE: &str = "TAGame.Replay_Soccar_TA";
+
+/// Playlist ids of the soccar queues, from the replay header's `PlaylistId`.
+const CASUAL_DUELS_PLAYLIST_ID: i32 = 1;
+const CASUAL_DOUBLES_PLAYLIST_ID: i32 = 2;
+const CASUAL_STANDARD_PLAYLIST_ID: i32 = 3;
+const RANKED_DUELS_PLAYLIST_ID: i32 = 10;
+const RANKED_DOUBLES_PLAYLIST_ID: i32 = 11;
+const RANKED_SOLO_STANDARD_PLAYLIST_ID: i32 = 12;
 const RANKED_STANDARD_PLAYLIST_ID: i32 = 13;
 
-/// Validates that a replay is a supported match.
+/// Largest supported team size (standard).
+const MAXIMUM_PLAYERS_PER_TEAM: i32 = 3;
+
+/// Validates that a replay is a supported match and returns its format.
+///
+/// Ranked lobbies must have exactly two full teams of distinct players (a player who left
+/// still counts). Casual lobbies only need a player on the pitch: players join and leave
+/// mid-match, so the count can be above or below two full teams.
 ///
 /// # Errors
 /// Returns an error if the replay is not a supported match.
-pub fn validate_supported_match(replay: &Replay) -> Result<(), UnsupportedReplayMatch> {
+pub fn validate_supported_match(replay: &Replay) -> Result<MatchFormat, UnsupportedReplayMatch> {
     if replay.game_type != SOCCAR_REPLAY_GAME_TYPE {
         return Err(UnsupportedReplayMatch {
             detected_mode_label: game_mode_label_from_game_type(&replay.game_type),
@@ -23,41 +38,58 @@ pub fn validate_supported_match(replay: &Replay) -> Result<(), UnsupportedReplay
         header_int_property(replay, "TeamSize").ok_or_else(|| UnsupportedReplayMatch {
             detected_mode_label: "missing team size in replay header".to_string(),
         })?;
-
-    if team_size != 3 {
+    if !(1..=MAXIMUM_PLAYERS_PER_TEAM).contains(&team_size) {
         return Err(UnsupportedReplayMatch {
             detected_mode_label: team_size_label(team_size),
         });
     }
+    let players_per_team = usize::try_from(team_size).unwrap_or(1);
+
+    let ranked = match playlist_id_from_header(replay) {
+        Some(
+            RANKED_DUELS_PLAYLIST_ID
+            | RANKED_DOUBLES_PLAYLIST_ID
+            | RANKED_SOLO_STANDARD_PLAYLIST_ID
+            | RANKED_STANDARD_PLAYLIST_ID,
+        ) => true,
+        Some(
+            CASUAL_DUELS_PLAYLIST_ID | CASUAL_DOUBLES_PLAYLIST_ID | CASUAL_STANDARD_PLAYLIST_ID,
+        ) => false,
+        Some(other_id) => {
+            return Err(UnsupportedReplayMatch {
+                detected_mode_label: describe_playlist_id(other_id),
+            });
+        }
+        None => match match_type_from_objects_list(replay).as_deref() {
+            Some(name) if name.contains("PublicRanked") => true,
+            Some(name) if name.contains("Public") => false,
+            other => {
+                return Err(UnsupportedReplayMatch {
+                    detected_mode_label: non_ranked_or_unknown_label(other),
+                });
+            }
+        },
+    };
 
     let player_count = effective_human_player_count(replay);
-    if player_count != 6 {
+    let full_lobby = players_per_team * 2;
+    if ranked && player_count != full_lobby {
         return Err(UnsupportedReplayMatch {
-            detected_mode_label: format!("this lobby ({player_count} players; expected 6 for 3v3)"),
+            detected_mode_label: format!(
+                "this lobby ({player_count} players; expected {full_lobby} for ranked {players_per_team}v{players_per_team})"
+            ),
+        });
+    }
+    if player_count == 0 {
+        return Err(UnsupportedReplayMatch {
+            detected_mode_label: "this lobby (no players found)".to_string(),
         });
     }
 
-    let playlist_id = playlist_id_from_header(replay);
-    let match_type_object = match_type_from_objects_list(replay);
-
-    match playlist_id {
-        Some(RANKED_STANDARD_PLAYLIST_ID) => Ok(()),
-        Some(other_id) => Err(UnsupportedReplayMatch {
-            detected_mode_label: describe_playlist_id(other_id),
-        }),
-        None => {
-            let is_ranked = match_type_object
-                .as_deref()
-                .is_some_and(|name| name.contains("PublicRanked"));
-            if is_ranked {
-                Ok(())
-            } else {
-                Err(UnsupportedReplayMatch {
-                    detected_mode_label: non_ranked_or_unknown_label(match_type_object.as_deref()),
-                })
-            }
-        }
-    }
+    Ok(MatchFormat {
+        players_per_team,
+        ranked,
+    })
 }
 
 fn header_int_property(replay: &Replay, key: &str) -> Option<i32> {
@@ -246,9 +278,7 @@ fn match_type_from_objects_list(replay: &Replay) -> Option<String> {
 
 fn team_size_label(team_size: i32) -> String {
     match team_size {
-        1 => "1v1".to_string(),
-        2 => "2v2".to_string(),
-        4 => "4v4".to_string(),
+        4 => "4v4 (Chaos)".to_string(),
         _ => format!("team size {team_size}"),
     }
 }
@@ -296,11 +326,7 @@ fn describe_playlist_id(playlist_id: i32) -> String {
 fn non_ranked_or_unknown_label(match_type_spawn: Option<&str>) -> String {
     match match_type_spawn {
         Some(name) if name.contains("Private") => "private matches or custom games".to_string(),
-        Some(name) if name.contains("Public") && !name.contains("PublicRanked") => {
-            "casual or unranked online play".to_string()
-        }
         Some(name) => format!("this match type ({name})"),
-        None => "this match (ranked standard 3v3 could not be confirmed in the replay header)"
-            .to_string(),
+        None => "this match (its queue could not be read from the replay header)".to_string(),
     }
 }

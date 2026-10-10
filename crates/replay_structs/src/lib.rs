@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 mod game_mode;
+mod match_format;
 mod math;
 mod rank;
 mod replay;
@@ -12,6 +13,7 @@ mod team;
 mod unsupported_match;
 
 pub use game_mode::*;
+pub use match_format::*;
 pub use math::*;
 pub use rank::*;
 pub use replay::*;
@@ -257,6 +259,8 @@ pub struct ParsedReplay {
     pub kickoff_frames: Vec<usize>,
     /// End-of-match scoreboard from the replay header, one entry per player.
     pub header_player_stats: Vec<HeaderPlayerStats>,
+    /// Team size and queue.
+    pub match_format: MatchFormat,
 }
 
 /// One player's end-of-match scoreboard line from the replay header (`PlayerStats`).

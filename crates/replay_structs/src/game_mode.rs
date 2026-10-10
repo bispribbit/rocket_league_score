@@ -1,7 +1,7 @@
 use core::str::FromStr;
 
 /// Game mode enum matching the `PostgreSQL` type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "database", derive(sqlx::Type))]
 #[cfg_attr(
     feature = "database",

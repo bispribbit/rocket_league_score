@@ -18,7 +18,7 @@ use database::{
     assign_dataset_splits, initialize_pool, list_replay_players_by_replay, list_replays_by_split,
 };
 use feature_extractor::{
-    MATCH_STAT_NAMES, PLAYERS_PER_TEAM, PlayerMatchStats, PlayerRoster, TOTAL_PLAYERS,
+    MATCH_STAT_NAMES, PlayerMatchStats, PlayerRoster, SLOTS_PER_TEAM, TOTAL_SLOTS,
     compute_player_match_stats, compute_player_window_stats, time_windows,
 };
 use rayon::prelude::*;
@@ -61,7 +61,7 @@ struct PendingReplay {
     split: DatasetSplit,
     file_path: String,
     roster: PlayerRoster,
-    targets: [f32; TOTAL_PLAYERS],
+    targets: [f32; TOTAL_SLOTS],
 }
 
 /// One output row.
@@ -88,10 +88,10 @@ fn roster_and_targets(players: &[ReplayPlayer]) -> PendingSlots {
     blue.sort_by(|a, b| a.player_name.cmp(&b.player_name));
     orange.sort_by(|a, b| a.player_name.cmp(&b.player_name));
     let player_at = |slot: usize| -> Option<&ReplayPlayer> {
-        if slot < PLAYERS_PER_TEAM {
+        if slot < SLOTS_PER_TEAM {
             blue.get(slot).copied()
         } else {
-            orange.get(slot - PLAYERS_PER_TEAM).copied()
+            orange.get(slot - SLOTS_PER_TEAM).copied()
         }
     };
     PendingSlots {
@@ -111,12 +111,12 @@ fn roster_and_targets(players: &[ReplayPlayer]) -> PendingSlots {
 /// Roster and labels for one replay.
 struct PendingSlots {
     roster: PlayerRoster,
-    targets: [f32; TOTAL_PLAYERS],
+    targets: [f32; TOTAL_SLOTS],
 }
 
 fn to_rows(
     pending: &PendingReplay,
-    stats: [Option<PlayerMatchStats>; TOTAL_PLAYERS],
+    stats: [Option<PlayerMatchStats>; TOTAL_SLOTS],
     window_index: Option<usize>,
 ) -> impl Iterator<Item = StatsRow> + '_ {
     stats

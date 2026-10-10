@@ -1,13 +1,13 @@
 #![expect(
     clippy::indexing_slicing,
-    reason = "per-slot arrays of length TOTAL_PLAYERS indexed by slot < TOTAL_PLAYERS"
+    reason = "per-slot arrays of length TOTAL_SLOTS indexed by slot < TOTAL_SLOTS"
 )]
 
 //! Turns a [`MatchAnalysis`] into what the timeline and the cards display.
 
-use feature_extractor::TOTAL_PLAYERS;
+use feature_extractor::TOTAL_SLOTS;
 use rand::{RngExt, rng};
-use replay_structs::{GameFrame, ParsedReplay, RankDivision, Team};
+use replay_structs::{GameFrame, MatchFormat, ParsedReplay, RankDivision, Team};
 use skill_model::{MatchAnalysis, PlayerTimeline};
 
 use crate::app_state::{
@@ -101,8 +101,8 @@ pub(crate) fn compute_segment_boundary_play_times(
 
 /// Rank badges for one window; absent players stay `None`.
 pub(crate) fn ranks_from_player_mmr(
-    player_mmr: &[Option<f32>; TOTAL_PLAYERS],
-) -> [Option<RankDivision>; TOTAL_PLAYERS] {
+    player_mmr: &[Option<f32>; TOTAL_SLOTS],
+) -> [Option<RankDivision>; TOTAL_SLOTS] {
     core::array::from_fn(|slot| player_mmr[slot].map(RankDivision::from))
 }
 
@@ -122,28 +122,30 @@ pub(crate) fn compute_segment_boundary_times(segment_steps: &[SegmentStepInfo]) 
     boundary_times_seconds
 }
 
-/// Lane names and teams in slot order, so lanes line up with the model's slots.
+/// One timeline lane per player present in the match, blue first, with each lane's model
+/// slot.
 pub(crate) struct TimelinePlayers {
     pub(crate) names: Vec<String>,
     pub(crate) teams: Vec<Team>,
+    pub(crate) slots: Vec<usize>,
 }
 
-/// Lane names (empty slots read "Player N") and teams for the timeline.
+/// Lanes for the players present in the match (a duel has two, a casual lobby can have
+/// more than six).
 pub(crate) fn prepare_players_for_timeline(analysis: &MatchAnalysis) -> TimelinePlayers {
+    let slots: Vec<usize> = (0..TOTAL_SLOTS)
+        .filter(|&slot| !analysis.names[slot].is_empty())
+        .collect();
     TimelinePlayers {
-        names: analysis
-            .names
+        names: slots
             .iter()
-            .enumerate()
-            .map(|(slot, name)| {
-                if name.is_empty() {
-                    format!("Player {}", slot + 1)
-                } else {
-                    name.clone()
-                }
-            })
+            .map(|&slot| analysis.names[slot].clone())
             .collect(),
-        teams: (0..TOTAL_PLAYERS).map(MatchAnalysis::team).collect(),
+        teams: slots
+            .iter()
+            .map(|&slot| MatchAnalysis::team(slot))
+            .collect(),
+        slots,
     }
 }
 
@@ -195,9 +197,12 @@ pub(crate) fn format_timeline_boundary_label(seconds: f32) -> String {
 }
 
 /// Cards and verdict input: every player the match model scored, in slot order.
-pub(crate) fn build_prediction_results(analysis: &MatchAnalysis) -> PredictionResults {
+pub(crate) fn build_prediction_results(
+    analysis: &MatchAnalysis,
+    match_format: MatchFormat,
+) -> PredictionResults {
     let mut random = rng();
-    let player_averages = (0..TOTAL_PLAYERS)
+    let player_averages = (0..TOTAL_SLOTS)
         .filter(|&slot| !analysis.names[slot].is_empty())
         .filter_map(|slot| {
             let mmr = analysis.match_mmr[slot]?;
@@ -212,5 +217,8 @@ pub(crate) fn build_prediction_results(analysis: &MatchAnalysis) -> PredictionRe
             })
         })
         .collect();
-    PredictionResults { player_averages }
+    PredictionResults {
+        player_averages,
+        match_format,
+    }
 }

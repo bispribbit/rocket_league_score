@@ -1,6 +1,6 @@
 #![expect(
     clippy::indexing_slicing,
-    reason = "per-slot arrays of length TOTAL_PLAYERS indexed by slot < TOTAL_PLAYERS"
+    reason = "per-slot arrays of length TOTAL_SLOTS indexed by slot < TOTAL_SLOTS"
 )]
 
 //! Turns a parsed replay into everything the app shows.
@@ -16,7 +16,7 @@
 use std::ops::Range;
 
 use feature_extractor::{
-    PLAYERS_PER_TEAM, PlayerMatchStats, PlayerRoster, TOTAL_PLAYERS, compute_player_match_stats,
+    PlayerMatchStats, PlayerRoster, SLOTS_PER_TEAM, TOTAL_SLOTS, compute_player_match_stats,
     compute_player_window_stats, time_windows,
 };
 use replay_structs::{ParsedReplay, Team};
@@ -28,33 +28,39 @@ use crate::coaching::CoachingAdvice;
 /// cut-off the window model was trained with.
 pub const MINIMUM_WINDOW_SECONDS: f32 = 10.0;
 
+/// Live seconds a player needs over the whole match to be scored.
+///
+/// Shorter players do not count towards the lobby either: mostly casual players who joined
+/// for the last few seconds. Same cut-off the match model was trained with.
+pub const MINIMUM_MATCH_SECONDS: f32 = 30.0;
+
 /// One timeline window: its frame range and each slot's displayed MMR.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerTimeline {
     /// Raw frame range of the window.
     pub frames: Range<usize>,
     /// Displayed MMR per slot, `None` when the player was (nearly) absent.
-    pub player_mmr: [Option<f32>; TOTAL_PLAYERS],
+    pub player_mmr: [Option<f32>; TOTAL_SLOTS],
 }
 
 /// Everything the app needs for one replay.
 #[derive(Debug, Clone)]
 pub struct MatchAnalysis {
     /// Player names in slot order (blue sorted by name, then orange); empty when unused.
-    pub names: [String; TOTAL_PLAYERS],
+    pub names: [String; TOTAL_SLOTS],
     /// Whole-match MMR per slot.
-    pub match_mmr: [Option<f32>; TOTAL_PLAYERS],
+    pub match_mmr: [Option<f32>; TOTAL_SLOTS],
     /// Roast per slot.
-    pub coaching: [Option<CoachingAdvice>; TOTAL_PLAYERS],
+    pub coaching: [Option<CoachingAdvice>; TOTAL_SLOTS],
     /// Timeline windows in order.
     pub timeline: Vec<PlayerTimeline>,
 }
 
 impl MatchAnalysis {
-    /// Team of a slot (slots `0..3` are blue).
+    /// Team of a slot (the first [`SLOTS_PER_TEAM`] slots are blue).
     #[must_use]
     pub const fn team(slot: usize) -> Team {
-        if slot < PLAYERS_PER_TEAM {
+        if slot < SLOTS_PER_TEAM {
             Team::Blue
         } else {
             Team::Orange
@@ -63,7 +69,7 @@ impl MatchAnalysis {
 }
 
 /// Mean over present slots.
-fn present_mean(values: &[Option<f32>; TOTAL_PLAYERS]) -> f32 {
+fn present_mean(values: &[Option<f32>; TOTAL_SLOTS]) -> f32 {
     let present: Vec<f32> = values.iter().flatten().copied().collect();
     present.iter().sum::<f32>() / present.len().max(1) as f32
 }
@@ -73,11 +79,22 @@ impl SkillModelBundle {
     #[must_use]
     pub fn analyze(&self, parsed: &ParsedReplay) -> MatchAnalysis {
         let roster = PlayerRoster::from_parsed(parsed);
-        let match_stats = compute_player_match_stats(parsed, &roster);
+        let mut match_stats = compute_player_match_stats(parsed, &roster);
+        for slot_stats in &mut match_stats {
+            if slot_stats
+                .as_ref()
+                .is_some_and(|s| s.live_seconds < MINIMUM_MATCH_SECONDS)
+            {
+                *slot_stats = None;
+            }
+        }
         let match_mmr = self.match_model.predict(&match_stats);
+        let coaching_table = self
+            .coaching
+            .for_players_per_team(parsed.match_format.players_per_team);
         let coaching = core::array::from_fn(|slot| {
             let stats: &PlayerMatchStats = match_stats[slot].as_ref()?;
-            self.coaching.advise(match_mmr[slot]?, &stats.values)
+            coaching_table?.advise(match_mmr[slot]?, &stats.values)
         });
         let timeline = self.timeline(parsed, &roster, &match_mmr);
         MatchAnalysis {
@@ -92,13 +109,13 @@ impl SkillModelBundle {
         &self,
         parsed: &ParsedReplay,
         roster: &PlayerRoster,
-        match_mmr: &[Option<f32>; TOTAL_PLAYERS],
+        match_mmr: &[Option<f32>; TOTAL_SLOTS],
     ) -> Vec<PlayerTimeline> {
         let windows = time_windows(parsed, self.window_seconds);
         // Each window: every present player's deviation from that window's lobby, and how
         // long they played in it.
-        let mut deviations: Vec<[Option<f32>; TOTAL_PLAYERS]> = Vec::with_capacity(windows.len());
-        let mut weights: Vec<[f32; TOTAL_PLAYERS]> = Vec::with_capacity(windows.len());
+        let mut deviations: Vec<[Option<f32>; TOTAL_SLOTS]> = Vec::with_capacity(windows.len());
+        let mut weights: Vec<[f32; TOTAL_SLOTS]> = Vec::with_capacity(windows.len());
         for range in &windows {
             let mut stats = compute_player_window_stats(parsed, roster, range.clone());
             for slot_stats in &mut stats {
@@ -121,7 +138,7 @@ impl SkillModelBundle {
 
         // A player's average window deviation, so the timeline shows form around their own
         // whole-match level rather than a second, competing estimate of it.
-        let average_deviation: [f32; TOTAL_PLAYERS] = core::array::from_fn(|slot| {
+        let average_deviation: [f32; TOTAL_SLOTS] = core::array::from_fn(|slot| {
             let mut weighted = 0.0;
             let mut total = 0.0;
             for (window, weight) in deviations.iter().zip(&weights) {

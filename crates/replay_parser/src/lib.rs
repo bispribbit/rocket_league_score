@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use boxcars::{Attribute, HeaderProp, ParserBuilder, Replay};
 use replay_structs::{
-    ActorState, BallState, DemolitionEvent, GameFrame, GoalEvent, HeaderPlayerStats, ParsedReplay,
-    PlayerState, Team, UnsupportedReplayMatch,
+    ActorState, BallState, DemolitionEvent, GameFrame, GoalEvent, HeaderPlayerStats, MatchFormat,
+    ParsedReplay, PlayerState, Team, UnsupportedReplayMatch,
 };
 
 pub mod match_validation;
@@ -144,12 +144,14 @@ pub fn parse_boxcars_replay_without_policy(data: &[u8]) -> Result<Replay, Replay
 ///
 /// # Errors
 ///
-/// Returns an error if the data cannot be parsed, or the replay is not ranked standard 3v3.
+/// Returns an error if the data cannot be parsed, or the replay is not a supported match.
 pub fn parse_replay_from_bytes(data: &[u8]) -> Result<ParsedReplay, ReplayAcceptanceError> {
     let replay = parse_boxcars_replay_without_policy(data)?;
-    match_validation::validate_supported_match(&replay)
+    let match_format = match_validation::validate_supported_match(&replay)
         .map_err(ReplayAcceptanceError::Unsupported)?;
-    parse_boxcars_replay(&replay).map_err(ReplayAcceptanceError::Parse)
+    let mut parsed = parse_boxcars_replay(&replay).map_err(ReplayAcceptanceError::Parse)?;
+    parsed.match_format = match_format;
+    Ok(parsed)
 }
 
 fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
@@ -715,6 +717,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
         goal_frames,
         kickoff_frames,
         header_player_stats: extract_header_player_stats(replay),
+        match_format: MatchFormat::default(),
     })
 }
 

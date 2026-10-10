@@ -14,11 +14,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging with console and file output
-    // Ensure directory exists
-    std::fs::create_dir_all("/workspace/target/logs").expect("Failed to create .cursor directory");
-    let log_file = std::fs::File::create("/workspace/target/logs/debug.log")
-        .expect("Failed to create debug log file");
+    // Initialize logging with console and file output (relative to the workspace root).
+    std::fs::create_dir_all("target/logs").expect("Failed to create the log directory");
+    let log_file =
+        std::fs::File::create("target/logs/debug.log").expect("Failed to create debug log file");
 
     let env_filter = EnvFilter::new("info");
 

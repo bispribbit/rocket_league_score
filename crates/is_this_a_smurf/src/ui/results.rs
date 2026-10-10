@@ -1,7 +1,6 @@
 //! Results tables and error view.
 
 use dioxus::prelude::*;
-use feature_extractor::TOTAL_PLAYERS;
 use rand::{RngExt, rng};
 use replay_structs::{Team, UnsupportedReplayMatch};
 
@@ -54,8 +53,18 @@ pub(crate) fn PlayerSummaryGrid(results: PredictionResults) -> Element {
         .collect();
 
     let lobby_median_mmr = lobby_median_mmr(&results.player_averages);
+    let format = results.match_format;
+    let size = format.players_per_team;
+    let format_note = if format.ranked {
+        format!("Ranked {size}v{size} · ranks are competitive {size}v{size} ranks")
+    } else {
+        format!(
+            "Casual {size}v{size} · ranks are the competitive {size}v{size} rank each player plays like"
+        )
+    };
 
     rsx! {
+        p { class: "text-center text-sm text-gray-400 mb-3", "{format_note}" }
         div { class: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-10",
             TeamSummaryCard {
                 team_name: "Blue Team",
@@ -125,7 +134,7 @@ pub(crate) fn PlayerSummaryGridLoading(progress: ProgressState) -> Element {
 
     let mut blue_names: Vec<String> = Vec::new();
     let mut orange_names: Vec<String> = Vec::new();
-    for player_lane_index in 0..TOTAL_PLAYERS {
+    for player_lane_index in 0..track.player_names.len() {
         let player_name = track
             .player_names
             .get(player_lane_index)
@@ -277,7 +286,7 @@ fn TeamSummaryCard(
     }
 }
 
-/// Shown when the replay is valid but not ranked standard 3v3.
+/// Shown when the replay is valid but not a supported match (e.g. Hoops or 4v4).
 #[component]
 pub(crate) fn UnsupportedReplayPage(
     details: UnsupportedReplayMatch,

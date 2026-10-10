@@ -183,9 +183,15 @@ pub async fn list_pending_downloads(
                 SELECT id, game_mode as "game_mode: GameMode", rank as "rank: Rank", metadata,
                        download_status as "download_status: DownloadStatus", file_path, error_message,
                        dataset_split as "dataset_split: DatasetSplit", created_at, updated_at
-                FROM replays
-                WHERE download_status = 'not_downloaded'
-                ORDER BY created_at
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY game_mode, rank ORDER BY created_at
+                    ) AS bucket_position
+                    FROM replays
+                    WHERE download_status = 'not_downloaded'
+                ) pending
+                -- Round-robin over (playlist, rank) so a partial download stays balanced.
+                ORDER BY bucket_position, game_mode, rank
                 LIMIT $1
                 "#,
                 limit
@@ -302,15 +308,16 @@ pub async fn reset_in_progress_downloads() -> Result<u64, sqlx::Error> {
     Ok(result.rows_affected())
 }
 
-/// Counts replays by rank.
+/// Counts replays of one playlist and rank.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub async fn count_replays_by_rank(rank: Rank) -> Result<i64, sqlx::Error> {
+pub async fn count_replays_by_rank(game_mode: GameMode, rank: Rank) -> Result<i64, sqlx::Error> {
     let pool = get_pool();
     let result = sqlx::query!(
-        r#"SELECT COUNT(*) as "count!" FROM replays WHERE rank = $1"#,
+        r#"SELECT COUNT(*) as "count!" FROM replays WHERE game_mode = $1 AND rank = $2"#,
+        game_mode as GameMode,
         rank as Rank
     )
     .fetch_one(pool)
@@ -319,18 +326,24 @@ pub async fn count_replays_by_rank(rank: Rank) -> Result<i64, sqlx::Error> {
     Ok(result.count)
 }
 
-/// Counts replays by rank and status.
+/// Counts replays of one playlist and rank with a given download status.
 ///
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
 pub async fn count_replays_by_rank_and_status(
+    game_mode: GameMode,
     rank: Rank,
     status: DownloadStatus,
 ) -> Result<i64, sqlx::Error> {
     let pool = get_pool();
     let result = sqlx::query!(
-        r#"SELECT COUNT(*) as "count!" FROM replays WHERE rank = $1 AND download_status = $2"#,
+        r#"
+        SELECT COUNT(*) as "count!"
+        FROM replays
+        WHERE game_mode = $1 AND rank = $2 AND download_status = $3
+        "#,
+        game_mode as GameMode,
         rank as Rank,
         status as DownloadStatus
     )

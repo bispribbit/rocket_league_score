@@ -1,7 +1,6 @@
 //! Match timeline animation and early working panel (spinner before the timeline is ready).
 
 use dioxus::prelude::*;
-use feature_extractor::TOTAL_PLAYERS;
 use replay_structs::Team;
 
 use crate::app_state::{GoalMarkerDisplay, ProgressState, StepStatus};
@@ -108,6 +107,11 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
     };
 
     let goal_entries = sorted_goals_with_scores(&track.goals);
+    // Lanes are `h-11` (2.75rem); the track grows with the number of players.
+    let lane_count = track.player_names.len();
+    let lanes_height_style = format!("height: {:.2}rem;", lane_count as f32 * 2.75);
+    let track_minimum_height_style =
+        format!("min-height: {:.2}rem;", (lane_count + 1) as f32 * 2.75);
 
     rsx! {
         div { class: "w-full mb-10 rounded-xl border border-gray-800 bg-gradient-to-b from-gray-900/90 to-gray-950/95 p-5 overflow-x-hidden shadow-lg shadow-black/40",
@@ -128,9 +132,9 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
             }
 
             div { class: "flex flex-row gap-3 w-full min-w-0 items-start",
-                // Player names (team tint + border; slots 0–2 blue, 3–5 orange in standard replays)
+                // Player names (team tint + border; blue lanes first, then orange)
                 div { class: "flex flex-col w-40 flex-shrink-0",
-                    for player_lane_index in 0..TOTAL_PLAYERS {
+                    for player_lane_index in 0..lane_count {
                         {
                             let player_name = track
                                 .player_names
@@ -161,10 +165,16 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                 }
 
                 // Match track (ends at last segment; no separate result column — summary is below)
-                div { class: "flex-1 flex flex-col min-h-[336px] min-w-0",
-                    div { class: "relative flex-1 flex flex-col rounded-lg bg-gray-950/80 border border-gray-800 overflow-visible min-h-[336px]",
+                div {
+                    class: "flex-1 flex flex-col min-w-0",
+                    style: "{track_minimum_height_style}",
+                    div {
+                        class: "relative flex-1 flex flex-col rounded-lg bg-gray-950/80 border border-gray-800 overflow-visible",
+                        style: "{track_minimum_height_style}",
                         // Lanes + overlays (match time uses the left MATCH_TRACK_WIDTH_PERCENT of this area)
-                        div { class: "relative h-72 min-h-72 shrink-0",
+                        div {
+                            class: "relative shrink-0",
+                            style: "{lanes_height_style}",
                             // Full-height overlays: boundaries + goal markers
                             div { class: "absolute inset-0 pointer-events-none z-[1]",
                                 for boundary_index in 0..track.boundary_times_seconds.len() {
@@ -221,8 +231,10 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                             }
 
                             // Lanes (segment ranks); fixed row height matches name column.
-                            div { class: "relative z-[5] flex flex-col h-72 shrink-0",
-                                for player_lane_index in 0..TOTAL_PLAYERS {
+                            div {
+                                class: "relative z-[5] flex flex-col shrink-0",
+                                style: "{lanes_height_style}",
+                                for player_lane_index in 0..lane_count {
                                     {
                                         let team = track
                                             .player_teams
@@ -256,7 +268,8 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                                             .and_then(|step| {
                                                                 step.player_segment_ranks
                                                                     .as_ref()
-                                                                    .and_then(|ranks| ranks.get(player_lane_index).copied().flatten())
+                                                                    .zip(track.player_slots.get(player_lane_index))
+                                                                    .and_then(|(ranks, slot)| ranks.get(*slot).copied().flatten())
                                                             });
                                                         let opacity_class = if rank_visible { "opacity-100" } else { "opacity-0" };
                                                         rsx! {

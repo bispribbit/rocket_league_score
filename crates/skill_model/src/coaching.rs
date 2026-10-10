@@ -230,6 +230,28 @@ pub struct CoachingTable {
     pub enabled: Vec<bool>,
 }
 
+/// One [`CoachingTable`] per playlist size: what the next rank does differs between duels,
+/// doubles and standard (a duel player touches the ball far more often).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CoachingTables {
+    /// Index = players per team − 1 (duels, doubles, standard). A table without tiers means
+    /// that playlist had no training data.
+    pub by_players_per_team: Vec<CoachingTable>,
+}
+
+impl CoachingTables {
+    /// The table for a playlist size, or the standard table when that size has none.
+    #[must_use]
+    pub fn for_players_per_team(&self, players_per_team: usize) -> Option<&CoachingTable> {
+        let has_tiers = |table: &&CoachingTable| !table.tiers.is_empty();
+        players_per_team
+            .checked_sub(1)
+            .and_then(|index| self.by_players_per_team.get(index))
+            .filter(has_tiers)
+            .or_else(|| self.by_players_per_team.get(2).filter(has_tiers))
+    }
+}
+
 /// Plural display name per tier index (0 = Bronze I … 21 = SSL), as used in `{next}`.
 const TIER_GROUP_PLURALS: [&str; 22] = [
     "Bronzes",
@@ -450,7 +472,7 @@ mod tests {
         assert!(NOTHING_TO_FIX_LINES.len() >= 20);
     }
 
-    /// Lines describe one of six players, so they never talk to the reader.
+    /// Lines describe one of several players, so they never talk to the reader.
     #[test]
     fn lines_never_address_the_reader() {
         let all_lines = COACHING_TIPS

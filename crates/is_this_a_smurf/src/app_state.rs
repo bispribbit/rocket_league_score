@@ -1,13 +1,16 @@
 //! Application state, progress tracking, and result payloads.
 
-use feature_extractor::TOTAL_PLAYERS;
-use replay_structs::{RankDivision, Team, UnsupportedReplayMatch};
+use feature_extractor::TOTAL_SLOTS;
+use replay_structs::{MatchFormat, RankDivision, Team, UnsupportedReplayMatch};
 
 /// Prediction results for the entire replay.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PredictionResults {
     /// Whole-match result per player.
     pub(crate) player_averages: Vec<PlayerAverage>,
+    /// Team size and queue of the match; ranks are always the competitive rank for that
+    /// team size, also for casual matches.
+    pub(crate) match_format: MatchFormat,
 }
 
 /// Whole-match result for a single player.
@@ -41,7 +44,7 @@ pub(crate) struct SegmentStepInfo {
     pub(crate) status: StepStatus,
     /// Filled when the window is revealed; a slot is `None` when that player was (nearly)
     /// absent from the window.
-    pub(crate) player_segment_ranks: Option<[Option<RankDivision>; TOTAL_PLAYERS]>,
+    pub(crate) player_segment_ranks: Option<[Option<RankDivision>; TOTAL_SLOTS]>,
 }
 
 /// One goal shown on the analysis timeline (replay-derived).
@@ -62,8 +65,11 @@ pub(crate) struct TimelineTrackState {
     /// Game-clock (play-time) at each boundary (used for display labels only).
     pub(crate) boundary_play_times_seconds: Vec<f32>,
     pub(crate) goals: Vec<GoalMarkerDisplay>,
+    /// One lane per player present in the match.
     pub(crate) player_names: Vec<String>,
     pub(crate) player_teams: Vec<Team>,
+    /// Model slot of each lane, to read that player's window ranks.
+    pub(crate) player_slots: Vec<usize>,
     pub(crate) num_segments: usize,
 }
 
@@ -89,7 +95,7 @@ pub(crate) enum AppState {
     WaitingForUpload,
     /// An error occurred (error message).
     Error(String),
-    /// Replay parsed but the match type is not supported (e.g. not ranked 3v3 standard).
+    /// Replay parsed but the match type is not supported (e.g. Hoops or 4v4).
     UnsupportedReplay(UnsupportedReplayMatch),
 }
 

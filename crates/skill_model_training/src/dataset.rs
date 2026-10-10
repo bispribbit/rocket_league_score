@@ -13,8 +13,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use feature_extractor::{MATCH_STAT_COUNT, MATCH_STAT_NAMES, TOTAL_PLAYERS};
-use skill_model::{LobbySummary, MINIMUM_WINDOW_SECONDS, TabularLayout, TabularSkillModel};
+use feature_extractor::{MATCH_STAT_COUNT, MATCH_STAT_NAMES, PLAYERS_PER_TEAM_STAT, TOTAL_SLOTS};
+use skill_model::{
+    LobbySummary, MINIMUM_MATCH_SECONDS, MINIMUM_WINDOW_SECONDS, TabularLayout, TabularSkillModel,
+};
 use uuid::Uuid;
 
 use crate::evaluation::{PlayerPrediction, stable_replay_hash};
@@ -47,11 +49,11 @@ pub struct Lobby {
     pub window: usize,
     pub partition: Partition,
     /// Stats per slot; `None` when the slot is empty (or too short in a window).
-    pub stats: [Option<[f32; MATCH_STAT_COUNT]>; TOTAL_PLAYERS],
+    pub stats: [Option<[f32; MATCH_STAT_COUNT]>; TOTAL_SLOTS],
     /// Label MMR per slot; `0` when the rank is unknown.
-    pub targets: [f32; TOTAL_PLAYERS],
+    pub targets: [f32; TOTAL_SLOTS],
     /// Live seconds per slot.
-    pub live_seconds: [f32; TOTAL_PLAYERS],
+    pub live_seconds: [f32; TOTAL_SLOTS],
 }
 
 /// Identifies one lobby while loading.
@@ -64,13 +66,24 @@ struct LobbyKey {
 impl Lobby {
     /// Stats per slot, by reference, as the model takes them.
     #[must_use]
-    pub fn stat_references(&self) -> [Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_PLAYERS] {
+    pub fn stat_references(&self) -> [Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_SLOTS] {
         core::array::from_fn(|slot| self.stats[slot].as_ref())
     }
 
     /// Slots with stats and a known label.
     pub fn labelled_slots(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..TOTAL_PLAYERS).filter(|&slot| self.stats[slot].is_some() && self.targets[slot] > 0.0)
+        (0..TOTAL_SLOTS).filter(|&slot| self.stats[slot].is_some() && self.targets[slot] > 0.0)
+    }
+
+    /// Playlist size (1 duels, 2 doubles, 3 standard), read from the stat every player
+    /// carries; `None` for a lobby without players.
+    #[must_use]
+    pub fn players_per_team(&self) -> Option<usize> {
+        self.stats
+            .iter()
+            .flatten()
+            .next()
+            .map(|stats| stats[PLAYERS_PER_TEAM_STAT].round() as usize)
     }
 
     /// Mean label over labelled slots.
@@ -84,8 +97,11 @@ impl Lobby {
     }
 }
 
-/// Reads a stats CSV written by `extract_stats`. A trailing `window_index` column marks
-/// window rows; players with less than [`MINIMUM_WINDOW_SECONDS`] in a window are dropped.
+/// Reads a stats CSV written by `extract_stats`.
+///
+/// A trailing `window_index` column marks window rows. Players with less than
+/// [`MINIMUM_WINDOW_SECONDS`] in a window, or less than [`MINIMUM_MATCH_SECONDS`] in a whole
+/// match, are dropped (as the app does).
 ///
 /// # Errors
 ///
@@ -115,9 +131,12 @@ pub fn read_lobbies(path: &Path) -> Result<Vec<Lobby>> {
             Some(column) => field(column).parse()?,
             None => 0,
         };
-        if slot >= TOTAL_PLAYERS
-            || (window_column.is_some() && live_seconds < MINIMUM_WINDOW_SECONDS)
-        {
+        let minimum_seconds = if window_column.is_some() {
+            MINIMUM_WINDOW_SECONDS
+        } else {
+            MINIMUM_MATCH_SECONDS
+        };
+        if slot >= TOTAL_SLOTS || live_seconds < minimum_seconds {
             continue;
         }
         let mut stats = [0.0; MATCH_STAT_COUNT];
@@ -139,9 +158,9 @@ pub fn read_lobbies(path: &Path) -> Result<Vec<Lobby>> {
                 replay_id,
                 window,
                 partition,
-                stats: [None; TOTAL_PLAYERS],
-                targets: [0.0; TOTAL_PLAYERS],
-                live_seconds: [0.0; TOTAL_PLAYERS],
+                stats: [None; TOTAL_SLOTS],
+                targets: [0.0; TOTAL_SLOTS],
+                live_seconds: [0.0; TOTAL_SLOTS],
             });
         lobby.stats[slot] = Some(stats);
         lobby.targets[slot] = field(3).parse()?;

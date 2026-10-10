@@ -23,8 +23,47 @@ use crate::api::client::{BallchasingClient, RateLimitedError};
 use crate::bundle::extract_players_with_average_rank;
 use crate::players::extract_players_from_metadata;
 
-/// Target number of replays per rank.
-const TARGET_REPLAYS_PER_RANK: usize = 1200;
+/// How many replays to collect per rank of one playlist.
+#[derive(Debug, Clone, Copy)]
+struct PlaylistTarget {
+    game_mode: GameMode,
+    replays_per_rank: usize,
+}
+
+/// Replays per rank, per ranked playlist. Standard was sized for the old LSTM. Duels and
+/// doubles are sized from the tree model's learning curve (`learning_curve` binary): on
+/// standard, accuracy flattens past ~8,000 training replays (each doubling after that buys
+/// 2–3 MMR), and 350 per rank over 22 ranks is ~7,700 replays per playlist.
+const PLAYLIST_TARGETS: [PlaylistTarget; 3] = [
+    PlaylistTarget {
+        game_mode: GameMode::RankedStandard,
+        replays_per_rank: 1200,
+    },
+    PlaylistTarget {
+        game_mode: GameMode::RankedDoubles,
+        replays_per_rank: TARGET_DOUBLES_REPLAYS_PER_RANK,
+    },
+    PlaylistTarget {
+        game_mode: GameMode::RankedDuels,
+        replays_per_rank: TARGET_DUELS_REPLAYS_PER_RANK,
+    },
+];
+
+/// Doubles replays per rank.
+const TARGET_DOUBLES_REPLAYS_PER_RANK: usize = 350;
+
+/// Duels replays per rank.
+const TARGET_DUELS_REPLAYS_PER_RANK: usize = 350;
+
+/// Pause after a failed replay list request before trying the next bucket.
+const FETCH_RETRY_SECONDS: u64 = 60;
+
+/// One (playlist, rank) bucket the fetcher fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FetchBucket {
+    game_mode: GameMode,
+    rank: Rank,
+}
 
 /// How often to log progress (in seconds).
 const PROGRESS_LOG_INTERVAL_SECONDS: u64 = 30;
@@ -57,9 +96,19 @@ pub async fn run() -> Result<()> {
     let fetch_client = client.clone();
     let download_client = client.clone();
 
-    let fetch_task = tokio::spawn(async move { fetch_all_metadata(fetch_client).await });
+    let fetch_finished = Arc::new(AtomicBool::new(false));
+    let fetch_finished_by_fetcher = Arc::clone(&fetch_finished);
+    let fetch_task = tokio::spawn(async move {
+        let result = fetch_all_metadata(fetch_client).await;
+        if let Err(error) = &result {
+            error!("Metadata fetch stopped: {error:#}");
+        }
+        fetch_finished_by_fetcher.store(true, Ordering::SeqCst);
+        result
+    });
 
-    let download_task = tokio::spawn(async move { download_all_replays(download_client).await });
+    let download_task =
+        tokio::spawn(async move { download_all_replays(download_client, fetch_finished).await });
 
     // Wait for both tasks
     let (fetch_result, download_result) = tokio::join!(fetch_task, download_task);
@@ -73,128 +122,60 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Fetches metadata for all ranks until we have enough replays.
+/// Fetches metadata for every playlist and rank until each has its target.
+///
+/// A bucket whose search comes back empty is not retried: some playlist/rank pairs (for
+/// example Supersonic Legend duels) never reach the target.
 async fn fetch_all_metadata(client: Arc<BallchasingClient>) -> Result<()> {
-    info!("Starting metadata fetch (target: {TARGET_REPLAYS_PER_RANK} per rank)");
+    info!("Starting metadata fetch (targets: {PLAYLIST_TARGETS:?})");
+    let mut exhausted: HashSet<FetchBucket> = HashSet::new();
 
     loop {
         let mut all_complete = true;
 
-        for rank in Rank::all_ranked() {
-            let current = database::count_replays_by_rank(rank).await?;
-
-            if current >= TARGET_REPLAYS_PER_RANK as i64 {
-                continue;
-            }
-
-            all_complete = false;
-            let needed = TARGET_REPLAYS_PER_RANK - current as usize;
-
-            info!("Rank {rank}: have {current}, fetching up to {needed} more");
-
-            // Skip any replay ID already stored under any rank (not only this rank).
-            // Otherwise the API can return replays we already have from another rank
-            // filter; inserts would no-op and this rank would never reach its target.
-            let all_replay_ids: HashSet<Uuid> = database::list_all_replay_ids().await?;
-
-            // Fetch from API
-            let replays: Vec<ReplaySummary> = client
-                .fetch_replays_for_rank(rank, needed, &all_replay_ids)
-                .await?;
-
-            // Store new replays
-            let mut ids = Vec::new();
-            let mut game_modes = Vec::new();
-            let mut ranks = Vec::new();
-            let mut metadata_values = Vec::new();
-
-            for replay in replays {
-                let Ok(id) = replay.id.parse::<Uuid>() else {
-                    warn!("Invalid replay ID: {}", replay.id);
-                    continue;
+        for target in PLAYLIST_TARGETS {
+            for rank in Rank::all_ranked() {
+                let bucket = FetchBucket {
+                    game_mode: target.game_mode,
+                    rank,
                 };
-
-                if all_replay_ids.contains(&id) {
+                if exhausted.contains(&bucket) {
                     continue;
                 }
-
-                // Extract game_mode from playlist_id, default to RankedStandard if not available
-                let game_mode =
-                    replay
-                        .playlist_id
-                        .as_ref()
-                        .map_or(GameMode::RankedStandard, |playlist_id| {
-                            GameMode::from_str(playlist_id).unwrap_or_else(|_| {
-                                warn!(
-                                    "Invalid playlist_id: {}, defaulting to ranked_standard",
-                                    playlist_id
-                                );
-                                GameMode::RankedStandard
-                            })
-                        });
-
-                let storage_rank = match extract_players_with_average_rank(id, &replay) {
-                    Ok(calculation) => calculation.folder_rank,
-                    Err(_) => rank,
+                let current = database::count_replays_by_rank(target.game_mode, rank).await?;
+                let Some(needed) = usize::try_from(current)
+                    .ok()
+                    .and_then(|current| target.replays_per_rank.checked_sub(current))
+                    .filter(|needed| *needed > 0)
+                else {
+                    continue;
                 };
-
-                let metadata = serde_json::to_value(&replay)?;
-                ids.push(id);
-                game_modes.push(game_mode);
-                ranks.push(storage_rank);
-                metadata_values.push(metadata);
-            }
-
-            if ids.is_empty() {
-                continue;
-            }
-
-            let created =
-                database::insert_replays(&ids, &game_modes, &ranks, &metadata_values).await?;
-            info!("Stored {created} new replays for rank {rank}");
-
-            // Extract and insert players for each new replay
-            let mut all_players = Vec::new();
-
-            for (replay_id, metadata) in ids.iter().zip(metadata_values.iter()) {
-                match extract_players_from_metadata(metadata) {
-                    Ok(players) => {
-                        for player in players {
-                            all_players.push(ReplayPlayer {
-                                id: 0,
-                                replay_id: *replay_id,
-                                player_name: player.player_name,
-                                team: player.team,
-                                rank_division: player.rank_division,
-                                rank_known: player.rank_known,
-                                created_at: Utc::now(),
-                            });
-                        }
-                    }
-                    Err(e) => {
+                all_complete = false;
+                // A failed list request (timeout, 5xx, 429) must not end the whole fetch:
+                // the downloads would carry on and the missing buckets would go unnoticed.
+                let created = match fetch_bucket(&client, bucket, needed).await {
+                    Ok(created) => created,
+                    Err(error) => {
                         warn!(
-                            replay_id = %replay_id,
-                            error = %e,
-                            "Failed to extract players from metadata"
+                            "{} {rank}: fetch failed, retrying in {FETCH_RETRY_SECONDS} s: {error:#}",
+                            target.game_mode.as_api_string()
                         );
+                        sleep(Duration::from_secs(FETCH_RETRY_SECONDS)).await;
+                        continue;
                     }
+                };
+                if created == 0 {
+                    info!(
+                        "{} {rank}: no new replays available, stopping at {current}",
+                        target.game_mode.as_api_string()
+                    );
+                    exhausted.insert(bucket);
                 }
             }
-
-            if all_players.is_empty() {
-                continue;
-            }
-
-            database::insert_replay_players(&all_players).await?;
-            info!(
-                "Inserted {} player records for {} replays",
-                all_players.len(),
-                ids.len()
-            );
         }
 
-        if all_complete {
-            info!("All ranks have {TARGET_REPLAYS_PER_RANK} replays");
+        if all_complete || exhausted.len() >= PLAYLIST_TARGETS.len() * Rank::all_ranked().count() {
+            info!("Metadata fetch finished");
             break;
         }
 
@@ -205,8 +186,123 @@ async fn fetch_all_metadata(client: Arc<BallchasingClient>) -> Result<()> {
     Ok(())
 }
 
-/// Downloads all pending replays.
-async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
+/// Fetches and stores up to `needed` new replays of one bucket. Returns how many were stored.
+async fn fetch_bucket(
+    client: &BallchasingClient,
+    bucket: FetchBucket,
+    needed: usize,
+) -> Result<usize> {
+    let FetchBucket { game_mode, rank } = bucket;
+    info!(
+        "{} {rank}: fetching up to {needed} more",
+        game_mode.as_api_string()
+    );
+
+    // Skip any replay ID already stored under any rank (not only this rank).
+    // Otherwise the API can return replays we already have from another rank
+    // filter; inserts would no-op and this rank would never reach its target.
+    let all_replay_ids: HashSet<Uuid> = database::list_all_replay_ids().await?;
+
+    let replays: Vec<ReplaySummary> = client
+        .fetch_replays_for_rank(game_mode, rank, needed, &all_replay_ids)
+        .await?;
+
+    let mut ids = Vec::new();
+    let mut game_modes = Vec::new();
+    let mut ranks = Vec::new();
+    let mut metadata_values = Vec::new();
+
+    for replay in replays {
+        let Ok(id) = replay.id.parse::<Uuid>() else {
+            warn!("Invalid replay ID: {}", replay.id);
+            continue;
+        };
+
+        if all_replay_ids.contains(&id) {
+            continue;
+        }
+
+        // The playlist the API reports, else the one we searched.
+        let replay_game_mode = replay
+            .playlist_id
+            .as_ref()
+            .map_or(game_mode, |playlist_id| {
+                GameMode::from_str(playlist_id).unwrap_or_else(|_| {
+                    warn!(
+                        "Invalid playlist_id: {playlist_id}, defaulting to {}",
+                        game_mode.as_api_string()
+                    );
+                    game_mode
+                })
+            });
+
+        let storage_rank = match extract_players_with_average_rank(id, &replay) {
+            Ok(calculation) => calculation.folder_rank,
+            Err(_) => rank,
+        };
+
+        let metadata = serde_json::to_value(&replay)?;
+        ids.push(id);
+        game_modes.push(replay_game_mode);
+        ranks.push(storage_rank);
+        metadata_values.push(metadata);
+    }
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let created = database::insert_replays(&ids, &game_modes, &ranks, &metadata_values).await?;
+    info!(
+        "Stored {created} new {} replays for rank {rank}",
+        game_mode.as_api_string()
+    );
+
+    // Extract and insert players for each new replay
+    let mut all_players = Vec::new();
+
+    for (replay_id, metadata) in ids.iter().zip(metadata_values.iter()) {
+        match extract_players_from_metadata(metadata) {
+            Ok(players) => {
+                for player in players {
+                    all_players.push(ReplayPlayer {
+                        id: 0,
+                        replay_id: *replay_id,
+                        player_name: player.player_name,
+                        team: player.team,
+                        rank_division: player.rank_division,
+                        rank_known: player.rank_known,
+                        created_at: Utc::now(),
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(
+                    replay_id = %replay_id,
+                    error = %e,
+                    "Failed to extract players from metadata"
+                );
+            }
+        }
+    }
+
+    if !all_players.is_empty() {
+        database::insert_replay_players(&all_players).await?;
+        info!(
+            "Inserted {} player records for {} replays",
+            all_players.len(),
+            ids.len()
+        );
+    }
+
+    Ok(created)
+}
+
+/// Downloads pending replays until the metadata fetch has finished and nothing is left.
+async fn download_all_replays(
+    client: Arc<BallchasingClient>,
+    fetch_finished: Arc<AtomicBool>,
+) -> Result<()> {
     info!("Starting replay downloads");
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
@@ -238,25 +334,9 @@ async fn download_all_replays(client: Arc<BallchasingClient>) -> Result<()> {
 
             let still_pending = database::list_pending_downloads(None, 1).await?;
 
-            if still_pending.is_empty() {
-                // Double-check all ranks are complete
-                let mut all_downloaded = true;
-                for rank in Rank::all_ranked() {
-                    let not_downloaded = database::count_replays_by_rank_and_status(
-                        rank,
-                        DownloadStatus::NotDownloaded,
-                    )
-                    .await?;
-                    if not_downloaded > 0 {
-                        all_downloaded = false;
-                        break;
-                    }
-                }
-
-                if all_downloaded {
-                    info!("All downloads complete");
-                    break;
-                }
+            if still_pending.is_empty() && fetch_finished.load(Ordering::SeqCst) {
+                info!("All downloads complete");
+                break;
             }
             continue;
         }
@@ -385,17 +465,32 @@ async fn log_download_progress() -> Result<()> {
     let mut total_pending = 0i64;
     let mut status = String::new();
 
-    for rank in Rank::all_ranked() {
-        let downloaded =
-            database::count_replays_by_rank_and_status(rank, DownloadStatus::Downloaded).await?;
-        let pending =
-            database::count_replays_by_rank_and_status(rank, DownloadStatus::NotDownloaded).await?;
+    for target in PLAYLIST_TARGETS {
+        for rank in Rank::all_ranked() {
+            let downloaded = database::count_replays_by_rank_and_status(
+                target.game_mode,
+                rank,
+                DownloadStatus::Downloaded,
+            )
+            .await?;
+            let pending = database::count_replays_by_rank_and_status(
+                target.game_mode,
+                rank,
+                DownloadStatus::NotDownloaded,
+            )
+            .await?;
 
-        total_downloaded += downloaded;
-        total_pending += pending;
+            total_downloaded += downloaded;
+            total_pending += pending;
 
-        if pending > 0 {
-            let _ = write!(status, " {}:{}/{}", rank, downloaded, downloaded + pending);
+            if pending > 0 {
+                let _ = write!(
+                    status,
+                    " {}/{rank}:{downloaded}/{}",
+                    target.game_mode.as_api_string(),
+                    downloaded + pending
+                );
+            }
         }
     }
 
@@ -415,30 +510,44 @@ async fn log_download_progress() -> Result<()> {
 async fn print_stats() -> Result<()> {
     info!(
         "{:<20} {:>12} {:>12} {:>12}",
-        "Rank", "Downloaded", "Failed", "Total"
+        "Playlist and rank", "Downloaded", "Failed", "Total"
     );
     info!("{}", "-".repeat(58));
 
     let mut grand_downloaded = 0i64;
     let mut grand_failed = 0i64;
 
-    for rank in Rank::all_ranked() {
-        let downloaded =
-            database::count_replays_by_rank_and_status(rank, DownloadStatus::Downloaded).await?;
-        let failed =
-            database::count_replays_by_rank_and_status(rank, DownloadStatus::Failed).await?;
-        let total = downloaded + failed;
+    for target in PLAYLIST_TARGETS {
+        for rank in Rank::all_ranked() {
+            let downloaded = database::count_replays_by_rank_and_status(
+                target.game_mode,
+                rank,
+                DownloadStatus::Downloaded,
+            )
+            .await?;
+            let failed = database::count_replays_by_rank_and_status(
+                target.game_mode,
+                rank,
+                DownloadStatus::Failed,
+            )
+            .await?;
+            let total = downloaded + failed;
 
-        info!(
-            "{:<20} {:>12} {:>12} {:>12}",
-            rank.as_api_string(),
-            downloaded,
-            failed,
-            total
-        );
+            info!(
+                "{:<20} {:>12} {:>12} {:>12}",
+                format!(
+                    "{} {}",
+                    target.game_mode.as_api_string(),
+                    rank.as_api_string()
+                ),
+                downloaded,
+                failed,
+                total
+            );
 
-        grand_downloaded += downloaded;
-        grand_failed += failed;
+            grand_downloaded += downloaded;
+            grand_failed += failed;
+        }
     }
 
     info!("{}", "-".repeat(58));

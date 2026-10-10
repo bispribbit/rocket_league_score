@@ -18,11 +18,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::coaching::CoachingTable;
+use crate::coaching::CoachingTables;
 use crate::model::{FrozenEnsemble, FrozenNode, TabularLayout, TabularSkillModel};
 
 /// File signature and format version.
-const MAGIC: &[u8; 8] = b"RLSKILL2";
+const MAGIC: &[u8; 8] = b"RLSKILL3";
 
 /// Largest quantised leaf magnitude.
 const LEAF_STEPS: f32 = 32767.0;
@@ -39,8 +39,8 @@ pub struct SkillModelBundle {
     /// Multiplier applied to a player's window-to-window form on the timeline so a typical
     /// swing reads as about one tier. Display only; never used for the verdict.
     pub timeline_emphasis: f32,
-    /// Per-tier reference stats for the "next rank" roast.
-    pub coaching: CoachingTable,
+    /// Per-tier reference stats for the "next rank" roast, per playlist size.
+    pub coaching: CoachingTables,
 }
 
 /// Why a bundle could not be decoded.
@@ -110,7 +110,7 @@ struct BundleHeader {
     window_model: ModelHeader,
     window_seconds: f32,
     timeline_emphasis: f32,
-    coaching: CoachingTable,
+    coaching: CoachingTables,
 }
 
 impl ModelHeader {
@@ -672,7 +672,7 @@ mod tests {
             window_model: model(800.0),
             window_seconds: 60.0,
             timeline_emphasis: 5.0,
-            coaching: CoachingTable::default(),
+            coaching: CoachingTables::default(),
         }
     }
 

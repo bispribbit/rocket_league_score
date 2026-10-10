@@ -18,7 +18,8 @@ Everything runs in the browser in a fraction of a second; there is no neural net
 ### 1. Per-player stats (`crates/feature_extractor`)
 
 `compute_player_match_stats` reads every live frame (goal replays skipped) and summarises each
-player in **71 numbers**, all measured from that player's own side of the field:
+player in **71 numbers**, all measured from that player's own side of the field, plus the
+playlist's team size (`players_per_team`, see [Playlists](#playlists)):
 
 - **movement** — speed, supersonic / slow time, ground / air / wall time, jumps
 - **boost** — average, time empty or full, pads per minute, boosting while supersonic
@@ -66,6 +67,44 @@ their tier to the target tier, and (b) show a gap a reader would notice ("0 % vs
 qualifies). A tip is disabled automatically if the data says its "better" direction is wrong.
 Lines and tips live in code; editing them needs no retraining.
 
+## Playlists
+
+One model scores **duels, doubles and standard**, ranked or casual.
+
+- **Team size is a stat.** Every player carries `players_per_team` (1, 2 or 3), so the trees
+  can treat a duel's 30 touches a minute differently from a standard game's 10, while
+  mechanics and positioning learned from the larger 3v3 set carry over.
+- **Labels share one scale.** A label is the division's middle on the 3v3 MMR scale, so the
+  model predicts a *rank*, and "Platinum II" means Platinum II in the replay's own playlist.
+- **Casual** replays are scored as the competitive playlist of the same size. Players can
+  join and leave mid-match, so the roster has [`SLOTS_PER_TEAM`] = 5 slots per team; players
+  with under 30 s of live play (`MINIMUM_MATCH_SECONDS`) are not scored and do not count
+  towards the lobby, in training and in the app alike.
+- **Roasts** use one coaching table per playlist size: the next rank up in duels does
+  different things than in standard.
+
+### How much data each playlist needs
+
+The 3v3 download target (1,200 per rank, ~27k replays) was sized for the LSTM. The
+`learning_curve` binary trains the match model on growing prefixes of the 3v3 training
+replays and scores each on the full evaluation split:
+
+| Training replays | player RMSE | lobby RMSE | within_r |
+|---|---|---|---|
+| 1,000 | 129 | 118 | 0.39 |
+| 2,000 | 122 | 111 | 0.44 |
+| 4,000 | 117 | 105 | 0.48 |
+| 8,000 | 112 | 100 | 0.50 |
+| 16,000 | 110 | 98 | 0.52 |
+| 24,450 | 107 | 95 | 0.52 |
+
+Past ~8,000 replays each doubling buys 2–3 MMR, and duels and doubles also borrow from the
+3v3 data, so they target **350 replays per rank** (~7,700 per playlist). Simulating doubles by
+keeping two players per team gives the same shape. Ballchasing allows ~200 replay downloads
+an hour, so the two playlists take about three days to download.
+
+[`SLOTS_PER_TEAM`]: ../crates/feature_extractor/src/lib.rs
+
 ## Bundle format
 
 `crates/skill_model/src/encoding.rs`. ~500k tree nodes dominate the size, so each ensemble is
@@ -88,8 +127,11 @@ brotli *decoder*; the encoder is behind `skill_model`'s `encode` feature, used b
 # Parse every downloaded replay into data/match_stats.csv and data/window_stats.csv (~5 min)
 cargo run --release -p skill_model_training --bin extract_stats
 
-# Train both models, build the roast table, write and verify data/skill_model.bin (~15 min)
+# Train both models, build the roast tables, write and verify data/skill_model.bin (~15 min)
 cargo run --release -p skill_model_training --bin train
+
+# How accuracy grows with data (optionally --players-per-team 1|2, --keep-players-per-team)
+cargo run --release -p skill_model_training --bin learning_curve
 
 # Only iterate on roast lines (no retraining)
 cargo run --release -p skill_model_training --bin train -- --reuse-bundle

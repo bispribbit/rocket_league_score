@@ -16,7 +16,7 @@ pub mod coaching;
 mod encoding;
 mod model;
 
-pub use analysis::{MINIMUM_WINDOW_SECONDS, MatchAnalysis, PlayerTimeline};
+pub use analysis::{MINIMUM_MATCH_SECONDS, MINIMUM_WINDOW_SECONDS, MatchAnalysis, PlayerTimeline};
 pub use encoding::{BundleDecodeError, BundleEncodeError, SkillModelBundle};
 pub use model::{FrozenEnsemble, FrozenNode, LobbySummary, TabularLayout, TabularSkillModel};
 

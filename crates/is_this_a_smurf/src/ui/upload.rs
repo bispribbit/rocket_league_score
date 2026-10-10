@@ -133,7 +133,7 @@ pub(crate) fn UploadPage(
                     span { class: "text-blue-400", ".replay" }
                     " anywhere"
                 }
-                p { class: "text-gray-500 text-sm mt-1", "Ranked 3v3 Rocket League replay file" }
+                p { class: "text-gray-500 text-sm mt-1", "1v1, 2v2 or 3v3 Rocket League replay, ranked or casual" }
 
                 input {
                     id: "replay-file-input",
@@ -311,6 +311,7 @@ pub(super) async fn run_pipeline(
         goals: build_goal_markers(&parsed, &players.names),
         player_names: players.names.clone(),
         player_teams: players.teams.clone(),
+        player_slots: players.slots.clone(),
         num_segments: segment_steps.len(),
     });
     publish(
@@ -335,6 +336,6 @@ pub(super) async fn run_pipeline(
     // ---- Cards and verdict.
     publish(
         progress_after_model(segment_steps, timeline),
-        Some(build_prediction_results(&analysis)),
+        Some(build_prediction_results(&analysis, parsed.match_format)),
     );
 }

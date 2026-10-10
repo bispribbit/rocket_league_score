@@ -7,8 +7,8 @@
 //!
 //! The shipped model (see `docs/model.md`). It is deliberately free of `burn` and of any training code so it runs unchanged in the WASM
 //! app: a match is parsed, [`feature_extractor::compute_player_match_stats`] summarises
-//! each player, and [`TabularSkillModel::predict`] turns the six summaries into six MMR
-//! estimates.
+//! each player, and [`TabularSkillModel::predict`] turns the summaries into one MMR
+//! estimate per player.
 //!
 //! Two ensembles are combined:
 //!
@@ -17,9 +17,9 @@
 //! * the **within** model predicts each player's deviation from the lobby's mean label
 //!   from deviation and lobby-mean stats — centred on the lobby, it orders the players.
 //!
-//! Prediction = lobby level + `deviation_scale` × centred deviation.
+//! Prediction = lobby level + `deviation_scale` × centred deviation, floored at 0 MMR.
 
-use feature_extractor::{MATCH_STAT_COUNT, PLAYERS_PER_TEAM, PlayerMatchStats, TOTAL_PLAYERS};
+use feature_extractor::{MATCH_STAT_COUNT, PlayerMatchStats, SLOTS_PER_TEAM, TOTAL_SLOTS};
 use serde::{Deserialize, Serialize};
 
 /// Index of `goals` in [`feature_extractor::MATCH_STAT_NAMES`], used for team goal difference.
@@ -114,9 +114,9 @@ pub struct LobbySummary {
 }
 
 impl LobbySummary {
-    /// Summarises the present players of one lobby. Slots `0..3` are blue, `3..6` orange.
+    /// Summarises the present players of one lobby (blue slots first, then orange).
     #[must_use]
-    pub fn new(players: &[Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_PLAYERS]) -> Self {
+    pub fn new(players: &[Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_SLOTS]) -> Self {
         let mut mean = [0.0; MATCH_STAT_COUNT];
         let mut team_mean = [[0.0; MATCH_STAT_COUNT]; 2];
         let mut team_goals = [0.0; 2];
@@ -125,7 +125,7 @@ impl LobbySummary {
             let members: Vec<&[f32; MATCH_STAT_COUNT]> = players
                 .iter()
                 .enumerate()
-                .filter(|(slot, _)| usize::from(*slot >= PLAYERS_PER_TEAM) == team)
+                .filter(|(slot, _)| usize::from(*slot >= SLOTS_PER_TEAM) == team)
                 .filter_map(|(_, stats)| *stats)
                 .collect();
             for member in &members {
@@ -167,7 +167,7 @@ impl TabularLayout {
             }
         }
         if self.team_context {
-            let team = usize::from(slot >= PLAYERS_PER_TEAM);
+            let team = usize::from(slot >= SLOTS_PER_TEAM);
             let own_team = &lobby.team_mean[team];
             let opponents = &lobby.team_mean[1 - team];
             for &stat in &self.stats {
@@ -245,11 +245,11 @@ impl TabularSkillModel {
     #[must_use]
     pub fn predict_stats(
         &self,
-        players: &[Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_PLAYERS],
-    ) -> [Option<f32>; TOTAL_PLAYERS] {
+        players: &[Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_SLOTS],
+    ) -> [Option<f32>; TOTAL_SLOTS] {
         let lobby = LobbySummary::new(players);
-        let mut absolute = [None; TOTAL_PLAYERS];
-        let mut deviation = [None; TOTAL_PLAYERS];
+        let mut absolute = [None; TOTAL_SLOTS];
+        let mut deviation = [None; TOTAL_SLOTS];
         let mut row = Vec::new();
         for (slot, stats) in players.iter().enumerate() {
             let Some(stats) = stats else {
@@ -268,7 +268,12 @@ impl TabularSkillModel {
         let level = absolute.iter().flatten().sum::<f32>() / present;
         let mean_deviation = deviation.iter().flatten().sum::<f32>() / present;
         core::array::from_fn(|slot| {
-            deviation[slot].map(|value| self.deviation_scale.mul_add(value - mean_deviation, level))
+            // Ranks start at 0 MMR (Bronze I); a low lobby plus a negative gap can dip below.
+            deviation[slot].map(|value| {
+                self.deviation_scale
+                    .mul_add(value - mean_deviation, level)
+                    .max(0.0)
+            })
         })
     }
 
@@ -276,9 +281,9 @@ impl TabularSkillModel {
     #[must_use]
     pub fn predict(
         &self,
-        players: &[Option<PlayerMatchStats>; TOTAL_PLAYERS],
-    ) -> [Option<f32>; TOTAL_PLAYERS] {
-        let values: [Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_PLAYERS] =
+        players: &[Option<PlayerMatchStats>; TOTAL_SLOTS],
+    ) -> [Option<f32>; TOTAL_SLOTS] {
+        let values: [Option<&[f32; MATCH_STAT_COUNT]>; TOTAL_SLOTS] =
             core::array::from_fn(|slot| players[slot].as_ref().map(|stats| &stats.values));
         self.predict_stats(&values)
     }
@@ -347,7 +352,11 @@ mod tests {
         let mut high = [0.0; MATCH_STAT_COUNT];
         low[0] = 0.0;
         high[0] = 1.0;
-        let players = [Some(&low), Some(&high), Some(&low), Some(&high), None, None];
+        let mut players = [None; TOTAL_SLOTS];
+        players[0] = Some(&low);
+        players[1] = Some(&high);
+        players[SLOTS_PER_TEAM] = Some(&low);
+        players[SLOTS_PER_TEAM + 1] = Some(&high);
         let predictions = model.predict_stats(&players);
         let present: Vec<f32> = predictions.iter().flatten().copied().collect();
         assert_eq!(present.len(), 4);

@@ -42,10 +42,11 @@ pub fn stable_replay_hash(replay_id: Uuid) -> u64 {
     hash ^ (hash >> 33)
 }
 
-/// Minimum rank-known players for a lobby to contribute to within-lobby metrics.
+/// Minimum rank-known players for a standard lobby to contribute to within-lobby metrics.
 ///
 /// With fewer, the lobby mean is dominated by one or two players and the deviations are
-/// mostly the mirror image of each other.
+/// mostly the mirror image of each other. Smaller playlists use
+/// [`compute_lobby_metrics_with_minimum`] with their full lobby size.
 pub const MINIMUM_PLAYERS_PER_LOBBY: usize = 4;
 
 /// Pairs whose labels sit closer than this are skipped by [`LobbyMetrics::concordance`].
@@ -161,7 +162,10 @@ impl PairSums {
     }
 }
 
-fn centre_lobbies(predictions: &[PlayerPrediction]) -> Vec<CentredLobby> {
+fn centre_lobbies(
+    predictions: &[PlayerPrediction],
+    minimum_players_per_lobby: usize,
+) -> Vec<CentredLobby> {
     let mut by_replay: HashMap<Uuid, Vec<PlayerPrediction>> = HashMap::new();
     for prediction in predictions {
         if prediction.target_mmr > 0.0 {
@@ -180,7 +184,7 @@ fn centre_lobbies(predictions: &[PlayerPrediction]) -> Vec<CentredLobby> {
         let Some(mut players) = by_replay.remove(&replay_id) else {
             continue;
         };
-        if players.len() < MINIMUM_PLAYERS_PER_LOBBY {
+        if players.len() < minimum_players_per_lobby {
             continue;
         }
         players.sort_by_key(|player| player.slot);
@@ -248,10 +252,20 @@ fn bootstrap_standard_error(lobbies: &[CentredLobby]) -> f64 {
     variance.sqrt()
 }
 
-/// Scores a set of whole-match predictions.
+/// Scores a set of whole-match predictions from standard lobbies.
 #[must_use]
 pub fn compute_lobby_metrics(predictions: &[PlayerPrediction]) -> LobbyMetrics {
-    let lobbies = centre_lobbies(predictions);
+    compute_lobby_metrics_with_minimum(predictions, MINIMUM_PLAYERS_PER_LOBBY)
+}
+
+/// Scores a set of whole-match predictions, keeping lobbies with at least
+/// `minimum_players_per_lobby` rank-known players.
+#[must_use]
+pub fn compute_lobby_metrics_with_minimum(
+    predictions: &[PlayerPrediction],
+    minimum_players_per_lobby: usize,
+) -> LobbyMetrics {
+    let lobbies = centre_lobbies(predictions, minimum_players_per_lobby);
     if lobbies.is_empty() {
         return LobbyMetrics::default();
     }

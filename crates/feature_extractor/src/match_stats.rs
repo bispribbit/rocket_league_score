@@ -2,7 +2,7 @@
 //!
 //! These are the inputs of the skill model (see `docs/model.md`): 71 hand-written stats per
 //! player, covering movement, boost, positioning, ball control, mechanics, the scoreboard
-//! and situational positioning.
+//! and situational positioning, plus the playlist's team size.
 //!
 //! Everything positional is measured in the **team-canonical frame** (own goal at `−y`),
 //! so a blue and an orange player doing the same thing get the same numbers. Time-based
@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use replay_structs::{ParsedReplay, Quaternion, Vector3};
 
-use crate::{PLAYERS_PER_TEAM, PlayerRoster, TOTAL_PLAYERS, build_goal_replay_excluded_set};
+use crate::{PlayerRoster, SLOTS_PER_TEAM, TOTAL_SLOTS, build_goal_replay_excluded_set};
 
 /// Names of the stats in [`PlayerMatchStats::values`] order.
 pub const MATCH_STAT_NAMES: [&str; MATCH_STAT_COUNT] = [
@@ -89,10 +89,15 @@ pub const MATCH_STAT_NAMES: [&str; MATCH_STAT_COUNT] = [
     "shadow_defense_fraction",
     "support_spacing_fraction",
     "goal_side_after_touch_fraction",
+    "players_per_team",
 ];
 
 /// Number of stats per player.
-pub const MATCH_STAT_COUNT: usize = 71;
+pub const MATCH_STAT_COUNT: usize = 72;
+
+/// Index of `players_per_team` in [`MATCH_STAT_NAMES`]: the playlist's team size (1, 2 or
+/// 3), the same for every player. It lets one model serve duels, doubles and standard.
+pub const PLAYERS_PER_TEAM_STAT: usize = 71;
 
 /// One player's stats over one match, in [`MATCH_STAT_NAMES`] order.
 #[derive(Debug, Clone, PartialEq)]
@@ -254,7 +259,7 @@ struct LiveCar {
 pub fn compute_player_match_stats(
     parsed: &ParsedReplay,
     roster: &PlayerRoster,
-) -> [Option<PlayerMatchStats>; TOTAL_PLAYERS] {
+) -> [Option<PlayerMatchStats>; TOTAL_SLOTS] {
     compute_player_window_stats(parsed, roster, 0..parsed.frames.len())
 }
 
@@ -268,7 +273,7 @@ pub fn compute_player_window_stats(
     parsed: &ParsedReplay,
     roster: &PlayerRoster,
     frames: Range<usize>,
-) -> [Option<PlayerMatchStats>; TOTAL_PLAYERS] {
+) -> [Option<PlayerMatchStats>; TOTAL_SLOTS] {
     let whole_match = frames.start == 0 && frames.end >= parsed.frames.len();
     let slot_by_name: HashMap<&str, usize> = roster
         .names
@@ -279,14 +284,13 @@ pub fn compute_player_window_stats(
         .collect();
     let excluded = build_goal_replay_excluded_set(&parsed.goal_frames, &parsed.kickoff_frames);
 
-    let mut accumulators: [Accumulator; TOTAL_PLAYERS] =
+    let mut accumulators: [Accumulator; TOTAL_SLOTS] =
         core::array::from_fn(|_| Accumulator::default());
-    let mut previous: [PreviousCarState; TOTAL_PLAYERS] =
-        [PreviousCarState::default(); TOTAL_PLAYERS];
+    let mut previous: [PreviousCarState; TOTAL_SLOTS] = [PreviousCarState::default(); TOTAL_SLOTS];
     let mut previous_ball_velocity: Option<Vector3> = None;
     let mut last_demolition_time: HashMap<i32, f32> = HashMap::new();
     // Time of each player's last touch while waiting to see them get back goal-side.
-    let mut pending_recovery: [Option<f32>; TOTAL_PLAYERS] = [None; TOTAL_PLAYERS];
+    let mut pending_recovery: [Option<f32>; TOTAL_SLOTS] = [None; TOTAL_SLOTS];
 
     for goal in parsed
         .goals
@@ -309,13 +313,13 @@ pub fn compute_player_window_stats(
     {
         if excluded.contains(&frame_index) {
             previous_ball_velocity = None;
-            previous = [PreviousCarState::default(); TOTAL_PLAYERS];
+            previous = [PreviousCarState::default(); TOTAL_SLOTS];
             continue;
         }
         let seconds = f64::from(frame.delta.clamp(0.0, MAXIMUM_FRAME_SECONDS));
         let ball = &frame.ball;
 
-        let mut live_cars: Vec<LiveCar> = Vec::with_capacity(TOTAL_PLAYERS);
+        let mut live_cars: Vec<LiveCar> = Vec::with_capacity(TOTAL_SLOTS);
         for player in &frame.players {
             let Some(&slot) = slot_by_name.get(player.name.as_str()) else {
                 continue;
@@ -543,7 +547,7 @@ pub fn compute_player_window_stats(
                     && closest.distance_to_ball < TOUCH_MAXIMUM_DISTANCE
                     && let Some(accumulator) = accumulators.get_mut(closest.slot)
                 {
-                    let sign = if closest.slot < PLAYERS_PER_TEAM {
+                    let sign = if closest.slot < SLOTS_PER_TEAM {
                         1.0
                     } else {
                         -1.0
@@ -577,9 +581,14 @@ pub fn compute_player_window_stats(
             .get(slot)
             .and_then(|name| scoreboard_by_name.get(name.as_str()))
             .copied();
-        accumulators
-            .get(slot)
-            .and_then(|accumulator| finish(accumulator, scoreboard, kickoff_count))
+        accumulators.get(slot).and_then(|accumulator| {
+            finish(
+                accumulator,
+                scoreboard,
+                kickoff_count,
+                parsed.match_format.players_per_team,
+            )
+        })
     })
 }
 
@@ -685,7 +694,7 @@ const SUPPORT_MAXIMUM_DISTANCE: f32 = 3000.0;
 
 /// `+1` for blue slots, `−1` for orange: multiplies y into the team-canonical frame.
 const fn team_sign(slot: usize) -> f32 {
-    if slot < PLAYERS_PER_TEAM { 1.0 } else { -1.0 }
+    if slot < SLOTS_PER_TEAM { 1.0 } else { -1.0 }
 }
 
 /// Positioning judged against the situation rather than as raw occupancy.
@@ -693,16 +702,16 @@ const fn team_sign(slot: usize) -> f32 {
 /// "Defending" means the ball is in the player's own half. The possessor is the car
 /// closest to the ball over all six players.
 fn accumulate_situational(
-    accumulators: &mut [Accumulator; TOTAL_PLAYERS],
+    accumulators: &mut [Accumulator; TOTAL_SLOTS],
     live_cars: &[LiveCar],
     ball_y: f32,
     possessor: Option<&LiveCar>,
     seconds: f64,
 ) {
-    for team_start in [0, PLAYERS_PER_TEAM] {
+    for team_start in [0, SLOTS_PER_TEAM] {
         let team: Vec<&LiveCar> = live_cars
             .iter()
-            .filter(|car| (team_start..team_start + PLAYERS_PER_TEAM).contains(&car.slot))
+            .filter(|car| (team_start..team_start + SLOTS_PER_TEAM).contains(&car.slot))
             .collect();
         let Some(first) = team.first() else {
             continue;
@@ -720,7 +729,7 @@ fn accumulate_situational(
             .map(|car| car.slot);
         let possessor_slot = possessor.map(|car| car.slot);
         let opponents_have_ball = possessor_slot
-            .is_some_and(|slot| !(team_start..team_start + PLAYERS_PER_TEAM).contains(&slot));
+            .is_some_and(|slot| !(team_start..team_start + SLOTS_PER_TEAM).contains(&slot));
         let own_goal = Vector3 {
             x: 0.0,
             y: -sign * 5120.0,
@@ -755,7 +764,7 @@ fn accumulate_situational(
                 accumulator.overcommit += seconds;
             }
             let teammate_has_ball = possessor_slot.is_some_and(|slot| {
-                slot != car.slot && (team_start..team_start + PLAYERS_PER_TEAM).contains(&slot)
+                slot != car.slot && (team_start..team_start + SLOTS_PER_TEAM).contains(&slot)
             });
             if teammate_has_ball {
                 accumulator.teammate_possession += seconds;
@@ -771,14 +780,14 @@ fn accumulate_situational(
 
 /// Credits time spent double-committing: two or more teammates near the ball at once.
 fn accumulate_double_commits(
-    accumulators: &mut [Accumulator; TOTAL_PLAYERS],
+    accumulators: &mut [Accumulator; TOTAL_SLOTS],
     live_cars: &[LiveCar],
     seconds: f64,
 ) {
-    for team_start in [0, PLAYERS_PER_TEAM] {
+    for team_start in [0, SLOTS_PER_TEAM] {
         let committed: Vec<usize> = live_cars
             .iter()
-            .filter(|car| (team_start..team_start + PLAYERS_PER_TEAM).contains(&car.slot))
+            .filter(|car| (team_start..team_start + SLOTS_PER_TEAM).contains(&car.slot))
             .filter(|car| car.distance_to_ball < DOUBLE_COMMIT_DISTANCE)
             .map(|car| car.slot)
             .collect();
@@ -795,7 +804,7 @@ fn accumulate_double_commits(
 /// For every kickoff: who touched the ball first, and whether the ball was on the
 /// opponents' side [`KICKOFF_OUTCOME_SECONDS`] later. Returns the number of kickoffs seen.
 fn accumulate_kickoffs(
-    accumulators: &mut [Accumulator; TOTAL_PLAYERS],
+    accumulators: &mut [Accumulator; TOTAL_SLOTS],
     parsed: &ParsedReplay,
     slot_by_name: &HashMap<&str, usize>,
     frames: &Range<usize>,
@@ -854,14 +863,14 @@ fn accumulate_kickoffs(
 
 /// Per-frame team roles: closest to ball, last back, most forward, nearest-teammate spacing.
 fn accumulate_team_roles(
-    accumulators: &mut [Accumulator; TOTAL_PLAYERS],
+    accumulators: &mut [Accumulator; TOTAL_SLOTS],
     live_cars: &[LiveCar],
     seconds: f64,
 ) {
-    for team_start in [0, PLAYERS_PER_TEAM] {
+    for team_start in [0, SLOTS_PER_TEAM] {
         let team: Vec<&LiveCar> = live_cars
             .iter()
-            .filter(|car| (team_start..team_start + PLAYERS_PER_TEAM).contains(&car.slot))
+            .filter(|car| (team_start..team_start + SLOTS_PER_TEAM).contains(&car.slot))
             .collect();
         if team.len() < 2 {
             continue;
@@ -909,6 +918,7 @@ fn finish(
     accumulator: &Accumulator,
     scoreboard: Option<&replay_structs::HeaderPlayerStats>,
     kickoff_count: u32,
+    players_per_team: usize,
 ) -> Option<PlayerMatchStats> {
     if accumulator.seconds <= 0.0 {
         return None;
@@ -1060,6 +1070,7 @@ fn finish(
             f64::from(accumulator.recovered_goal_side),
             f64::from(accumulator.recovery_touches),
         ),
+        players_per_team as f32,
     ];
     Some(PlayerMatchStats {
         values,
@@ -1102,8 +1113,12 @@ mod tests {
 
     fn roster() -> PlayerRoster {
         PlayerRoster {
-            names: core::array::from_fn(|slot| {
-                ["b0", "b1", "b2", "o0", "o1", "o2"][slot].to_string()
+            names: core::array::from_fn(|slot| match slot {
+                0..3 => format!("b{slot}"),
+                _ if (SLOTS_PER_TEAM..SLOTS_PER_TEAM + 3).contains(&slot) => {
+                    format!("o{}", slot - SLOTS_PER_TEAM)
+                }
+                _ => String::new(),
             }),
         }
     }
@@ -1144,7 +1159,7 @@ mod tests {
         let blue = stats[0]
             .as_ref()
             .map_or([0.0; MATCH_STAT_COUNT], |s| s.values);
-        let orange = stats[3]
+        let orange = stats[SLOTS_PER_TEAM]
             .as_ref()
             .map_or([0.0; MATCH_STAT_COUNT], |s| s.values);
         let defensive = index_of("defensive_third_fraction");
@@ -1167,7 +1182,14 @@ mod tests {
             ..ParsedReplay::default()
         };
         let stats = compute_player_match_stats(&parsed, &roster());
-        assert!(stats.iter().all(Option::is_some));
+        let roster = roster();
+        for (slot, name) in roster.names.iter().enumerate() {
+            assert_eq!(stats[slot].is_some(), !name.is_empty(), "slot {slot}");
+        }
+        let players_per_team = stats[0]
+            .as_ref()
+            .map_or(0.0, |s| s.values[PLAYERS_PER_TEAM_STAT]);
+        assert!((players_per_team - 3.0).abs() < f32::EPSILON);
     }
 
     /// A big pad pickup is counted once and the boost gain is recorded.
@@ -1356,8 +1378,12 @@ mod situational_tests {
             ..ParsedReplay::default()
         };
         let roster = PlayerRoster {
-            names: core::array::from_fn(|slot| {
-                ["b0", "b1", "b2", "o0", "o1", "o2"][slot].to_string()
+            names: core::array::from_fn(|slot| match slot {
+                0..3 => format!("b{slot}"),
+                _ if (SLOTS_PER_TEAM..SLOTS_PER_TEAM + 3).contains(&slot) => {
+                    format!("o{}", slot - SLOTS_PER_TEAM)
+                }
+                _ => String::new(),
             }),
         };
         let stats = compute_player_match_stats(&parsed, &roster);
@@ -1376,6 +1402,6 @@ mod situational_tests {
         assert!((stat(&values(2), "overcommit_fraction") - 1.0).abs() < 1e-6);
         assert!((stat(&values(0), "overcommit_fraction")).abs() < 1e-6);
         // Orange is attacking, not defending.
-        assert!((stat(&values(3), "goal_side_when_defending_fraction")).abs() < 1e-6);
+        assert!((stat(&values(SLOTS_PER_TEAM), "goal_side_when_defending_fraction")).abs() < 1e-6);
     }
 }

@@ -2,8 +2,7 @@
 
 //! Per-player match statistics from parsed Rocket League replays.
 //!
-//! [`compute_player_match_stats`] summarises how each of the six players played a whole
-//! match (movement, boost, positioning, ball control, mechanics, scoreboard…), and
+//! [`compute_player_match_stats`] summarises how each player played a whole match (movement, boost, positioning, ball control, mechanics, scoreboard…), and
 //! [`compute_player_window_stats`] does the same for a slice of it. These summaries are the
 //! inputs of the skill model (`skill_model`).
 
@@ -13,14 +12,15 @@ use replay_structs::{ParsedReplay, Team};
 
 mod match_stats;
 pub use match_stats::{
-    MATCH_STAT_COUNT, MATCH_STAT_NAMES, PlayerMatchStats, compute_player_match_stats,
-    compute_player_window_stats, goal_windows, time_windows,
+    MATCH_STAT_COUNT, MATCH_STAT_NAMES, PLAYERS_PER_TEAM_STAT, PlayerMatchStats,
+    compute_player_match_stats, compute_player_window_stats, goal_windows, time_windows,
 };
 
-/// Number of players per team in a 3v3 match.
-pub const PLAYERS_PER_TEAM: usize = 3;
-/// Number of players in a 3v3 match.
-pub const TOTAL_PLAYERS: usize = PLAYERS_PER_TEAM * 2;
+/// Roster slots per team. Above the largest team size (3) because casual lobbies replace
+/// players who leave, so one team can field more distinct players over a match.
+pub const SLOTS_PER_TEAM: usize = 5;
+/// Roster slots in a match: blue slots first, then orange.
+pub const TOTAL_SLOTS: usize = SLOTS_PER_TEAM * 2;
 
 /// How a name was seen in a replay.
 #[derive(Debug, Clone, Default)]
@@ -48,14 +48,15 @@ fn is_placeholder_name(name: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Canonical ordered roster for a 3v3 match.
+/// Canonical ordered roster.
 ///
-/// Slots 0–2 hold the blue team sorted alphabetically by player name; slots 3–5 hold the
-/// orange team sorted the same way. Empty strings mark unused slots.
+/// The first [`SLOTS_PER_TEAM`] slots hold the blue team sorted alphabetically by player
+/// name; the next ones hold the orange team sorted the same way. Empty strings mark unused
+/// slots (a duel uses one slot per team).
 #[derive(Debug, Clone)]
 pub struct PlayerRoster {
-    /// Six names: `[blue_0, blue_1, blue_2, orange_0, orange_1, orange_2]`.
-    pub names: [String; TOTAL_PLAYERS],
+    /// Blue names, then orange names.
+    pub names: [String; TOTAL_SLOTS],
 }
 
 impl PlayerRoster {
@@ -65,8 +66,9 @@ impl PlayerRoster {
     /// quit early, and the per-frame team attribute flips back and forth in some replays.
     /// So every real name from either source is a candidate; the header decides the team
     /// when it lists the player, otherwise the team the player is seen on most (a full lobby
-    /// without header teams is split 3/3 by how often each name is seen on blue). Each team
-    /// keeps the three players seen in the most frames.
+    /// without header teams is split evenly by how often each name is seen on blue). Each
+    /// team keeps up to [`SLOTS_PER_TEAM`] players, header-listed first, then by time on the
+    /// pitch.
     #[must_use]
     pub fn from_parsed(parsed: &ParsedReplay) -> Self {
         let mut by_name: BTreeMap<String, Sightings> = BTreeMap::new();
@@ -105,10 +107,11 @@ impl PlayerRoster {
         let no_header_teams = candidates.iter().all(|s| s.header_team.is_none());
         let mut blue: Vec<Sightings> = Vec::new();
         let mut orange: Vec<Sightings> = Vec::new();
-        if no_header_teams && candidates.len() == TOTAL_PLAYERS {
+        let players_per_team = parsed.match_format.players_per_team;
+        if no_header_teams && candidates.len() == players_per_team * 2 {
             candidates.sort_by(|a, b| b.blue_share().total_cmp(&a.blue_share()));
             for (index, sightings) in candidates.into_iter().enumerate() {
-                if index < PLAYERS_PER_TEAM {
+                if index < players_per_team {
                     blue.push(sightings);
                 } else {
                     orange.push(sightings);
@@ -129,7 +132,7 @@ impl PlayerRoster {
                 }
             }
         }
-        let keep_three = |mut team: Vec<Sightings>| -> Vec<String> {
+        let keep_team = |mut team: Vec<Sightings>| -> Vec<String> {
             // Header-listed players first, then by time on the pitch.
             team.sort_by(|a, b| {
                 b.header_team
@@ -139,21 +142,21 @@ impl PlayerRoster {
             });
             let mut names: Vec<String> = team
                 .into_iter()
-                .take(PLAYERS_PER_TEAM)
+                .take(SLOTS_PER_TEAM)
                 .map(|s| s.name)
                 .collect();
             names.sort();
             names
         };
-        let blue = keep_three(blue);
-        let orange = keep_three(orange);
+        let blue = keep_team(blue);
+        let orange = keep_team(orange);
         Self {
             names: core::array::from_fn(|slot| {
-                if slot < PLAYERS_PER_TEAM {
+                if slot < SLOTS_PER_TEAM {
                     blue.get(slot).cloned().unwrap_or_default()
                 } else {
                     orange
-                        .get(slot - PLAYERS_PER_TEAM)
+                        .get(slot - SLOTS_PER_TEAM)
                         .cloned()
                         .unwrap_or_default()
                 }
@@ -185,7 +188,67 @@ fn build_goal_replay_excluded_set(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use replay_structs::{GameFrame, HeaderPlayerStats, MatchFormat, PlayerState};
+
     use super::*;
+
+    fn player(name: &str, team: Team) -> PlayerState {
+        PlayerState {
+            actor_id: 0,
+            name: Arc::new(name.to_string()),
+            team,
+            actor_state: replay_structs::ActorState::default(),
+        }
+    }
+
+    /// A casual 3v3 where one blue player left and two others took the seat in turn: blue
+    /// fields four distinct players over the match, and all four get a slot.
+    #[test]
+    fn casual_roster_keeps_replacement_players() {
+        let blue = ["leaver", "stayer_one", "stayer_two", "joiner"];
+        let orange = ["orange_one", "orange_two", "orange_three"];
+        let frame = GameFrame {
+            players: blue
+                .iter()
+                .map(|name| player(name, Team::Blue))
+                .chain(orange.iter().map(|name| player(name, Team::Orange)))
+                .collect(),
+            ..GameFrame::default()
+        };
+        let parsed = ParsedReplay {
+            frames: vec![frame; 10],
+            header_player_stats: orange
+                .iter()
+                .map(|name| HeaderPlayerStats {
+                    name: (*name).to_string(),
+                    team: Some(Team::Orange),
+                    ..HeaderPlayerStats::default()
+                })
+                .collect(),
+            match_format: MatchFormat {
+                players_per_team: 3,
+                ranked: false,
+            },
+            ..ParsedReplay::default()
+        };
+        let roster = PlayerRoster::from_parsed(&parsed);
+        let blue_slots: Vec<&str> = roster.names[..SLOTS_PER_TEAM]
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(blue_slots.len(), 4);
+        for name in blue {
+            assert!(blue_slots.contains(&name), "{name} lost its slot");
+        }
+        let orange_slots = roster.names[SLOTS_PER_TEAM..]
+            .iter()
+            .filter(|name| !name.is_empty())
+            .count();
+        assert_eq!(orange_slots, 3);
+    }
 
     #[test]
     fn goal_replay_runs_until_the_next_kickoff() {

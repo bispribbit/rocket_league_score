@@ -14,13 +14,36 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
-    fn sample_replays() -> Vec<PathBuf> {
+    /// A sample replay and its playlist size.
+    struct SampleReplay {
+        path: PathBuf,
+        players_per_team: usize,
+    }
+
+    fn sample_replays() -> Vec<SampleReplay> {
         let root = repository_root();
-        let mut replays = vec![root.join("test_data/2af51380-05b5-44ac-8b31-94b8b0f8da84.replay")];
+        let test_data = |name: &str, players_per_team: usize| SampleReplay {
+            path: root.join("test_data").join(name),
+            players_per_team,
+        };
+        let mut replays = vec![
+            test_data("2af51380-05b5-44ac-8b31-94b8b0f8da84.replay", 3),
+            test_data(
+                "ranked-doubles-f5650747-1fd4-40cb-a037-7dfaf166bd6d.replay",
+                2,
+            ),
+            test_data(
+                "ranked-duels-a9feb907-75e9-4514-b52f-44766e0374f1.replay",
+                1,
+            ),
+        ];
         if let Ok(entries) = std::fs::read_dir(root.join("data/smurf")) {
             let mut smurfs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
             smurfs.sort();
-            replays.extend(smurfs);
+            replays.extend(smurfs.into_iter().map(|path| SampleReplay {
+                path,
+                players_per_team: 3,
+            }));
         }
         replays
     }
@@ -35,10 +58,21 @@ mod tests {
             "bundle is stale: retrain"
         );
 
-        for path in sample_replays() {
+        for SampleReplay {
+            path,
+            players_per_team,
+        } in sample_replays()
+        {
             let replay = std::fs::read(&path).expect("sample replay is readable");
             let parsed =
                 replay_parser::parse_replay_from_bytes(&replay).expect("sample replay parses");
+            assert_eq!(
+                parsed.match_format.players_per_team,
+                players_per_team,
+                "{}: wrong playlist size",
+                path.display()
+            );
+            assert!(parsed.match_format.ranked, "{}: not ranked", path.display());
             let analysis = bundle.analyze(&parsed);
 
             println!(
@@ -48,7 +82,7 @@ mod tests {
                     .unwrap_or_default()
             );
             let mut scored = 0;
-            for slot in 0..feature_extractor::TOTAL_PLAYERS {
+            for slot in 0..feature_extractor::TOTAL_SLOTS {
                 let Some(name) = analysis.names.get(slot).filter(|name| !name.is_empty()) else {
                     continue;
                 };
@@ -85,8 +119,9 @@ mod tests {
                     assert!(!roast.is_empty(), "{name}: no roast");
                 }
             }
+            // Every player of a full lobby, allowing one early leaver in standard.
             assert!(
-                scored >= 5,
+                scored >= (players_per_team * 2).saturating_sub(1).max(2),
                 "{}: only {scored} players scored",
                 path.display()
             );

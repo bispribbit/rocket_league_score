@@ -6,7 +6,7 @@
 crates/
 ├── replay_structs/          # Shared types: frames, players, ranks, dataset splits
 ├── replay_parser/           # .replay → frames (positions, boost, inputs, demos, scoreboard) via boxcars
-├── feature_extractor/       # frames → 71 per-player stats (whole match or a frame window)
+├── feature_extractor/       # frames → 72 per-player stats (whole match or a frame window)
 ├── skill_model/             # Gradient-boosted trees, timeline, roast, compact bundle format (WASM-safe)
 ├── skill_model_training/    # extract_stats + train binaries; GBDT trainer and evaluation
 ├── is_this_a_smurf/         # Dioxus WASM web app (embeds data/skill_model.bin)
@@ -43,8 +43,13 @@ The app and training share one code path for stats (`feature_extractor`) and pre
 - **Lobby level + gap to the lobby.** Two ensembles per model: one for the lobby level, one
   for each player's deviation from it.
 - **Whole match for the verdict, 60-second windows for the timeline.**
-- **Labels** are each player's ranked-3v3 rank at match time (from Ballchasing), converted to
-  the middle of the division's MMR range.
+- **One model for 1v1, 2v2 and 3v3.** The `players_per_team` stat tells the trees the
+  playlist; duels and doubles borrow what standard teaches about mechanics and positioning.
+  Casual replays (players can join and leave, so a team can field more than three) are
+  scored as their team size's competitive playlist.
+- **Labels** are each player's rank in the replay's ranked playlist at match time (from
+  Ballchasing), converted to the middle of the division's range on the 3v3 MMR scale, so
+  "Gold II" is the same number in every playlist.
 
 ## Database
 
