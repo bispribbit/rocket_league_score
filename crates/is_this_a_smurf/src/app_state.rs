@@ -6,10 +6,6 @@ use replay_structs::{RankDivision, Team, UnsupportedReplayMatch};
 /// Prediction results for the entire replay.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PredictionResults {
-    /// Player names (6 players).
-    pub(crate) player_names: Vec<String>,
-    /// Team for each player (6 entries).
-    pub(crate) player_teams: Vec<Team>,
     /// Whole-match result per player.
     pub(crate) player_averages: Vec<PlayerAverage>,
 }

@@ -57,15 +57,6 @@ pub const CONCORDANCE_MINIMUM_LABEL_GAP_MMR: f32 = 25.0;
 /// Number of lobby-level bootstrap resamples behind [`LobbyMetrics::within_r_standard_error`].
 const BOOTSTRAP_RESAMPLES: usize = 200;
 
-/// Identifies one player slot in one replay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlayerSlotKey {
-    /// Replay the player appeared in.
-    pub replay_id: Uuid,
-    /// Canonical slot (blue 0..3, orange 3..6).
-    pub slot: usize,
-}
-
 /// Benchmark metrics for one prediction dump.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LobbyMetrics {
@@ -96,22 +87,15 @@ pub struct LobbyMetrics {
     pub concordance: f64,
     /// Number of pairs behind [`Self::concordance`].
     pub concordance_pairs: usize,
-    /// Pearson r between predicted within-lobby deviation and within-lobby deviation of the
-    /// performance signal (for example possession share). `NaN` without performance data.
-    pub performance_r: f64,
-    /// Pearson r between *labelled* deviation and performance deviation, as a reference for
-    /// how much of the performance signal the account rank itself explains.
-    pub label_performance_r: f64,
-    /// Players behind the two performance correlations.
-    pub performance_count: usize,
 }
 
 /// One player centred on their lobby.
 #[derive(Debug, Clone, Copy)]
 struct CentredPlayer {
-    prediction_deviation: f64,
-    label_deviation: f64,
-    performance_deviation: Option<f64>,
+    /// Prediction minus the lobby's mean prediction.
+    prediction: f64,
+    /// Label minus the lobby's mean label.
+    label: f64,
 }
 
 /// One lobby's players, centred, plus the lobby-level means.
@@ -177,10 +161,7 @@ impl PairSums {
     }
 }
 
-fn centre_lobbies(
-    predictions: &[PlayerPrediction],
-    performance: Option<&HashMap<PlayerSlotKey, f32>>,
-) -> Vec<CentredLobby> {
+fn centre_lobbies(predictions: &[PlayerPrediction]) -> Vec<CentredLobby> {
     let mut by_replay: HashMap<Uuid, Vec<PlayerPrediction>> = HashMap::new();
     for prediction in predictions {
         if prediction.target_mmr > 0.0 {
@@ -211,34 +192,11 @@ fn centre_lobbies(
             / count;
         let mean_label = players.iter().map(|p| f64::from(p.target_mmr)).sum::<f64>() / count;
 
-        let performance_values: Vec<Option<f64>> = players
-            .iter()
-            .map(|player| {
-                performance.and_then(|map| {
-                    map.get(&PlayerSlotKey {
-                        replay_id,
-                        slot: player.slot,
-                    })
-                    .map(|value| f64::from(*value))
-                })
-            })
-            .collect();
-        let known_performance: Vec<f64> = performance_values.iter().flatten().copied().collect();
-        let performance_mean = if known_performance.len() >= MINIMUM_PLAYERS_PER_LOBBY {
-            Some(known_performance.iter().sum::<f64>() / known_performance.len() as f64)
-        } else {
-            None
-        };
-
         let centred = players
             .iter()
-            .zip(performance_values.iter())
-            .map(|(player, performance_value)| CentredPlayer {
-                prediction_deviation: f64::from(player.prediction_mmr) - mean_prediction,
-                label_deviation: f64::from(player.target_mmr) - mean_label,
-                performance_deviation: performance_mean
-                    .zip(*performance_value)
-                    .map(|(mean, value)| value - mean),
+            .map(|player| CentredPlayer {
+                prediction: f64::from(player.prediction_mmr) - mean_prediction,
+                label: f64::from(player.target_mmr) - mean_label,
             })
             .collect();
 
@@ -256,7 +214,7 @@ fn within_sums<'a>(lobbies: impl Iterator<Item = &'a CentredLobby>) -> PairSums 
     let mut sums = PairSums::default();
     for lobby in lobbies {
         for player in &lobby.players {
-            sums.add(player.prediction_deviation, player.label_deviation);
+            sums.add(player.prediction, player.label);
         }
     }
     sums
@@ -290,14 +248,10 @@ fn bootstrap_standard_error(lobbies: &[CentredLobby]) -> f64 {
     variance.sqrt()
 }
 
-/// Scores one dump. `performance` maps a player slot to a per-player performance signal
-/// (for example possession share); pass `None` to skip the performance correlations.
+/// Scores a set of whole-match predictions.
 #[must_use]
-pub fn compute_lobby_metrics(
-    predictions: &[PlayerPrediction],
-    performance: Option<&HashMap<PlayerSlotKey, f32>>,
-) -> LobbyMetrics {
-    let lobbies = centre_lobbies(predictions, performance);
+pub fn compute_lobby_metrics(predictions: &[PlayerPrediction]) -> LobbyMetrics {
+    let lobbies = centre_lobbies(predictions);
     if lobbies.is_empty() {
         return LobbyMetrics::default();
     }
@@ -310,23 +264,15 @@ pub fn compute_lobby_metrics(
     let mut shrunk_square_sum = 0.0;
     let mut player_square_sum = 0.0;
     let mut lobby_square_sum = 0.0;
-    let mut performance_prediction = PairSums::default();
-    let mut performance_label = PairSums::default();
     let mut concordant = 0.0;
     let mut concordance_pairs = 0usize;
 
     for lobby in &lobbies {
         lobby_square_sum += (lobby.mean_prediction - lobby.mean_label).powi(2);
         for player in &lobby.players {
-            label_square_sum += player.label_deviation.powi(2);
-            raw_square_sum += (player.label_deviation - player.prediction_deviation).powi(2);
-            shrunk_square_sum += slope
-                .mul_add(-player.prediction_deviation, player.label_deviation)
-                .powi(2);
-            if let Some(performance_deviation) = player.performance_deviation {
-                performance_prediction.add(player.prediction_deviation, performance_deviation);
-                performance_label.add(player.label_deviation, performance_deviation);
-            }
+            label_square_sum += player.label.powi(2);
+            raw_square_sum += (player.label - player.prediction).powi(2);
+            shrunk_square_sum += slope.mul_add(-player.prediction, player.label).powi(2);
         }
         for raw in &lobby.raw {
             player_square_sum += f64::from(raw.prediction_mmr - raw.target_mmr).powi(2);
@@ -367,15 +313,12 @@ pub fn compute_lobby_metrics(
             f64::NAN
         },
         concordance_pairs,
-        performance_r: performance_prediction.pearson(),
-        label_performance_r: performance_label.pearson(),
-        performance_count: performance_prediction.count as usize,
     }
 }
 
-/// A player is a "higher-ranked than the lobby" proxy positive when their label sits at
-/// least this far above their lobby's median label (mostly parties with a stronger friend:
-/// smurf-like lobbies where the true rank is known).
+/// Label margin over the lobby median that makes a player a smurf-proxy positive.
+///
+/// Mostly parties with a stronger friend: smurf-like lobbies where the true rank is known.
 pub const PROXY_POSITIVE_MARGIN_MMR: f32 = 150.0;
 
 /// How the smurf flag performs at one margin.
@@ -493,7 +436,7 @@ mod tests {
                 [650.0, 750.0],
             ],
         ));
-        let metrics = compute_lobby_metrics(&predictions, None);
+        let metrics = compute_lobby_metrics(&predictions);
         assert_eq!(metrics.lobby_count, 2);
         assert!((metrics.within_r - 1.0).abs() < 1e-9);
         assert!((metrics.within_slope - 1.0).abs() < 1e-9);
@@ -516,7 +459,7 @@ mod tests {
                 [900.0, 1100.0],
             ],
         );
-        let metrics = compute_lobby_metrics(&predictions, None);
+        let metrics = compute_lobby_metrics(&predictions);
         assert!(metrics.within_r.abs() < 1e-9);
         assert!((metrics.concordance - 0.5).abs() < 1e-9);
         assert!((metrics.within_rmse - metrics.label_within_rms).abs() < 1e-6);
@@ -535,7 +478,7 @@ mod tests {
                 [1000.0, 1000.0],
             ],
         );
-        let metrics = compute_lobby_metrics(&predictions, None);
+        let metrics = compute_lobby_metrics(&predictions);
         assert!((metrics.within_r - 1.0).abs() < 1e-9);
         assert!((metrics.within_slope - 0.5).abs() < 1e-9);
         assert!(metrics.within_rmse > 1.0);
@@ -550,35 +493,8 @@ mod tests {
             2,
             &[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 0.0], [5.0, 5.0]],
         ));
-        let metrics = compute_lobby_metrics(&predictions, None);
+        let metrics = compute_lobby_metrics(&predictions);
         assert_eq!(metrics.lobby_count, 1);
         assert_eq!(metrics.player_count, 4);
-    }
-
-    #[test]
-    fn performance_correlation_tracks_prediction() {
-        let predictions = lobby(
-            1,
-            &[
-                [800.0, 900.0],
-                [900.0, 900.0],
-                [1000.0, 900.0],
-                [1100.0, 900.0],
-            ],
-        );
-        let performance: HashMap<PlayerSlotKey, f32> = (0..4)
-            .map(|slot| {
-                (
-                    PlayerSlotKey {
-                        replay_id: Uuid::from_u128(1),
-                        slot,
-                    },
-                    slot as f32 * 0.1,
-                )
-            })
-            .collect();
-        let metrics = compute_lobby_metrics(&predictions, Some(&performance));
-        assert_eq!(metrics.performance_count, 4);
-        assert!((metrics.performance_r - 1.0).abs() < 1e-9);
     }
 }

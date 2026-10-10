@@ -33,7 +33,7 @@ struct Sightings {
 }
 
 impl Sightings {
-    fn frames(&self) -> usize {
+    const fn frames(&self) -> usize {
         self.blue_frames + self.orange_frames
     }
 

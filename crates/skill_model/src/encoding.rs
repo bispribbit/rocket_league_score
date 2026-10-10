@@ -344,7 +344,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, count: usize) -> Result<&'a [u8], BundleDecodeError> {
+    const fn take(&mut self, count: usize) -> Result<&'a [u8], BundleDecodeError> {
         if self.bytes.len() < count {
             return Err(BundleDecodeError::Truncated);
         }
@@ -585,7 +585,7 @@ impl SkillModelBundle {
             return Err(BundleDecodeError::BadMagic);
         };
         let mut payload = Vec::new();
-        brotli_decompressor::BrotliDecompress(&mut &compressed[..], &mut payload)
+        brotli_decompressor::BrotliDecompress(&mut &*compressed, &mut payload)
             .map_err(|_error| BundleDecodeError::Decompression)?;
 
         let mut reader = Reader { bytes: &payload };
@@ -614,7 +614,8 @@ impl SkillModelBundle {
     }
 }
 
-#[cfg(all(test, feature = "encode"))]
+#[cfg(test)]
+#[cfg(feature = "encode")]
 mod tests {
     use super::*;
 

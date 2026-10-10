@@ -196,7 +196,6 @@ pub(crate) fn format_timeline_boundary_label(seconds: f32) -> String {
 
 /// Cards and verdict input: every player the match model scored, in slot order.
 pub(crate) fn build_prediction_results(analysis: &MatchAnalysis) -> PredictionResults {
-    let players = prepare_players_for_timeline(analysis);
     let mut random = rng();
     let player_averages = (0..TOTAL_PLAYERS)
         .filter(|&slot| !analysis.names[slot].is_empty())
@@ -213,9 +212,5 @@ pub(crate) fn build_prediction_results(analysis: &MatchAnalysis) -> PredictionRe
             })
         })
         .collect();
-    PredictionResults {
-        player_names: players.names,
-        player_teams: players.teams,
-        player_averages,
-    }
+    PredictionResults { player_averages }
 }

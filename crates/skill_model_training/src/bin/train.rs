@@ -92,7 +92,7 @@ const TIER_NAMES: [&str; 22] = [
 ];
 
 fn print_metrics(label: &str, predictions: &[PlayerPrediction]) {
-    let metrics = compute_lobby_metrics(predictions, None);
+    let metrics = compute_lobby_metrics(predictions);
     println!(
         "  {label:<22} within_r={:.3} ±{:.3}  lobby_rmse={:.0}  player_rmse={:.0}  concordance={:.3}  players={}",
         metrics.within_r,

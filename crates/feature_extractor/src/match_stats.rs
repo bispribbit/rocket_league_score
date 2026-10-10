@@ -579,14 +579,16 @@ fn accumulate_mechanics(
         );
     }
 
-    let mut seconds_since_jump = if prior.present {
+    let jumped = controls.jumping && !prior.jumping;
+    let seconds_since_jump = if jumped {
+        0.0
+    } else if prior.present {
         prior.seconds_since_jump + seconds as f32
     } else {
         f32::MAX
     };
-    if controls.jumping && !prior.jumping {
+    if jumped {
         accumulator.jump_presses += 1;
-        seconds_since_jump = 0.0;
     }
     if controls.double_jumping && !prior.double_jumping {
         accumulator.double_jumps += 1;
@@ -1142,9 +1144,10 @@ mod tests {
     }
 }
 
-/// Splits a replay into windows that end at each goal: kickoff → goal, kickoff → goal, …,
-/// last kickoff → end. Goal-replay frames fall inside the window after the goal and are
-/// skipped by the stats themselves.
+/// Splits a replay into windows that each end just after a goal.
+///
+/// Kickoff → goal, kickoff → goal, …, last kickoff → end. Goal-replay frames fall inside
+/// the window after the goal and are skipped by the stats themselves.
 #[must_use]
 pub fn goal_windows(parsed: &ParsedReplay) -> Vec<Range<usize>> {
     let mut boundaries: Vec<usize> = parsed

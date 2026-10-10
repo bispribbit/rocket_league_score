@@ -56,10 +56,9 @@ impl FeatureMatrix {
     /// Number of rows.
     #[must_use]
     pub const fn rows(&self) -> usize {
-        if self.columns == 0 {
-            0
-        } else {
-            self.values.len() / self.columns
+        match self.values.len().checked_div(self.columns) {
+            Some(rows) => rows,
+            None => 0,
         }
     }
 
@@ -162,9 +161,9 @@ pub struct GradientBoostingModel {
     trees: Vec<Tree>,
     bins: Vec<FeatureBins>,
     /// Total split gain attributed to each feature.
-    pub feature_gain: Vec<f64>,
+    feature_gain: Vec<f64>,
     /// Validation RMSE after each tree, when a validation set was given.
-    pub validation_curve: Vec<f64>,
+    validation_curve: Vec<f64>,
 }
 
 /// Best split found for one node.
@@ -458,6 +457,18 @@ impl GradientBoostingModel {
             feature_gain,
             validation_curve,
         }
+    }
+
+    /// Total split gain attributed to each feature: a rough importance ranking.
+    #[must_use]
+    pub fn feature_gain(&self) -> &[f64] {
+        &self.feature_gain
+    }
+
+    /// Validation RMSE after each tree, when a validation set was given.
+    #[must_use]
+    pub fn validation_curve(&self) -> &[f64] {
+        &self.validation_curve
     }
 
     /// Number of trees kept after early stopping.
