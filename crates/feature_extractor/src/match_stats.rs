@@ -359,27 +359,57 @@ pub fn compute_player_window_stats(
             };
 
             accumulator.seconds += seconds;
-            accumulator.speed += seconds * f64::from(speed);
-            accumulator.supersonic += seconds * f64::from(u8::from(speed >= SUPERSONIC_SPEED));
-            accumulator.slow += seconds * f64::from(u8::from(speed < SLOW_SPEED));
-            accumulator.ground += seconds * f64::from(u8::from(grounded));
-            accumulator.wall += seconds * f64::from(u8::from(on_wall));
-            accumulator.high_air +=
-                seconds * f64::from(u8::from(!on_wall && height >= HIGH_AIR_HEIGHT));
-            accumulator.low_air +=
-                seconds * f64::from(u8::from(!on_wall && !grounded && height < HIGH_AIR_HEIGHT));
-            accumulator.height += seconds * f64::from(height);
+            accumulator.speed = f64::mul_add(seconds, f64::from(speed), accumulator.speed);
+            accumulator.supersonic = f64::mul_add(
+                seconds,
+                f64::from(u8::from(speed >= SUPERSONIC_SPEED)),
+                accumulator.supersonic,
+            );
+            accumulator.slow = f64::mul_add(
+                seconds,
+                f64::from(u8::from(speed < SLOW_SPEED)),
+                accumulator.slow,
+            );
+            accumulator.ground =
+                f64::mul_add(seconds, f64::from(u8::from(grounded)), accumulator.ground);
+            accumulator.wall =
+                f64::mul_add(seconds, f64::from(u8::from(on_wall)), accumulator.wall);
+            accumulator.high_air = f64::mul_add(
+                seconds,
+                f64::from(u8::from(!on_wall && height >= HIGH_AIR_HEIGHT)),
+                accumulator.high_air,
+            );
+            accumulator.low_air = f64::mul_add(
+                seconds,
+                f64::from(u8::from(!on_wall && !grounded && height < HIGH_AIR_HEIGHT)),
+                accumulator.low_air,
+            );
+            accumulator.height = f64::mul_add(seconds, f64::from(height), accumulator.height);
             if !grounded && !on_wall {
                 accumulator.airborne_seconds += seconds;
-                accumulator.airborne_upright +=
-                    seconds * f64::from(u8::from(up_z(&state.rotation) > 0.7));
+                accumulator.airborne_upright = f64::mul_add(
+                    seconds,
+                    f64::from(u8::from(up_z(&state.rotation) > 0.7)),
+                    accumulator.airborne_upright,
+                );
             }
 
-            accumulator.boost += seconds * f64::from(state.boost);
-            accumulator.boost_empty += seconds * f64::from(u8::from(state.boost < 0.03));
-            accumulator.boost_full += seconds * f64::from(u8::from(state.boost > 0.95));
-            accumulator.slow_with_boost +=
-                seconds * f64::from(u8::from(speed < SLOW_SPEED && state.boost > 0.5));
+            accumulator.boost = f64::mul_add(seconds, f64::from(state.boost), accumulator.boost);
+            accumulator.boost_empty = f64::mul_add(
+                seconds,
+                f64::from(u8::from(state.boost < 0.03)),
+                accumulator.boost_empty,
+            );
+            accumulator.boost_full = f64::mul_add(
+                seconds,
+                f64::from(u8::from(state.boost > 0.95)),
+                accumulator.boost_full,
+            );
+            accumulator.slow_with_boost = f64::mul_add(
+                seconds,
+                f64::from(u8::from(speed < SLOW_SPEED && state.boost > 0.5)),
+                accumulator.slow_with_boost,
+            );
 
             if prior.present && !prior.was_demolished {
                 let boost_change = state.boost - prior.boost;
@@ -401,16 +431,33 @@ pub fn compute_player_window_stats(
                 }
             }
 
-            accumulator.defensive_third +=
-                seconds * f64::from(u8::from(canonical_y < -THIRD_BOUNDARY_Y));
-            accumulator.offensive_third +=
-                seconds * f64::from(u8::from(canonical_y > THIRD_BOUNDARY_Y));
-            accumulator.canonical_y += seconds * f64::from(canonical_y);
-            accumulator.behind_ball +=
-                seconds * f64::from(u8::from(canonical_y < ball_canonical_y));
-            accumulator.distance_to_ball += seconds * f64::from(distance_to_ball);
-            accumulator.distance_to_own_goal +=
-                seconds * f64::from(distance(&state.position, &own_goal));
+            accumulator.defensive_third = f64::mul_add(
+                seconds,
+                f64::from(u8::from(canonical_y < -THIRD_BOUNDARY_Y)),
+                accumulator.defensive_third,
+            );
+            accumulator.offensive_third = f64::mul_add(
+                seconds,
+                f64::from(u8::from(canonical_y > THIRD_BOUNDARY_Y)),
+                accumulator.offensive_third,
+            );
+            accumulator.canonical_y =
+                f64::mul_add(seconds, f64::from(canonical_y), accumulator.canonical_y);
+            accumulator.behind_ball = f64::mul_add(
+                seconds,
+                f64::from(u8::from(canonical_y < ball_canonical_y)),
+                accumulator.behind_ball,
+            );
+            accumulator.distance_to_ball = f64::mul_add(
+                seconds,
+                f64::from(distance_to_ball),
+                accumulator.distance_to_ball,
+            );
+            accumulator.distance_to_own_goal = f64::mul_add(
+                seconds,
+                f64::from(distance(&state.position, &own_goal)),
+                accumulator.distance_to_own_goal,
+            );
 
             let seconds_since_jump =
                 accumulate_mechanics(accumulator, prior, state, grounded, on_wall, seconds);

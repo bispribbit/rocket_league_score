@@ -653,7 +653,14 @@ mod freeze_tests {
         );
         let frozen = model.freeze();
         let binned = model.predict(&matrix);
-        for (row, (features, expected)) in matrix.values.chunks_exact(2).zip(&binned).enumerate() {
+        for (row, (features, expected)) in matrix
+            .values
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(&binned)
+            .enumerate()
+        {
             let frozen_prediction = frozen.predict(features);
             assert!(
                 (frozen_prediction - expected).abs() < 1e-3,
