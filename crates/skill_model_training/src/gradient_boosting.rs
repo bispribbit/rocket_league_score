@@ -1,9 +1,8 @@
-//! Small histogram gradient-boosted regression trees for tabular baselines.
+//! Small histogram gradient-boosted regression trees, trained on per-player match stats.
 //!
-//! Experiment A2 in `docs/experiment-plan-2026-10.md` needs a strong, fast tabular model
-//! over per-player match stats. Squared loss only; features are quantile-binned to at most
-//! 256 bins once, then every tree is grown depth-wise from per-node gradient histograms,
-//! parallel over features. Early stopping watches an optional validation set.
+//! Squared loss only; features are quantile-binned to at most 256 bins once, then every tree
+//! is grown depth-wise from per-node gradient histograms, parallel over features. Early
+//! stopping watches an optional validation set.
 
 use rayon::prelude::*;
 

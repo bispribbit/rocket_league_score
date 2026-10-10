@@ -9,7 +9,7 @@
 //! Everything ships as one [`SkillModelBundle`], stored in a compact binary format
 //! ([`SkillModelBundle::to_bytes`]).
 //!
-//! See `docs/experiment-plan-2026-10.md` for how the model was chosen and measured.
+//! See `docs/model.md` for how the model was chosen and measured.
 
 mod analysis;
 pub mod coaching;
@@ -25,7 +25,6 @@ pub use model::{FrozenEnsemble, FrozenNode, LobbySummary, TabularLayout, Tabular
 /// The single definition of the shipped rule: the app's badge, its verdict copy and the
 /// offline evaluation tools all read it from here.
 ///
-/// Fitted for the tabular model on held-out lobbies (`docs/experiment.md` row 44). Earlier
-/// rows (≤ 43) scored the LSTM with a hand-set `+200`, which the tabular model almost never
-/// reaches (0.16 % of players).
+/// Chosen from the precision/recall table `train` prints for the evaluation split: about 0.7 %
+/// of players flagged, ~60 % of them genuinely ranked well above their lobby (`docs/model.md`).
 pub const SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR: f32 = 100.0;

@@ -1,9 +1,8 @@
 //! Per-player, whole-match summary statistics.
 //!
-//! Experiment A2 in `docs/experiment-plan-2026-10.md`: a tabular baseline that scores each
-//! player from ~40 hand-crafted match-level stats. It answers, in minutes rather than GPU
-//! hours, how much within-lobby signal per-player play carries and which families of
-//! behaviour carry it.
+//! These are the inputs of the skill model (see `docs/model.md`): 71 hand-written stats per
+//! player, covering movement, boost, positioning, ball control, mechanics, the scoreboard
+//! and situational positioning.
 //!
 //! Everything positional is measured in the **team-canonical frame** (own goal at `−y`),
 //! so a blue and an orange player doing the same thing get the same numbers. Time-based

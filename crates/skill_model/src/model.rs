@@ -5,8 +5,7 @@
 
 //! Tabular per-player skill model: whole-match stats → gradient-boosted trees.
 //!
-//! The shippable form of experiments A2/T1–T5 in `docs/experiment-plan-2026-10.md`. It is
-//! deliberately free of `burn` and of any training code so it runs unchanged in the WASM
+//! The shipped model (see `docs/model.md`). It is deliberately free of `burn` and of any training code so it runs unchanged in the WASM
 //! app: a match is parsed, [`feature_extractor::compute_player_match_stats`] summarises
 //! each player, and [`TabularSkillModel::predict`] turns the six summaries into six MMR
 //! estimates.

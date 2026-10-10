@@ -9,7 +9,7 @@
 //! * **The timeline** shows *form*: each player's whole-match score, moved up or down by how
 //!   much better or worse they did in a window than in their own average window, times
 //!   [`SkillModelBundle::timeline_emphasis`]. Window-level lobby estimates jump by ±100 MMR
-//!   from one minute to the next for the whole lobby at once (`docs/experiment.md` row 41),
+//!   from one minute to the next for the whole lobby at once (see `docs/model.md`),
 //!   so the timeline never shows them directly.
 //! * **One roast per player** from [`crate::coaching`].
 
