@@ -1,4 +1,4 @@
-//! Upload drop zone and full inference pipeline (keeps the future alive on this scope).
+//! Upload drop zone and full inference pipeline (spawned by [`super::app::App`]).
 //!
 //! ## Threading and WASM
 //!
@@ -37,15 +37,16 @@ use crate::prediction::{
 
 /// Upload page with a centered drag-and-drop area.
 ///
-/// Processing runs as a future on **this** component's scope. On success we
-/// keep `AppState::WaitingForUpload` and store the outcome in
-/// [`LocalProcessing`] so the timeline and summary stay on one screen without
-/// routing. Errors use [`AppState::Error`]; unsupported match types use
-/// [`AppState::UnsupportedReplay`].
+/// The pipeline itself runs on [`super::app::App`]'s scope (see [`run_pipeline`]). On success
+/// we keep `AppState::WaitingForUpload` and store the outcome in [`LocalProcessing`] so the
+/// timeline and summary stay on one screen without routing. Errors use [`AppState::Error`];
+/// unsupported match types use [`AppState::UnsupportedReplay`].
 #[component]
-pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
-    let state = state;
-    let mut local_processing = use_signal(|| None::<LocalProcessing>);
+pub(crate) fn UploadPage(
+    local_processing: Signal<Option<LocalProcessing>>,
+    on_replay_selected: Callback<web_sys::File>,
+) -> Element {
+    let mut local_processing = local_processing;
 
     if let Some(LocalProcessing {
         filename,
@@ -65,12 +66,15 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             p { class: "text-gray-400 mt-1", "{filename}" }
                         }
                         if results.is_some() {
+                            div { class: "flex flex-col items-start sm:items-end gap-1 self-start sm:self-center shrink-0",
                             button {
-                                class: "px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg transition-colors self-start sm:self-center shrink-0",
+                                class: "px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg transition-colors",
                                 onclick: move |_| {
                                     local_processing.set(None);
                                 },
                                 "Analyze another replay"
+                            }
+                            p { class: "text-gray-500 text-xs", "or drop a .replay anywhere" }
                             }
                         }
                     }
@@ -127,6 +131,7 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                 p { class: "text-gray-400 text-lg font-medium",
                     "Click or drop a "
                     span { class: "text-blue-400", ".replay" }
+                    " anywhere"
                 }
                 p { class: "text-gray-500 text-sm mt-1", "Ranked 3v3 Rocket League replay file" }
 
@@ -145,7 +150,9 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             .and_then(|file_list| file_list.get(0));
                         tracing::info!("[replay] onchange: file selected");
 
-                        spawn(run_pipeline(file, state, local_processing));
+                        if let Some(file) = file {
+                            on_replay_selected.call(file);
+                        }
                     },
                 }
             }
@@ -172,19 +179,25 @@ fn progress_after_model(
     }
 }
 
-/// Reads, parses and scores the replay, updating `local_processing` as each step lands.
-#[expect(clippy::future_not_send)]
-async fn run_pipeline(
-    file: Option<web_sys::File>,
+/// Leaves the processing view and shows an error or unsupported-replay page.
+fn fail(
     mut state: Signal<AppState>,
     mut local_processing: Signal<Option<LocalProcessing>>,
+    next_state: AppState,
 ) {
-    let Some(file) = file else {
-        state.set(AppState::Error("No file selected.".to_string()));
-        return;
-    };
+    local_processing.set(None);
+    state.set(next_state);
+}
+
+/// Reads, parses and scores the replay, updating `local_processing` as each step lands.
+#[expect(clippy::future_not_send)]
+pub(super) async fn run_pipeline(
+    file: web_sys::File,
+    state: Signal<AppState>,
+    mut local_processing: Signal<Option<LocalProcessing>>,
+) {
     let filename = file.name();
-    let mut publish = |progress: ProgressState, results: Option<PredictionResults>| {
+    let mut publish = move |progress: ProgressState, results: Option<PredictionResults>| {
         local_processing.set(Some(LocalProcessing {
             filename: filename.clone(),
             progress,
@@ -214,7 +227,11 @@ async fn run_pipeline(
     let array_buffer = match JsFuture::from(file.array_buffer()).await {
         Ok(buffer) => buffer,
         Err(error) => {
-            state.set(AppState::Error(format!("Could not read file: {error:?}")));
+            fail(
+                state,
+                local_processing,
+                AppState::Error(format!("Could not read file: {error:?}")),
+            );
             return;
         }
     };
@@ -233,18 +250,28 @@ async fn run_pipeline(
     let parsed = match parse_replay_from_bytes(&data) {
         Ok(parsed) => parsed,
         Err(ReplayAcceptanceError::Unsupported(details)) => {
-            state.set(AppState::UnsupportedReplay(details));
+            fail(
+                state,
+                local_processing,
+                AppState::UnsupportedReplay(details),
+            );
             return;
         }
         Err(ReplayAcceptanceError::Parse(error)) => {
-            state.set(AppState::Error(format!("Replay parsing error: {error}")));
+            fail(
+                state,
+                local_processing,
+                AppState::Error(format!("Replay parsing error: {error}")),
+            );
             return;
         }
     };
     if parsed.frames.is_empty() {
-        state.set(AppState::Error(
-            "No frames found in the replay.".to_string(),
-        ));
+        fail(
+            state,
+            local_processing,
+            AppState::Error("No frames found in the replay.".to_string()),
+        );
         return;
     }
 
@@ -261,7 +288,7 @@ async fn run_pipeline(
     let bundle = match load_bundle() {
         Ok(bundle) => bundle,
         Err(message) => {
-            state.set(AppState::Error(message));
+            fail(state, local_processing, AppState::Error(message));
             return;
         }
     };

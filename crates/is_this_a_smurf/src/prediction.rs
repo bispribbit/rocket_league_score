@@ -206,9 +206,9 @@ pub(crate) fn build_prediction_results(analysis: &MatchAnalysis) -> PredictionRe
                 team: MatchAnalysis::team(slot),
                 mmr,
                 rank: RankDivision::from(mmr),
-                next_rank_roast: analysis.coaching[slot]
-                    .as_ref()
-                    .map(|advice| advice.line(random.random_range(0..8))),
+                next_rank_roast: analysis.coaching[slot].as_ref().map(|advice| {
+                    advice.line(random.random_range(0..usize::MAX), &analysis.names[slot])
+                }),
             })
         })
         .collect();

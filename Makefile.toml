@@ -37,16 +37,16 @@ command = "cargo"
 args = ["update"]
 
 [tasks.start-web]
-cwd = "/workspace/crates/is_this_a_smurf"
+cwd = "./crates/is_this_a_smurf"
 run_task = { name = ["start-web-tailwind", "start-web-dx"], parallel = true }
 
 [tasks.start-web-dx]
-cwd = "/workspace/crates/is_this_a_smurf"
+cwd = "./crates/is_this_a_smurf"
 command = "dx"
 args = ["serve"]
 
 [tasks.start-web-tailwind]
-cwd = "/workspace/crates/is_this_a_smurf"
+cwd = "./crates/is_this_a_smurf"
 command = "npx"
 args = [
     "@tailwindcss/cli",
@@ -57,13 +57,16 @@ args = [
     "--watch",
 ]
 
+[tasks.start-web-tailwind.windows]
+command = "npx.cmd"
+
 # Build the web app for production (tailwind first, then dx release build → dist/).
 [tasks.build-web]
-cwd = "/workspace/crates/is_this_a_smurf"
+cwd = "./crates/is_this_a_smurf"
 run_task = { name = ["build-web-tailwind", "build-web-dx"], parallel = false }
 
 [tasks.build-web-tailwind]
-cwd = "/workspace/crates/is_this_a_smurf"
+cwd = "./crates/is_this_a_smurf"
 command = "npx"
 args = [
     "--yes",
@@ -75,19 +78,22 @@ args = [
     "--minify",
 ]
 
+[tasks.build-web-tailwind.windows]
+command = "npx.cmd"
+
 [tasks.build-web-dx]
-cwd = "/workspace/crates/is_this_a_smurf"
+cwd = "./crates/is_this_a_smurf"
 command = "dx"
 args = ["build", "--platform", "web", "--release"]
 
 # Restore PostgreSQL from the custom-format dump shipped in the devcontainer image (or data/database_dump.dump on the bind mount).
 [tasks.restore-database]
-cwd = "/workspace"
+cwd = "."
 command = "bash"
 args = ["scripts/restore-database.sh"]
 
 # Write data/database_dump.dump from a live database (pg_dump -Fc; rebuild the devcontainer image to bake a new snapshot).
 [tasks.database-dump]
-cwd = "/workspace"
+cwd = "."
 command = "bash"
 args = ["scripts/database-dump.sh"]

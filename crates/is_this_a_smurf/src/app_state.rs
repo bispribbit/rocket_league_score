@@ -85,8 +85,7 @@ pub(crate) struct ProgressState {
 #[derive(Debug, Clone)]
 pub(crate) enum AppState {
     /// Waiting for the user to upload a replay file (processing also
-    /// happens while in this state, with progress shown via a local signal
-    /// inside `UploadPage`).
+    /// happens while in this state, with progress shown via [`LocalProcessing`]).
     WaitingForUpload,
     /// An error occurred (error message).
     Error(String),
@@ -94,8 +93,8 @@ pub(crate) enum AppState {
     UnsupportedReplay(UnsupportedReplayMatch),
 }
 
-/// Local processing state kept inside `UploadPage` so the component stays
-/// mounted (and the async future stays alive) during the entire pipeline.
+/// Processing state shown by `UploadPage`; owned by `App` together with the pipeline future,
+/// so a replay dropped on any screen can restart the analysis.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LocalProcessing {
     /// Name of the file being processed.

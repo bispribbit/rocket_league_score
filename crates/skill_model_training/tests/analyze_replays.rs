@@ -69,7 +69,7 @@ mod tests {
                     .coaching
                     .get(slot)
                     .and_then(|advice| advice.as_ref())
-                    .map(|advice| advice.line(0))
+                    .map(|advice| advice.line(0, name))
                     .unwrap_or_default();
                 println!(
                     "  {name:<20} {:>6} [{}]  {roast}",

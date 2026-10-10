@@ -16,6 +16,8 @@
 use feature_extractor::MATCH_STAT_NAMES;
 use serde::{Deserialize, Serialize};
 
+mod lines;
+
 /// How many tiers above the player's predicted tier the comparison targets. Three tiers is
 /// one named rank (Silver I → Gold I).
 pub const TARGET_TIER_STEP: usize = 3;
@@ -74,9 +76,12 @@ impl Unit {
     }
 }
 
+/// Placeholder for the player's gamertag in lines.
+const NAME_PLACEHOLDER: &str = "{name}";
+
 /// One coachable stat and its lines.
 ///
-/// Lines use `{yours}`, `{theirs}` and `{next}` (plural rank name, e.g. "Golds").
+/// Lines use `{name}`, `{yours}`, `{theirs}` and `{next}` (plural rank name, e.g. "Golds").
 #[derive(Debug, Clone, Copy)]
 pub struct CoachingTip {
     /// Stat name in [`MATCH_STAT_NAMES`].
@@ -92,158 +97,120 @@ pub const COACHING_TIPS: &[CoachingTip] = &[
         stat: "touches_per_minute",
         better: Better::Higher,
         unit: Unit::PerMinute,
-        lines: &[
-            "The ball isn't lava. {next} touch it {theirs}, you managed {yours}.",
-            "Spotted near the ball occasionally. {next} hit it {theirs}; you: {yours}.",
-        ],
+        lines: lines::TOUCHES_PER_MINUTE,
     },
     CoachingTip {
         stat: "forward_touch_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "Only {yours} of your touches went toward their net. {next}: {theirs}. Aim for the big net, bro.",
-            "Hitting the ball is step one. Step two is the right direction: {next} send {theirs} forward, you {yours}.",
-        ],
+        lines: lines::FORWARD_TOUCH_FRACTION,
     },
     CoachingTip {
         stat: "mean_ball_speed_after_touch",
         better: Better::Higher,
         unit: Unit::BallSpeed,
-        lines: &[
-            "Your touches leave the ball at {yours}. {next} launch it at {theirs}. Hit it like it owes you money.",
-            "Gentle little taps at {yours}. {next} send it at {theirs}.",
-        ],
+        lines: lines::MEAN_BALL_SPEED_AFTER_TOUCH,
     },
     CoachingTip {
         stat: "boost_empty_fraction",
         better: Better::Lower,
         unit: Unit::Percent,
-        lines: &[
-            "On zero boost {yours} of the game. {next}: {theirs}. The pads are free, grab some.",
-            "Running on fumes {yours} of the time ({next}: {theirs}). Boost is not a collectible.",
-        ],
+        lines: lines::BOOST_EMPTY_FRACTION,
     },
     CoachingTip {
         stat: "small_pads_per_minute",
         better: Better::Higher,
         unit: Unit::PerMinute,
-        lines: &[
-            "Small pads exist. {next} grab {theirs}, you grab {yours}. Stop driving past the snacks.",
-        ],
+        lines: lines::SMALL_PADS_PER_MINUTE,
     },
     CoachingTip {
         stat: "supersonic_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "Supersonic {yours} of the time. {next}: {theirs}. The fast button is right there.",
-            "{next} hit top speed {theirs} of the game. You: {yours}. Sunday drive?",
-        ],
+        lines: lines::SUPERSONIC_FRACTION,
     },
     CoachingTip {
         stat: "slow_fraction",
         better: Better::Lower,
         unit: Unit::Percent,
-        lines: &["Basically parked {yours} of the game. {next} only crawl {theirs}."],
+        lines: lines::SLOW_FRACTION,
     },
     CoachingTip {
         stat: "overcommit_fraction",
         better: Better::Lower,
         unit: Unit::Percent,
-        lines: &[
-            "Upfield while a teammate had the ball {yours} of the time ({next}: {theirs}). Your net misses you.",
-            "Ahead of the play {yours} of the game. {next}: {theirs}. Someone has to rotate back. It's you.",
-        ],
+        lines: lines::OVERCOMMIT_FRACTION,
     },
     CoachingTip {
         stat: "goal_side_when_defending_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "When they attacked, you were on the right side of the ball {yours} of the time. {next}: {theirs}. Defend from goal-side.",
-        ],
+        lines: lines::GOAL_SIDE_WHEN_DEFENDING_FRACTION,
     },
     CoachingTip {
         stat: "double_commit_fraction",
         better: Better::Lower,
         unit: Unit::Percent,
-        lines: &[
-            "Double-committing {yours} of the time ({next}: {theirs}). Your teammate had it. Probably.",
-        ],
+        lines: lines::DOUBLE_COMMIT_FRACTION,
     },
     CoachingTip {
         stat: "goal_side_after_touch_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "After touching the ball you got back goal-side {yours} of the time ({next}: {theirs}). Stop admiring your own touch.",
-        ],
+        lines: lines::GOAL_SIDE_AFTER_TOUCH_FRACTION,
     },
     CoachingTip {
         stat: "kickoff_win_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "Won {yours} of your kickoffs. {next}: {theirs}. Practise one kickoff. Any kickoff.",
-        ],
+        lines: lines::KICKOFF_WIN_FRACTION,
     },
     CoachingTip {
         stat: "demos_received",
         better: Better::Lower,
         unit: Unit::Count,
-        lines: &["Demolished {yours} times. {next}: {theirs}. Check your mirrors."],
+        lines: lines::DEMOS_RECEIVED,
     },
     CoachingTip {
         stat: "dodges_per_minute",
         better: Better::Higher,
         unit: Unit::PerMinute,
-        lines: &["Flips: {yours}. {next}: {theirs}. Flipping is free speed."],
+        lines: lines::DODGES_PER_MINUTE,
     },
     CoachingTip {
         stat: "high_air_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "{next} spend {theirs} of the game airborne. You: {yours}. Gravity is optional.",
-            "Grounded {yours} of the way, metaphorically. {next} fly {theirs} of the game.",
-        ],
+        lines: lines::HIGH_AIR_FRACTION,
     },
     CoachingTip {
         stat: "aerial_touch_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &["{yours} of your touches were in the air. {next}: {theirs}. Free play is free."],
+        lines: lines::AERIAL_TOUCH_FRACTION,
     },
     CoachingTip {
         stat: "fast_aerial_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "Your aerials take the scenic route: {yours} fast aerials vs {theirs} for {next}. Jump, jump, boost.",
-        ],
+        lines: lines::FAST_AERIAL_FRACTION,
     },
     CoachingTip {
         stat: "wavedash_like_dodges_per_minute",
         better: Better::Higher,
         unit: Unit::PerMinute,
-        lines: &["{next} wavedash {theirs}. You: {yours}. Land with some style."],
+        lines: lines::WAVEDASH_LIKE_DODGES_PER_MINUTE,
     },
     CoachingTip {
         stat: "powerslide_fraction",
         better: Better::Higher,
         unit: Unit::Percent,
-        lines: &[
-            "Powersliding {yours} of the time, {next} {theirs}. Turning is a skill and there's a button for it.",
-        ],
+        lines: lines::POWERSLIDE_FRACTION,
     },
 ];
 
 /// Lines for a player with nothing left to learn from the rank above (or already SSL).
-pub const NOTHING_TO_FIX_LINES: &[&str] = &[
-    "Honestly? Nothing to fix. Suspicious.",
-    "No notes. Go touch grass instead.",
-];
+pub const NOTHING_TO_FIX_LINES: &[&str] = lines::NOTHING_TO_FIX;
 
 /// Reference values of one tier for every tip, aligned with [`COACHING_TIPS`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -314,20 +281,22 @@ pub struct CoachingAdvice {
 }
 
 impl CoachingAdvice {
-    /// Renders the advice with line variant `variant` (wrapped to the available lines).
+    /// Renders the advice about player `name` with line variant `variant` (wrapped to the
+    /// available lines).
     #[must_use]
-    pub fn line(&self, variant: usize) -> String {
+    pub fn line(&self, variant: usize, name: &str) -> String {
         let Some(tip) = self.tip else {
             return NOTHING_TO_FIX_LINES
                 .get(variant % NOTHING_TO_FIX_LINES.len())
                 .copied()
                 .unwrap_or_default()
-                .to_string();
+                .replace(NAME_PLACEHOLDER, name);
         };
         tip.lines
             .get(variant % tip.lines.len().max(1))
             .copied()
             .unwrap_or_default()
+            .replace(NAME_PLACEHOLDER, name)
             .replace("{yours}", &tip.unit.format(self.yours))
             .replace("{theirs}", &tip.unit.format(self.theirs))
             .replace("{next}", self.next)
@@ -459,6 +428,50 @@ mod tests {
         }
     }
 
+    /// Several players in one match often get the same tip; enough variety keeps them from
+    /// all reading the same sentence.
+    #[test]
+    fn every_tip_has_enough_distinct_lines() {
+        for tip in COACHING_TIPS {
+            assert!(tip.lines.len() >= 20, "{} has too few lines", tip.stat);
+            for line in tip.lines {
+                for placeholder in ["{yours}", "{theirs}", "{next}"] {
+                    assert!(line.contains(placeholder), "{line:?} lacks {placeholder}");
+                }
+            }
+            let distinct: std::collections::HashSet<_> = tip.lines.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                tip.lines.len(),
+                "{} repeats a line",
+                tip.stat
+            );
+        }
+        assert!(NOTHING_TO_FIX_LINES.len() >= 20);
+    }
+
+    /// Lines describe one of six players, so they never talk to the reader.
+    #[test]
+    fn lines_never_address_the_reader() {
+        let all_lines = COACHING_TIPS
+            .iter()
+            .flat_map(|tip| tip.lines.iter())
+            .chain(NOTHING_TO_FIX_LINES);
+        for line in all_lines {
+            let addresses_reader = ["{name}", "{yours}", "{theirs}", "{next}"]
+                .iter()
+                .fold(line.to_string(), |text, placeholder| {
+                    text.replace(placeholder, "")
+                })
+                .split(|character: char| !character.is_alphanumeric() && character != '\'')
+                .any(|word| {
+                    let word = word.to_lowercase();
+                    word == "you" || word.starts_with("you'") || word.starts_with("your")
+                });
+            assert!(!addresses_reader, "{line:?} addresses the reader");
+        }
+    }
+
     /// A low-ranked player who never jumps is still told to touch the ball: air time does
     /// not separate their tier from the target tier, however far behind they are.
     #[test]
@@ -469,7 +482,7 @@ mod tests {
         let bronze = table().advise(100.0, &stats).expect("table is not empty");
         assert_eq!(bronze.tip.map(|tip| tip.stat), Some("touches_per_minute"));
         assert_eq!(bronze.next, "Silvers");
-        assert!(bronze.line(0).contains("Silvers"));
+        assert!(bronze.line(0, "Player").contains("Silvers"));
     }
 
     #[test]
@@ -477,7 +490,7 @@ mod tests {
         let stats = vec![10.0; MATCH_STAT_NAMES.len()];
         let advice = table().advise(100.0, &stats).expect("table is not empty");
         assert!(advice.tip.is_none());
-        assert!(NOTHING_TO_FIX_LINES.contains(&advice.line(0).as_str()));
+        assert!(NOTHING_TO_FIX_LINES.contains(&advice.line(0, "Player").as_str()));
     }
 
     #[test]

@@ -309,6 +309,7 @@ pub(crate) fn UnsupportedReplayPage(
                 },
                 "Try another replay"
             }
+            p { class: "text-gray-500 text-sm mt-3", "or drop a .replay anywhere on this page" }
         }
     }
 }
@@ -342,6 +343,7 @@ pub(crate) fn ErrorPage(message: String, state: Signal<AppState>) -> Element {
                 },
                 "Try again"
             }
+            p { class: "text-gray-500 text-sm mt-3", "or drop a .replay anywhere on this page" }
         }
     }
 }

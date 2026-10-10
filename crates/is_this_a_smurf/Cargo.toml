@@ -23,6 +23,9 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
     "Blob",
+    "DataTransfer",
+    "DragEvent",
+    "Event",
     "File",
     "FileList",
     "HtmlInputElement",

@@ -164,7 +164,7 @@ fn print_coaching_report(lobbies: &[Lobby], bundle: &SkillModelBundle) {
             let key = advice.tip.map_or("(nothing to fix)", |tip| tip.stat);
             *counts[group].entry(key).or_default() += 1;
             if examples[group].is_none() && advice.tip.is_some() {
-                examples[group] = Some(advice.line(slot));
+                examples[group] = Some(advice.line(slot, "Player"));
             }
         }
     }
