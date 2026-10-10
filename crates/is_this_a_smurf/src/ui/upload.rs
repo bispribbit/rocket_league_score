@@ -11,15 +11,11 @@
 //!   with cross-origin isolation (`Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy`)
 //!   so `SharedArrayBuffer` is available.
 //!
-//! This crate therefore runs inference on the **same thread** as the UI, but the async loop calls
-//! [`crate::browser_async::yield_to_ui`] after each segment so the browser can repaint between
-//! steps. Moving compute to a worker would be a larger architectural change (model + tensors in the
-//! worker, progress messages back to the main thread).
+//! This crate therefore runs everything on the **same thread** as the UI and calls
+//! [`crate::browser_async::yield_to_ui`] between steps so the browser can repaint. Scoring a
+//! match with the tree model takes a fraction of a second, so no worker is needed.
 
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
 use dioxus::prelude::*;
-use ml_model::{ExtractedSegmentFeatures, SequenceModel, load_checkpoint_from_bytes};
 use replay_parser::{ReplayAcceptanceError, parse_replay_from_bytes};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -27,24 +23,17 @@ use wasm_bindgen_futures::JsFuture;
 use super::processing::{AnalysisTimeline, EarlyWorkingPanel};
 use super::results::{MatchVerdictBanner, PlayerSummaryGrid, PlayerSummaryGridLoading};
 use crate::app_state::{
-    AnalysisTimelinePhase, AppState, LocalProcessing, ProgressState, StepStatus, TimelineTrackState,
+    AppState, LocalProcessing, PredictionResults, ProgressState, SegmentStepInfo, StepStatus,
+    TimelineTrackState,
 };
 use crate::branding::IS_THIS_A_SMURF_HERO;
 use crate::browser_async::{sleep_milliseconds, yield_for_dom_paint, yield_to_ui};
-use crate::embedded_model::{MODEL_BYTES, MODEL_CONFIG, sequence_length_from_embedded_config};
+use crate::embedded_model::load_bundle;
 use crate::prediction::{
     build_goal_markers, build_prediction_results, compute_segment_boundary_play_times,
-    compute_segment_boundary_times, global_ranks_from_predictions, prepare_players_for_timeline,
-    ranks_from_player_predictions, segment_step_infos,
+    compute_segment_boundary_times, prepare_players_for_timeline, ranks_from_player_mmr,
+    segment_step_infos,
 };
-
-/// Burn backend for inference. The website runs inference on pure CPU
-/// (`ndarray`) on every target: WASM needs it because cubecl-wgpu's sync
-/// tensor reads panic in-browser, and native desktop builds use the same
-/// backend so "what ships" matches "what we test". Bulk GPU inference
-/// (flag_smurfs, predict) is handled by a separate CLI that targets CUDA.
-type InferenceBackend = NdArray;
-type InferenceDevice = NdArrayDevice;
 
 /// Upload page with a centered drag-and-drop area.
 ///
@@ -55,7 +44,7 @@ type InferenceDevice = NdArrayDevice;
 /// [`AppState::UnsupportedReplay`].
 #[component]
 pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
-    let mut state = state;
+    let state = state;
     let mut local_processing = use_signal(|| None::<LocalProcessing>);
 
     if let Some(LocalProcessing {
@@ -156,288 +145,169 @@ pub(crate) fn UploadPage(state: Signal<AppState>) -> Element {
                             .and_then(|file_list| file_list.get(0));
                         tracing::info!("[replay] onchange: file selected");
 
-                        spawn(async move {
-                            // ---- Step 1: read file bytes via web-sys (no JS eval, no base64) --
-                            let Some(file) = file else {
-                                tracing::info!("[replay] no file found on input element");
-                                state.set(AppState::Error("No file selected.".to_string()));
-                                return;
-                            };
-                            let filename = file.name();
-                            tracing::info!(
-                                "[replay] reading file: {}, size: {} bytes", filename, file.size()
-                            );
-                            local_processing
-                                .set(
-                                    Some(LocalProcessing {
-                                        filename: filename.clone(),
-                                        progress: ProgressState {
-                                            reading_file: StepStatus::Processing,
-                                            copying_into_memory: StepStatus::Pending,
-                                            parsing: StepStatus::Pending,
-                                            loading_model: StepStatus::Pending,
-                                            segments: vec![],
-                                            timeline: None,
-                                        },
-                                        results: None,
-                                    }),
-                                );
-                            yield_to_ui().await;
-                            let array_buffer = match JsFuture::from(file.array_buffer()).await {
-                                Ok(buffer) => buffer,
-                                Err(error) => {
-                                    tracing::info!("[replay] array_buffer() error: {:?}", error);
-                                    state
-                                        .set(AppState::Error(format!("Could not read file: {error:?}")));
-                                    return;
-                                }
-                            };
-                            local_processing
-                                .set(
-                                    Some(LocalProcessing {
-                                        filename: filename.clone(),
-                                        progress: ProgressState {
-                                            reading_file: StepStatus::Done("Done".to_string()),
-                                            copying_into_memory: StepStatus::Processing,
-                                            parsing: StepStatus::Pending,
-                                            loading_model: StepStatus::Pending,
-                                            segments: vec![],
-                                            timeline: None,
-                                        },
-                                        results: None,
-                                    }),
-                                );
-                            yield_to_ui().await;
-                            yield_for_dom_paint().await;
-                            let uint8_array = js_sys::Uint8Array::new(&array_buffer);
-                            let data: Vec<u8> = uint8_array.to_vec();
-                            tracing::info!("[replay] file read ok, {} bytes", data.len());
-                            local_processing
-                                .set(
-                                    Some(LocalProcessing {
-                                        filename: filename.clone(),
-                                        progress: ProgressState {
-                                            reading_file: StepStatus::Done("Done".to_string()),
-                                            copying_into_memory: StepStatus::Done("Done".to_string()),
-                                            parsing: StepStatus::Processing,
-                                            loading_model: StepStatus::Pending,
-                                            segments: vec![],
-                                            timeline: None,
-                                        },
-                                        results: None,
-                                    }),
-                                );
-                            yield_to_ui().await;
-                            yield_for_dom_paint().await;
-                            tracing::info!("[replay] parse_replay_from_bytes starting");
-                            let parsed = match parse_replay_from_bytes(&data) {
-                                Ok(parsed) => parsed,
-                                Err(ReplayAcceptanceError::Unsupported(details)) => {
-                                    tracing::info!(
-                                        "[replay] unsupported match: {}", details.detected_mode_label
-                                    );
-                                    state.set(AppState::UnsupportedReplay(details));
-                                    return;
-                                }
-                                Err(ReplayAcceptanceError::Parse(error)) => {
-                                    tracing::info!("[replay] parse error: {}", error);
-                                    state.set(AppState::Error(format!("Replay parsing error: {error}")));
-                                    return;
-                                }
-                            };
-                            tracing::info!("[replay] parse ok, {} frames", parsed.frames.len());
-                            if parsed.frames.is_empty() {
-                                state.set(AppState::Error("No frames found in the replay.".to_string()));
-                                return;
-                            }
-                            let sequence_length = sequence_length_from_embedded_config();
-                            let extracted = ExtractedSegmentFeatures::from_frames(
-                                &parsed.frames,
-                                sequence_length,
-                            );
-                            let num_segments = extracted.segment_count(sequence_length);
-                            let mut segment_steps = segment_step_infos(
-                                &parsed.frames,
-                                sequence_length,
-                                num_segments,
-                            );
-                            let (timeline_player_names, timeline_player_teams) = prepare_players_for_timeline(
-                                &parsed,
-                            );
-                            let goal_markers = build_goal_markers(&parsed, &timeline_player_names);
-                            let match_duration_seconds = parsed
-                                .frames
-                                .last()
-                                .map_or(1.0_f32, |frame| frame.time)
-                                .max(0.001);
-                            let boundary_times_seconds = compute_segment_boundary_times(&segment_steps);
-                            let boundary_play_times_seconds = compute_segment_boundary_play_times(
-                                &parsed.frames,
-                                &segment_steps,
-                                sequence_length,
-                            );
-                            let mut timeline_snapshot = if num_segments > 0 {
-                                let timeline_snapshot = TimelineTrackState {
-                                    match_duration_seconds,
-                                    boundary_times_seconds,
-                                    boundary_play_times_seconds,
-                                    goals: goal_markers,
-                                    player_names: timeline_player_names,
-                                    player_teams: timeline_player_teams,
-                                    phase: AnalysisTimelinePhase::InferenceInProgress,
-                                    num_segments,
-                                    global_ranks: None,
-                                };
-                                tracing::info!("[replay] building results");
-                                Some(timeline_snapshot)
-                            } else {
-                                None
-                            };
-                            local_processing
-                                .set(
-                                    Some(LocalProcessing {
-                                        filename: filename.clone(),
-                                        progress: ProgressState {
-                                            reading_file: StepStatus::Done("Done".to_string()),
-                                            copying_into_memory: StepStatus::Done("Done".to_string()),
-                                            parsing: StepStatus::Done("Done".to_string()),
-                                            loading_model: StepStatus::Processing,
-                                            segments: segment_steps.clone(),
-                                            timeline: timeline_snapshot.clone(),
-                                        },
-                                        results: None,
-                                    }),
-                                );
-                            yield_to_ui().await;
-                            yield_for_dom_paint().await;
-                            tracing::info!(
-                                "[replay] load_checkpoint_from_bytes starting (backend = NdArray)"
-                            );
-                            let device = InferenceDevice::default();
-                            let model: SequenceModel<InferenceBackend> = match load_checkpoint_from_bytes(
-                                MODEL_BYTES,
-                                MODEL_CONFIG,
-                                &device,
-                            ) {
-                                Ok(model) => {
-                                    tracing::info!("[replay] model loaded ok");
-                                    model
-                                }
-                                Err(error) => {
-                                    tracing::info!("[replay] model load error: {}", error);
-                                    state.set(AppState::Error(format!("Model loading error: {error}")));
-                                    return;
-                                }
-                            };
-                            tracing::info!("[replay] building results");
-                            tracing::info!("[replay] {} segments, starting inference", num_segments);
-                            if let Some(first_segment_step) = segment_steps.first_mut() {
-                                first_segment_step.status = StepStatus::Processing;
-                            }
-                            local_processing
-                                .set(
-                                    Some(LocalProcessing {
-                                        filename: filename.clone(),
-                                        progress: ProgressState {
-                                            reading_file: StepStatus::Done("Done".to_string()),
-                                            copying_into_memory: StepStatus::Done("Done".to_string()),
-                                            parsing: StepStatus::Done("Done".to_string()),
-                                            loading_model: StepStatus::Done("Done".to_string()),
-                                            segments: segment_steps.clone(),
-                                            timeline: timeline_snapshot.clone(),
-                                        },
-                                        results: None,
-                                    }),
-                                );
-                            yield_to_ui().await;
-                            yield_for_dom_paint().await;
-                            let mut segment_predictions = Vec::with_capacity(num_segments);
-                            for seg_idx in 0..num_segments {
-                                let Some(prediction) = extracted
-                                    .predict_single_segment(&model, &device, sequence_length, seg_idx)
-                                    .await else {
-                                    break;
-                                };
-                                let segment_player_ranks = ranks_from_player_predictions(
-                                    &prediction.player_predictions,
-                                );
-                                segment_predictions.push(prediction);
-                                if let Some(completed_step) = segment_steps.get_mut(seg_idx) {
-                                    completed_step.player_segment_ranks = Some(segment_player_ranks);
-                                    completed_step.status = StepStatus::Done("Complete".to_string());
-                                }
-                                if let Some(next_step) = segment_steps.get_mut(seg_idx + 1) {
-                                    next_step.status = StepStatus::Processing;
-                                }
-                                local_processing
-                                    .set(
-                                        Some(LocalProcessing {
-                                            filename: filename.clone(),
-                                            progress: ProgressState {
-                                                reading_file: StepStatus::Done("Done".to_string()),
-                                                copying_into_memory: StepStatus::Done("Done".to_string()),
-                                                parsing: StepStatus::Done("Done".to_string()),
-                                                loading_model: StepStatus::Done("Done".to_string()),
-                                                segments: segment_steps.clone(),
-                                                timeline: timeline_snapshot.clone(),
-                                            },
-                                            results: None,
-                                        }),
-                                    );
-                                yield_to_ui().await;
-                            }
-                            tracing::info!("[replay] all segments done, revealing global ranks");
-                            let global_ranks_array = global_ranks_from_predictions(&segment_predictions);
-                            if let Some(track) = timeline_snapshot.as_mut() {
-                                track.phase = AnalysisTimelinePhase::RevealingGlobalRanks;
-                                track.global_ranks = Some(global_ranks_array);
-                            }
-                            local_processing
-                                .set(
-                                    Some(LocalProcessing {
-                                        filename: filename.clone(),
-                                        progress: ProgressState {
-                                            reading_file: StepStatus::Done("Done".to_string()),
-                                            copying_into_memory: StepStatus::Done("Done".to_string()),
-                                            parsing: StepStatus::Done("Done".to_string()),
-                                            loading_model: StepStatus::Done("Done".to_string()),
-                                            segments: segment_steps.clone(),
-                                            timeline: timeline_snapshot.clone(),
-                                        },
-                                        results: None,
-                                    }),
-                                );
-                            yield_to_ui().await;
-                            if timeline_snapshot.is_some() {
-                                sleep_milliseconds(850).await;
-                            }
-                            tracing::info!("[replay] building results");
-                            match build_prediction_results(&parsed, segment_predictions) {
-                                Ok(results) => {
-                                    local_processing
-                                        .set(
-                                            Some(LocalProcessing {
-                                                filename,
-                                                progress: ProgressState {
-                                                    reading_file: StepStatus::Done("Done".to_string()),
-                                                    copying_into_memory: StepStatus::Done("Done".to_string()),
-                                                    parsing: StepStatus::Done("Done".to_string()),
-                                                    loading_model: StepStatus::Done("Done".to_string()),
-                                                    segments: segment_steps.clone(),
-                                                    timeline: timeline_snapshot.clone(),
-                                                },
-                                                results: Some(results),
-                                            }),
-                                        );
-                                }
-                                Err(message) => {
-                                    state.set(AppState::Error(message));
-                                }
-                            }
-                        });
+                        spawn(run_pipeline(file, state, local_processing));
                     },
                 }
             }
         }
     }
+}
+
+/// Pause between revealing two timeline windows. Scoring is near-instant now; the pause
+/// keeps the "scanning" animation readable.
+const WINDOW_REVEAL_MILLISECONDS: u32 = 220;
+
+/// Every step done up to and including model loading.
+fn progress_after_model(
+    segments: Vec<SegmentStepInfo>,
+    timeline: Option<TimelineTrackState>,
+) -> ProgressState {
+    ProgressState {
+        reading_file: StepStatus::Done("Done".to_string()),
+        copying_into_memory: StepStatus::Done("Done".to_string()),
+        parsing: StepStatus::Done("Done".to_string()),
+        loading_model: StepStatus::Done("Done".to_string()),
+        segments,
+        timeline,
+    }
+}
+
+/// Reads, parses and scores the replay, updating `local_processing` as each step lands.
+#[expect(clippy::future_not_send)]
+async fn run_pipeline(
+    file: Option<web_sys::File>,
+    mut state: Signal<AppState>,
+    mut local_processing: Signal<Option<LocalProcessing>>,
+) {
+    let Some(file) = file else {
+        state.set(AppState::Error("No file selected.".to_string()));
+        return;
+    };
+    let filename = file.name();
+    let mut publish = |progress: ProgressState, results: Option<PredictionResults>| {
+        local_processing.set(Some(LocalProcessing {
+            filename: filename.clone(),
+            progress,
+            results,
+        }));
+    };
+    let early = |reading: StepStatus, copying: StepStatus, parsing: StepStatus| ProgressState {
+        reading_file: reading,
+        copying_into_memory: copying,
+        parsing,
+        loading_model: StepStatus::Pending,
+        segments: vec![],
+        timeline: None,
+    };
+    let done = || StepStatus::Done("Done".to_string());
+
+    // ---- Read the file bytes via web-sys (no JS eval, no base64).
+    publish(
+        early(
+            StepStatus::Processing,
+            StepStatus::Pending,
+            StepStatus::Pending,
+        ),
+        None,
+    );
+    yield_to_ui().await;
+    let array_buffer = match JsFuture::from(file.array_buffer()).await {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            state.set(AppState::Error(format!("Could not read file: {error:?}")));
+            return;
+        }
+    };
+    publish(
+        early(done(), StepStatus::Processing, StepStatus::Pending),
+        None,
+    );
+    yield_to_ui().await;
+    yield_for_dom_paint().await;
+    let data: Vec<u8> = js_sys::Uint8Array::new(&array_buffer).to_vec();
+
+    // ---- Parse.
+    publish(early(done(), done(), StepStatus::Processing), None);
+    yield_to_ui().await;
+    yield_for_dom_paint().await;
+    let parsed = match parse_replay_from_bytes(&data) {
+        Ok(parsed) => parsed,
+        Err(ReplayAcceptanceError::Unsupported(details)) => {
+            state.set(AppState::UnsupportedReplay(details));
+            return;
+        }
+        Err(ReplayAcceptanceError::Parse(error)) => {
+            state.set(AppState::Error(format!("Replay parsing error: {error}")));
+            return;
+        }
+    };
+    if parsed.frames.is_empty() {
+        state.set(AppState::Error(
+            "No frames found in the replay.".to_string(),
+        ));
+        return;
+    }
+
+    // ---- Load the model and score the match (whole match, windows, roasts).
+    publish(
+        ProgressState {
+            loading_model: StepStatus::Processing,
+            ..early(done(), done(), done())
+        },
+        None,
+    );
+    yield_to_ui().await;
+    yield_for_dom_paint().await;
+    let bundle = match load_bundle() {
+        Ok(bundle) => bundle,
+        Err(message) => {
+            state.set(AppState::Error(message));
+            return;
+        }
+    };
+    let analysis = bundle.analyze(&parsed);
+
+    // ---- Timeline: reveal one window at a time.
+    let players = prepare_players_for_timeline(&analysis);
+    let mut segment_steps = segment_step_infos(&parsed.frames, &analysis.timeline);
+    let timeline = (!segment_steps.is_empty()).then(|| TimelineTrackState {
+        match_duration_seconds: parsed
+            .frames
+            .last()
+            .map_or(1.0_f32, |frame| frame.time)
+            .max(0.001),
+        boundary_times_seconds: compute_segment_boundary_times(&segment_steps),
+        boundary_play_times_seconds: compute_segment_boundary_play_times(
+            &parsed.frames,
+            &analysis.timeline,
+        ),
+        goals: build_goal_markers(&parsed, &players.names),
+        player_names: players.names.clone(),
+        player_teams: players.teams.clone(),
+        num_segments: segment_steps.len(),
+    });
+    publish(
+        progress_after_model(segment_steps.clone(), timeline.clone()),
+        None,
+    );
+    yield_to_ui().await;
+    yield_for_dom_paint().await;
+    for (index, window) in analysis.timeline.iter().enumerate() {
+        if let Some(step) = segment_steps.get_mut(index) {
+            step.player_segment_ranks = Some(ranks_from_player_mmr(&window.player_mmr));
+            step.status = StepStatus::Done("Complete".to_string());
+        }
+        publish(
+            progress_after_model(segment_steps.clone(), timeline.clone()),
+            None,
+        );
+        yield_to_ui().await;
+        sleep_milliseconds(WINDOW_REVEAL_MILLISECONDS).await;
+    }
+
+    // ---- Cards and verdict.
+    publish(
+        progress_after_model(segment_steps, timeline),
+        Some(build_prediction_results(&analysis)),
+    );
 }

@@ -2,7 +2,8 @@
 #![allow(clippy::redundant_pub_crate)]
 //! Dioxus web application: tongue-in-cheek smurf detection from Rocket League replays.
 //!
-//! Upload a `.replay` file and get per-player MMR estimates in segment and summary views.
+//! Upload a `.replay` file and get per-player rank estimates for the whole match, a one-minute
+//! form timeline, and a roast about what the next rank up does better.
 
 mod app_state;
 mod branding;

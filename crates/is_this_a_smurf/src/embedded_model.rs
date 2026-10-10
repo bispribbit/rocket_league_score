@@ -1,24 +1,31 @@
-//! Embedded checkpoint and training config for WASM inference.
+//! The skill model bundle embedded in the app.
+//!
+//! Rebuilt by `cargo run --release -p skill_model_training --bin train`, which writes
+//! `data/skill_model.bin` (see `docs/model.md`).
 
-/// Model weights in binary format (saved via `save_checkpoint_bin`).
-#[expect(clippy::large_include_file)]
-pub(crate) static MODEL_BYTES: &[u8] = include_bytes!("../../../data/v20.mpk");
+use skill_model::SkillModelBundle;
 
-/// Model training config JSON (for architecture dimensions).
-pub(crate) static MODEL_CONFIG: &str = include_str!("../../../data/v20.config.json");
+/// Encoded [`SkillModelBundle`].
+#[expect(
+    clippy::large_include_file,
+    reason = "the model is meant to ship inside the app (about 1.4 MB)"
+)]
+static MODEL_BYTES: &[u8] = include_bytes!("../../../data/skill_model.bin");
 
-/// Default sequence length for inference (subsampled frames per segment; must match checkpoint).
-pub(crate) const DEFAULT_SEQUENCE_LENGTH: usize = 150;
-
-/// Sequence length from embedded [`MODEL_CONFIG`], or [`DEFAULT_SEQUENCE_LENGTH`] if missing.
-pub(crate) fn sequence_length_from_embedded_config() -> usize {
-    if MODEL_CONFIG.is_empty() {
-        return DEFAULT_SEQUENCE_LENGTH;
+/// Decodes the embedded bundle and checks it was trained on the stats this build computes.
+///
+/// # Errors
+///
+/// A human-readable message when the bundle is corrupt or out of date.
+pub(crate) fn load_bundle() -> Result<SkillModelBundle, String> {
+    let bundle = SkillModelBundle::from_bytes(MODEL_BYTES)
+        .map_err(|error| format!("Model loading error: {error}"))?;
+    if !bundle.match_model.matches_current_stats() || !bundle.window_model.matches_current_stats() {
+        return Err(
+            "The built-in model was trained on different stats than this version computes. \
+             Retrain it with `skill_model_training`."
+                .to_string(),
+        );
     }
-    serde_json::from_str::<serde_json::Value>(MODEL_CONFIG)
-        .ok()
-        .and_then(|config_value| config_value.get("sequence_length")?.as_u64())
-        .map_or(DEFAULT_SEQUENCE_LENGTH, |length_value| {
-            length_value as usize
-        })
+    Ok(bundle)
 }

@@ -256,7 +256,7 @@ pub(crate) fn AnalysisTimeline(progress: ProgressState) -> Element {
                                                             .and_then(|step| {
                                                                 step.player_segment_ranks
                                                                     .as_ref()
-                                                                    .and_then(|ranks| ranks.get(player_lane_index).copied())
+                                                                    .and_then(|ranks| ranks.get(player_lane_index).copied().flatten())
                                                             });
                                                         let opacity_class = if rank_visible { "opacity-100" } else { "opacity-0" };
                                                         rsx! {

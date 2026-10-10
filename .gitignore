@@ -23,3 +23,5 @@ test_data/*.json
 *.pdb
 
 .env
+# Per-player stats extracted for training (`extract_stats`): regenerable and large.
+data/*_stats.csv

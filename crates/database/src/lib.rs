@@ -1,18 +1,16 @@
 //! Database crate for Rocket League impact score calculator.
 //!
 //! Provides connection pooling, migrations, and repository functions
-//! for replays, players, and ML models.
+//! for replays and players.
 
 use std::sync::LazyLock;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
-pub mod model;
 pub mod replay;
 pub mod replay_player;
 
-pub use model::*;
 pub use replay::*;
 pub use replay_player::*;
 
