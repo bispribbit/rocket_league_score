@@ -19,8 +19,10 @@ workspace = true
 # Internal dependencies
 bytes.workspace = true
 chrono.workspace = true
+dotenvy.workspace = true
 config.workspace = true
 database.workspace = true
+replay_parser.workspace = true
 replay_structs = { workspace = true, features = ["database"] }
 
 # External dependencies

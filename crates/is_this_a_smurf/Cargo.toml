@@ -9,16 +9,14 @@ workspace = true
 
 [dependencies]
 getrandom.workspace = true
-ml_model.workspace = true
 replay_parser.workspace = true
 replay_structs.workspace = true
+skill_model.workspace = true
 feature_extractor.workspace = true
 rand.workspace = true
 
-burn.workspace = true
 dioxus = { workspace = true, features = ["web"] }
 manganis.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true

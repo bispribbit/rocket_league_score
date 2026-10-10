@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use boxcars::{Attribute, HeaderProp, ParserBuilder, Replay};
 use replay_structs::{
-    ActorState, BallState, GameFrame, GoalEvent, ParsedReplay, PlayerState, Team,
-    UnsupportedReplayMatch,
+    ActorState, BallState, DemolitionEvent, GameFrame, GoalEvent, HeaderPlayerStats, ParsedReplay,
+    PlayerState, Team, UnsupportedReplayMatch,
 };
 
 pub mod match_validation;
@@ -176,6 +176,16 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
         &replay.objects,
         "TAGame.GameEvent_Soccar_TA:SecondsRemaining",
     );
+    // Replays recorded before the `ReplicatedBoost` struct existed carry the amount as a plain
+    // byte. Without this, every car in those replays reads boost = 0 for the whole match —
+    // about three quarters of the bronze-1 training replays (they are old because bronze
+    // uploads are rare), which turned "no boost" into a bronze marker.
+    let legacy_boost_amount_attr = find_object_id(
+        &replay.objects,
+        "TAGame.CarComponent_Boost_TA:ReplicatedBoostAmount",
+    );
+    let input_attributes = InputAttributeIds::find(&replay.objects);
+    let component_archetypes = ComponentArchetypeIds::find(&replay.objects);
 
     let network_frames = replay
         .network_frames
@@ -187,6 +197,9 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     let mut car_actors: HashMap<i32, ActorState> = HashMap::new();
     let mut boost_actors: HashMap<i32, i32> = HashMap::new(); // boost_actor_id -> car_actor_id
     let mut boost_amounts: HashMap<i32, f32> = HashMap::new(); // car_actor_id -> boost (0-1)
+    // Car component actor id -> its kind, and -> the car it belongs to.
+    let mut component_kinds: HashMap<i32, CarComponentKind> = HashMap::new();
+    let mut component_cars: HashMap<i32, i32> = HashMap::new();
     let mut player_infos: HashMap<i32, PlayerInfo> = HashMap::new(); // PRI actor_id -> PlayerInfo
     let mut car_to_actor_id: HashMap<i32, i32> = HashMap::new(); // car_actor_id -> PRI actor_id
     // Forward mapping: which actors each actor references via ActiveActor (can be multiple)
@@ -210,6 +223,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
     let mut last_kickoff_detected = false;
 
     for (frame_idx, frame) in network_frames.frames.iter().enumerate() {
+        let mut frame_demolitions: Vec<DemolitionEvent> = Vec::new();
         // Handle new actors
         for new_actor in &frame.new_actors {
             let actor_id = new_actor.actor_id.0;
@@ -222,6 +236,9 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             } else if Some(object_id) == boost_object_id {
                 // Boost component - we'll link it to a car via Vehicle attribute
                 boost_actors.insert(actor_id, 0);
+            }
+            if let Some(kind) = component_archetypes.kind_of(object_id) {
+                component_kinds.insert(actor_id, kind);
             }
 
             // Check if this is a PRI (player replication info) based on object name
@@ -239,6 +256,8 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             ball_actors.remove(&actor_id);
             car_actors.remove(&actor_id);
             boost_actors.remove(&actor_id);
+            component_kinds.remove(&actor_id);
+            component_cars.remove(&actor_id);
             player_infos.remove(&actor_id);
             car_to_actor_id.remove(&actor_id);
             // Also remove any car_to_actor_id entries that point TO this deleted actor (PRI deletion)
@@ -268,6 +287,10 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                             .map(Into::into)
                             .unwrap_or_default(),
                         rotation: rigid_body.rotation.into(),
+                        angular_velocity: rigid_body
+                            .angular_velocity
+                            .map(Into::into)
+                            .unwrap_or_default(),
                         ..Default::default()
                     };
 
@@ -281,6 +304,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         existing.position = state.position;
                         existing.velocity = state.velocity;
                         existing.rotation = state.rotation;
+                        existing.angular_velocity = state.angular_velocity;
                     }
                 }
                 Attribute::ReplicatedBoost(boost) => {
@@ -380,6 +404,9 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         let car_id = referenced_actor;
                         boost_actors.insert(actor_id, car_id);
                     }
+                    if component_kinds.contains_key(&actor_id) {
+                        component_cars.insert(actor_id, referenced_actor);
+                    }
 
                     // KEY INSIGHT: A car actor can directly reference its PRI via ActiveActor!
                     // If THIS actor is a car and the referenced actor is a PRI, link them directly
@@ -449,6 +476,57 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                         }
                     }
                 }
+                Attribute::Byte(value) => {
+                    let object_id = update.object_id.0 as usize;
+                    let amount = value;
+                    if Some(object_id) == input_attributes.replicated_active
+                        && let Some(&kind) = component_kinds.get(&actor_id)
+                        && let Some(&car_id) = component_cars.get(&actor_id)
+                        && let Some(car) = car_actors.get_mut(&car_id)
+                    {
+                        let active = value % 2 == 1;
+                        match kind {
+                            CarComponentKind::Boost => car.controls.boosting = active,
+                            CarComponentKind::Jump => car.controls.jumping = active,
+                            CarComponentKind::DoubleJump => car.controls.double_jumping = active,
+                            CarComponentKind::Dodge => car.controls.dodging = active,
+                        }
+                    } else if Some(object_id) == input_attributes.throttle
+                        && let Some(car) = car_actors.get_mut(&actor_id)
+                    {
+                        car.controls.throttle = byte_axis(*value);
+                    } else if Some(object_id) == input_attributes.steer
+                        && let Some(car) = car_actors.get_mut(&actor_id)
+                    {
+                        car.controls.steer = byte_axis(*value);
+                    } else if Some(object_id) == legacy_boost_amount_attr
+                        && let Some(&car_id) = boost_actors.get(&actor_id)
+                        && car_id != 0
+                    {
+                        let boost_normalized = f32::from(*amount) / 255.0;
+                        boost_amounts.insert(car_id, boost_normalized);
+                        if let Some(car) = car_actors.get_mut(&car_id) {
+                            car.boost = boost_normalized;
+                        }
+                    }
+                }
+                Attribute::Boolean(value) => {
+                    let object_id = update.object_id.0 as usize;
+                    if Some(object_id) == input_attributes.handbrake
+                        && let Some(car) = car_actors.get_mut(&actor_id)
+                    {
+                        car.controls.handbrake = *value;
+                    }
+                }
+                Attribute::Location(vector) => {
+                    let object_id = update.object_id.0 as usize;
+                    if Some(object_id) == input_attributes.dodge_torque
+                        && let Some(&car_id) = component_cars.get(&actor_id)
+                        && let Some(car) = car_actors.get_mut(&car_id)
+                    {
+                        car.controls.dodge_torque = (*vector).into();
+                    }
+                }
                 Attribute::Int(seconds) => {
                     let object_id = update.object_id.0 as usize;
                     if Some(object_id) == seconds_remaining_attr {
@@ -458,6 +536,22 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                 Attribute::Demolish(demo) => {
                     // Mark car as demolished
                     let victim_id = demo.victim.0;
+                    frame_demolitions.push(DemolitionEvent {
+                        attacker_actor_id: demo.attacker.0,
+                        victim_actor_id: victim_id,
+                    });
+                    if let Some(car) = car_actors.get_mut(&victim_id) {
+                        car.is_demolished = true;
+                    }
+                }
+                Attribute::DemolishExtended(demo) => {
+                    // Newer replays only send this variant. Before it was handled, demolitions
+                    // in those replays were invisible: no demolished flag, no event.
+                    let victim_id = demo.victim.actor.0;
+                    frame_demolitions.push(DemolitionEvent {
+                        attacker_actor_id: demo.attacker.actor.0,
+                        victim_actor_id: victim_id,
+                    });
                     if let Some(car) = car_actors.get_mut(&victim_id) {
                         car.is_demolished = true;
                     }
@@ -465,6 +559,10 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
                 Attribute::DemolishFx(demo) => {
                     // Mark car as demolished (extended version)
                     let victim_id = demo.victim.0;
+                    frame_demolitions.push(DemolitionEvent {
+                        attacker_actor_id: demo.attacker.0,
+                        victim_actor_id: victim_id,
+                    });
                     if let Some(car) = car_actors.get_mut(&victim_id) {
                         car.is_demolished = true;
                     }
@@ -570,6 +668,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
             seconds_remaining: current_seconds_remaining,
             ball: ball_state,
             players,
+            demolitions: frame_demolitions,
         });
     }
 
@@ -615,6 +714,7 @@ fn parse_boxcars_replay(replay: &Replay) -> anyhow::Result<ParsedReplay> {
         goals,
         goal_frames,
         kickoff_frames,
+        header_player_stats: extract_header_player_stats(replay),
     })
 }
 
@@ -653,6 +753,29 @@ fn extract_goals(replay: &Replay) -> Vec<GoalEvent> {
 
 fn find_object_id(objects: &[String], name: &str) -> Option<usize> {
     objects.iter().position(|o| o == name)
+}
+
+/// Reads every player's end-of-match scoreboard line from the header's `PlayerStats`.
+fn extract_header_player_stats(replay: &Replay) -> Vec<HeaderPlayerStats> {
+    match_validation::player_stats_row_slices(replay)
+        .into_iter()
+        .map(|player_props| {
+            let mut stats = HeaderPlayerStats::default();
+            for (prop_key, prop_value) in player_props {
+                match (prop_key.as_str(), prop_value) {
+                    ("Name", HeaderProp::Str(name)) => stats.name.clone_from(name),
+                    ("Team", HeaderProp::Int(team)) => stats.team = Some(Team::from(*team as u8)),
+                    ("Score", HeaderProp::Int(value)) => stats.score = *value,
+                    ("Goals", HeaderProp::Int(value)) => stats.goals = *value,
+                    ("Assists", HeaderProp::Int(value)) => stats.assists = *value,
+                    ("Saves", HeaderProp::Int(value)) => stats.saves = *value,
+                    ("Shots", HeaderProp::Int(value)) => stats.shots = *value,
+                    _ => {}
+                }
+            }
+            stats
+        })
+        .collect()
 }
 
 /// Extract player name -> team mapping from the replay header's `PlayerStats`.
@@ -809,5 +932,77 @@ mod tests {
             last.seconds_remaining < 300,
             "seconds_remaining should decrease during a match"
         );
+    }
+}
+
+/// Maps a replicated input byte (128 = centred) onto `[-1, 1]`.
+fn byte_axis(value: u8) -> f32 {
+    ((f32::from(value) - 128.0) / 127.0).clamp(-1.0, 1.0)
+}
+
+/// Car components whose `ReplicatedActive` byte is tracked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarComponentKind {
+    Boost,
+    Jump,
+    DoubleJump,
+    Dodge,
+}
+
+/// Object ids of the archetypes that spawn each tracked car component.
+struct ComponentArchetypeIds {
+    boost: Option<usize>,
+    jump: Option<usize>,
+    double_jump: Option<usize>,
+    dodge: Option<usize>,
+}
+
+impl ComponentArchetypeIds {
+    fn find(objects: &[String]) -> Self {
+        Self {
+            boost: find_object_id(objects, "Archetypes.CarComponents.CarComponent_Boost"),
+            jump: find_object_id(objects, "Archetypes.CarComponents.CarComponent_Jump"),
+            double_jump: find_object_id(
+                objects,
+                "Archetypes.CarComponents.CarComponent_DoubleJump",
+            ),
+            dodge: find_object_id(objects, "Archetypes.CarComponents.CarComponent_Dodge"),
+        }
+    }
+
+    fn kind_of(&self, object_id: usize) -> Option<CarComponentKind> {
+        let id = Some(object_id);
+        if id == self.boost {
+            Some(CarComponentKind::Boost)
+        } else if id == self.jump {
+            Some(CarComponentKind::Jump)
+        } else if id == self.double_jump {
+            Some(CarComponentKind::DoubleJump)
+        } else if id == self.dodge {
+            Some(CarComponentKind::Dodge)
+        } else {
+            None
+        }
+    }
+}
+
+/// Object ids of the input-related attributes.
+struct InputAttributeIds {
+    throttle: Option<usize>,
+    steer: Option<usize>,
+    handbrake: Option<usize>,
+    replicated_active: Option<usize>,
+    dodge_torque: Option<usize>,
+}
+
+impl InputAttributeIds {
+    fn find(objects: &[String]) -> Self {
+        Self {
+            throttle: find_object_id(objects, "TAGame.Vehicle_TA:ReplicatedThrottle"),
+            steer: find_object_id(objects, "TAGame.Vehicle_TA:ReplicatedSteer"),
+            handbrake: find_object_id(objects, "TAGame.Vehicle_TA:bReplicatedHandbrake"),
+            replicated_active: find_object_id(objects, "TAGame.CarComponent_TA:ReplicatedActive"),
+            dodge_torque: find_object_id(objects, "TAGame.CarComponent_Dodge_TA:DodgeTorque"),
+        }
     }
 }

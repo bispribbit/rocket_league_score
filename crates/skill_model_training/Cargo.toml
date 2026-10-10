@@ -1,0 +1,27 @@
+[package]
+name = "skill_model_training"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+config.workspace = true
+database.workspace = true
+feature_extractor.workspace = true
+replay_parser.workspace = true
+replay_structs = { workspace = true, features = ["database"] }
+skill_model = { workspace = true, features = ["encode"] }
+
+anyhow.workspace = true
+clap.workspace = true
+csv.workspace = true
+rayon.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]

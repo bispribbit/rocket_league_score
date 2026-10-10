@@ -10,36 +10,23 @@ pub(crate) struct PredictionResults {
     pub(crate) player_names: Vec<String>,
     /// Team for each player (6 entries).
     pub(crate) player_teams: Vec<Team>,
-    /// Per-segment predictions.
-    pub(crate) segments: Vec<SegmentDisplayData>,
-    /// Final averaged results per player.
+    /// Whole-match result per player.
     pub(crate) player_averages: Vec<PlayerAverage>,
 }
 
-/// Display data for a single segment.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SegmentDisplayData {
-    /// One-based segment number.
-    pub(crate) segment_number: usize,
-    /// Start time in seconds.
-    pub(crate) start_time: f32,
-    /// End time in seconds.
-    pub(crate) end_time: f32,
-    /// Predicted MMR for each player (6 values).
-    pub(crate) player_mmr: [f32; TOTAL_PLAYERS],
-}
-
-/// Averaged result for a single player.
+/// Whole-match result for a single player.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PlayerAverage {
     /// Player name.
     pub(crate) name: String,
     /// Player team.
     pub(crate) team: Team,
-    /// Median predicted MMR across all segments.
-    pub(crate) median_mmr: f32,
-    /// Rank derived from median MMR.
+    /// Whole-match predicted MMR.
+    pub(crate) mmr: f32,
+    /// Rank derived from [`Self::mmr`].
     pub(crate) rank: RankDivision,
+    /// One-line roast: what the next rank up does better.
+    pub(crate) next_rank_roast: Option<String>,
 }
 
 /// Status of a single step in the pipeline.
@@ -56,8 +43,9 @@ pub(crate) struct SegmentStepInfo {
     pub(crate) start_time: f32,
     pub(crate) end_time: f32,
     pub(crate) status: StepStatus,
-    /// Filled when the segment inference step is complete.
-    pub(crate) player_segment_ranks: Option<[RankDivision; TOTAL_PLAYERS]>,
+    /// Filled when the window is revealed; a slot is `None` when that player was (nearly)
+    /// absent from the window.
+    pub(crate) player_segment_ranks: Option<[Option<RankDivision>; TOTAL_PLAYERS]>,
 }
 
 /// One goal shown on the analysis timeline (replay-derived).
@@ -67,13 +55,6 @@ pub(crate) struct GoalMarkerDisplay {
     pub(crate) scorer_name: String,
     pub(crate) team: Team,
     pub(crate) player_lane_index: Option<usize>,
-}
-
-/// Whether cars are advancing per segment or moving to the global rank column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AnalysisTimelinePhase {
-    InferenceInProgress,
-    RevealingGlobalRanks,
 }
 
 /// State for the animated match timeline during processing.
@@ -87,12 +68,10 @@ pub(crate) struct TimelineTrackState {
     pub(crate) goals: Vec<GoalMarkerDisplay>,
     pub(crate) player_names: Vec<String>,
     pub(crate) player_teams: Vec<Team>,
-    pub(crate) phase: AnalysisTimelinePhase,
     pub(crate) num_segments: usize,
-    pub(crate) global_ranks: Option<[RankDivision; TOTAL_PLAYERS]>,
 }
 
-/// Live progress during analysis (parsing, model load, segments).
+/// Live progress during analysis (parsing, model load, timeline windows).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProgressState {
     /// Reading file bytes from the browser file API (can take a moment for large replays).

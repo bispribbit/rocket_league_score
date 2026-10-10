@@ -25,7 +25,7 @@ const PREDICTED_RANK_ROAST_LABELS: [&str; 10] = [
 ];
 
 fn player_looks_high_for_lobby(player_mmr: f32, lobby_median_mmr: f32) -> bool {
-    player_mmr > lobby_median_mmr + ml_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR
+    player_mmr > lobby_median_mmr + skill_model::SMURF_MARGIN_OVER_LOBBY_MEDIAN_MMR
 }
 
 fn predicted_rank_roast_label() -> &'static str {
@@ -210,16 +210,6 @@ fn TeamSummaryCard(
         "text-orange-400"
     };
 
-    let _team_average_mmr = if players_complete.is_empty() {
-        0.0
-    } else {
-        players_complete
-            .iter()
-            .map(|player| player.median_mmr)
-            .sum::<f32>()
-            / players_complete.len() as f32
-    };
-
     rsx! {
         div { class: "bg-gray-900 rounded-xl border {border_color} overflow-hidden",
             div { class: "bg-gradient-to-r {header_gradient} px-6 py-4",
@@ -255,8 +245,11 @@ fn TeamSummaryCard(
                                     "{player.name}"
                                 }
                                 p { class: "text-sm text-gray-500", "{player.rank}" }
+                                if let Some(roast) = &player.next_rank_roast {
+                                    p { class: "text-xs italic text-gray-400 leading-snug", "{roast}" }
+                                }
                             }
-                            if player_looks_high_for_lobby(player.median_mmr, lobby_median_mmr) {
+                            if player_looks_high_for_lobby(player.mmr, lobby_median_mmr) {
                                 div { class: "flex shrink-0 items-center justify-center gap-2 sm:gap-3",
                                     LobbyAlertTriangleIcon {}
                                     img {

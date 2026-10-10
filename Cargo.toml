@@ -16,19 +16,14 @@ config = { path = "crates/config" }
 database = { path = "crates/database" }
 replay_parser = { path = "crates/replay_parser" }
 feature_extractor = { path = "crates/feature_extractor" }
-ml_model = { path = "crates/ml_model" }
-ml_model_training = { path = "crates/ml_model_training" }
+skill_model = { path = "crates/skill_model" }
 replay_structs = { path = "crates/replay_structs" }
 
 # External workspace dependencies
 anyhow = { version = "1.0.104" }
-backon = { version = "1.6.0" }
-base64 = { version = "0.23.1" }
 boxcars = { version = "0.12.0" }
-burn = { version = "0.22.0", default-features = false, features = ["flex", "std", "autodiff", "extension"] }
-burn-cubecl = { version = "0.22.0" }
-cubecl = { version = "0.11.0", default-features = false }
-bytemuck = { version = "1.25.2" }
+brotli = { version = "9.0.0" }
+brotli-decompressor = { version = "6.0.1" }
 bytes = { version = "1.12.1" }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
@@ -42,11 +37,8 @@ getrandom_for_transitive_rand = { package = "getrandom", version = "0.3.4", defa
 ] }
 governor = { version = "0.10.4" }
 js-sys = { version = "0.3.106" }
-memmap2 = { version = "0.9.11" }
 manganis = { version = "0.7.10", default-features = false, features = ["dioxus"] }
-mimalloc = { version = "0.1.52" }
 object_store = { version = "0.14.2" }
-parking_lot = { version = "0.12.5" }
 rayon = { version = "1.12.0" }
 rand = { version = "0.10.3", default-features = false, features = ["std", "thread_rng"] }
 reqwest = { version = "0.13.5", features = ["json"] }

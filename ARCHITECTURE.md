@@ -1,299 +1,55 @@
-# Rocket League Impact Score Calculator - Architecture
+# Architecture
 
-## Overview
-
-An ML-based system to evaluate player performance in Rocket League replays, outputting an "impact score" that reflects skill level (similar to MMR: 100-300 for bronze, 1500+ for elite players).
-
-## Crate Structure
+## Crates
 
 ```
 crates/
-├── database/             # PostgreSQL access via SQLx
-├── replay_parser/        # Parse .replay files using boxcars
-├── feature_extractor/    # Extract ML features from frame data
-├── ml_model/             # Burn neural network for prediction
-└── rocket_league_score/  # CLI binary (ingest/train/predict/test-pipeline)
+├── replay_structs/          # Shared types: frames, players, ranks, dataset splits
+├── replay_parser/           # .replay → frames (positions, boost, inputs, demos, scoreboard) via boxcars
+├── feature_extractor/       # frames → 71 per-player stats (whole match or a frame window)
+├── skill_model/             # Gradient-boosted trees, timeline, roast, compact bundle format (WASM-safe)
+├── skill_model_training/    # extract_stats + train binaries; GBDT trainer and evaluation
+├── is_this_a_smurf/         # Dioxus WASM web app (embeds data/skill_model.bin)
+├── ballchasing_downloader/  # Ballchasing API ingestion, download loop, DB maintenance binaries
+├── database/                # PostgreSQL access via SQLx (replays, players, splits)
+└── config/                  # Environment and replay-store configuration
 ```
 
-## Data Flow
+## Data flow
 
 ```
-.replay files + metadata.jsonl
-    │
-    ▼
-┌─────────────────┐
-│  replay_parser  │  Parse with boxcars → ParsedReplay, GameFrame, PlayerState
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  feature_extractor  │  Extract per-frame features (147 floats)
-└────────┬────────────┘
-         │
-         ▼
-┌─────────────────┐
-│    ml_model     │  Burn neural network → Impact Score (0-2000+)
-└────────┬────────┘
-         │
-         ▼
-    Impact Score
+Ballchasing API ──► ballchasing_downloader ──► PostgreSQL (replays, player ranks, splits)
+                                         └──► replay files on disk
+
+replay files + ranks ──► extract_stats ──► data/match_stats.csv, data/window_stats.csv
+                                              │
+                                              ▼
+                                    train ──► data/skill_model.bin
+                                              │ (include_bytes!)
+                                              ▼
+user's .replay ──► replay_parser ──► feature_extractor ──► skill_model ──► is_this_a_smurf UI
 ```
 
-## Database Schema
-
-### Tables
-
-- **replays**: Metadata (id, file_path, game_mode, timestamps)
-- **replay_players**: Player ratings per replay (player_name, team, skill_rating as MMR)
-- **models**: Trained model versions (name, version, checkpoint_path, config, metrics)
-
-### Game Modes
-
-`soccar_3v3`, `soccar_2v2`, `soccar_1v1`, `hoops`, `rumble`, `dropshot`, `snowday`
-
-## CLI Commands
-
-```bash
-# End-to-end pipeline test (no database required)
-rocket_league_score test-pipeline \
-  --replay-dir replays/3v3 \
-  --metadata replays/3v3/metadata.jsonl \
-  --num-replays 5
-
-# Ingest replays with player MMR ratings
-rocket_league_score ingest --folder replays/3v3 --game-mode 3v3 --ratings-file ratings.csv
-
-# Train the model
-rocket_league_score train --name impact_model --epochs 100 --batch-size 64
-
-# Predict impact scores for a replay
-rocket_league_score predict --replay game.replay --model impact_model
-
-# Run database migrations
-rocket_league_score migrate
-```
-
-## Key Design Decisions
-
-1. **MMR-based labels**: Using actual player MMR (integer) instead of categorical skill labels allows the model to learn the continuous skill spectrum.
-
-2. **Per-frame features**: 147 features including:
-   - Ball state (7): position, velocity, speed
-   - Per player state (6 × 13 = 78): position, velocity, rotation quaternion, speed, boost, demolished
-   - Per player geometry (6 × 9 = 54): distance to ball, distance to own goal, facing ball, goal line position, distance to each teammate (2), distance to each opponent (3)
-   - Team context (2 × 3 = 6): team centroid, average boost
-   - Game context (2): ball distance to each goal
-
-3. **Segment-based training**: Replays are split into segments between kickoffs and goals for focused learning.
-
-4. **Minimal database storage**: Only metadata and player ratings stored, not full replay data.
-
-5. **Metadata from ballchasing.com**: Player ranks are extracted from `metadata.jsonl` files and converted to MMR using rank-to-MMR mapping tables.
-
----
-
-## Implementation Status
-
-### ✅ DONE: Core Infrastructure
-
-- [x] Workspace configuration with all crates
-- [x] Database migrations for all tables
-- [x] Repository functions (CRUD for replays, players, models)
-- [x] CLI commands structure (ingest, train, predict, migrate, test-pipeline)
-
-### ✅ DONE: replay_parser
-
-- [x] **Implemented `parse_replay()` with boxcars**:
-  - Parses network frames from boxcars `Replay`
-  - Extracts ball actor positions/velocities per frame
-  - Extracts player/car actor positions/velocities/boost per frame
-  - Extracts goal events from replay header
-  - Detects kickoff frames (ball at center position)
-  - Tracks team assignments via TeamPaint and FlaggedByte attributes
-  
-- [ ] **Player names**: Currently showing as `Player_X` - need to properly link PlayerReplicationInfo names to car actors
-
-### ✅ DONE: feature_extractor
-
-- [x] **Implemented `extract_frame_features()`**: Full 147-feature extraction:
-  - Ball state: position, velocity, speed
-  - Player state: position, velocity, rotation (quaternion), speed magnitude, boost, demolished
-  - Player geometry: distance to ball, distance to own goal, facing ball angle, goal-line position
-  - Team context: team centroid position, average boost
-  - Game context: ball-to-goal distances
-  
-- [x] **Normalization**: All features normalized to [-1, 1] or [0, 1] ranges during extraction
-- [x] **FEATURES.md**: Comprehensive documentation of all features with indices
-
-### ✅ DONE: ml_model
-
-- [x] **ImpactModel**: 3-layer feedforward neural network (147 → 256 → 128 → 1)
-- [x] **Training pipeline**:
-  - `ImpactDataset` and `ImpactBatcher` for data loading
-  - Adam optimizer with configurable learning rate
-  - MSE loss function
-  - Validation split (configurable, default 10%)
-  - Early stopping (10 epochs patience)
-  - Progress logging
-- [x] **Inference**: `predict()` and `predict_batch()` functions
-- [x] **Checkpointing**: `save_checkpoint()` and `load_checkpoint()` using Burn's MessagePack format
-- [x] **Documentation**: MLModel.md with architecture and usage guide
-
-### ✅ DONE: test_pipeline Command
-
-- [x] **Metadata parsing**: Reads `metadata.jsonl` and extracts player ranks
-- [x] **Rank-to-MMR mapping**: Converts rank strings to MMR values
-- [x] **End-to-end test**: Parses replays, extracts features, trains model, runs inference
-- [x] **Sanity checks**: Verifies loss is finite and predictions are in reasonable range
-
-### 🔄 IN PROGRESS: Full Training
-
-- [ ] Run small-scale test to verify pipeline works
-- [ ] Scale up to full dataset with proper train/validation/test splits
-- [ ] Evaluate model performance
-
-### Future Enhancements
-
-- [ ] BakkesMod integration for real-time scoring
-- [ ] Support for 2v2 and 1v1 game modes (different feature counts)
-- [ ] Advanced features: 50/50 outcomes, passing sequences, boost steal detection
-- [ ] Per-player scoring (not just per-frame)
-- [ ] Training dashboard with loss curves
-- [ ] Model hyperparameter tuning
-
----
-
-## Training Data
-
-### Available Data
-
-| Mode | Replays | Metadata |
-|------|---------|----------|
-| 3v3  | 36,078  | ✅ metadata.jsonl |
-| 2v2  | 42,200  | ✅ metadata.jsonl |
-| 1v1  | 41,318  | ✅ metadata.jsonl |
-
-### Metadata Format
-
-Each line in `metadata.jsonl` is a JSON object with:
-- `id`: Replay UUID (matches filename without `.replay`)
-- `data.blue.players[]`: Blue team players with `rank.id`, `rank.division`
-- `data.orange.players[]`: Orange team players with `rank.id`, `rank.division`
-
-### Rank-to-MMR Mapping
-
-Player ranks are converted to approximate MMR values:
-
-| Rank | Base MMR |
-|------|----------|
-| Supersonic Legend | 1883 |
-| Grand Champion III | 1706 |
-| Grand Champion II | 1575 |
-| Grand Champion I | 1436 |
-| Champion III | 1315 |
-| Champion II | 1195 |
-| Champion I | 1075 |
-| Diamond III | 980 |
-| Diamond II | 915 |
-| Diamond I | 835 |
-| Platinum III | 760 |
-| ... | ... |
-| Bronze I | 0 |
-
-Each division adds ~20-40 MMR to the base value.
-
----
-
-## Quick Start: Running the Pipeline Test
-
-```bash
-# Build the project
-cargo build --release
-
-# Run end-to-end test with 5 replays
-./target/release/rocket_league_score test-pipeline \
-  --replay-dir /workspace/replays/3v3 \
-  --metadata /workspace/replays/3v3/metadata.jsonl \
-  --num-replays 5
-```
-
-Expected output:
-1. Loads metadata and matches to replay files
-2. Parses replays and extracts features
-3. Trains model for 5 epochs
-4. Runs inference on samples
-5. Reports sanity check results
-6. Displays timing breakdown for each step
-
----
-
-## Performance and Timing
-
-The pipeline includes comprehensive timing measurements to help identify bottlenecks and optimize performance. Timing information is logged at multiple levels:
-
-### Pipeline-Level Timing
-
-Both `test-pipeline` and `full_train` commands report timing for each major step:
-
-**test-pipeline timing:**
-- Step 1: Loading metadata (database queries)
-- Step 2: Extracting game sequences (parsing + feature extraction)
-  - Per-replay parse time
-  - Per-replay feature extraction time
-- Step 3: Model creation
-- Step 4: Training (with per-epoch breakdown)
-- Step 5: Inference
-- Step 6: Sanity checks
-- Total pipeline duration
-
-**full_train timing:**
-- Step 1: Dataset split assignment
-- Step 2: Collecting game metadata
-- Step 3: Creating lazy datasets
-- Step 4: Model initialization
-- Step 5: Training (with per-epoch breakdown)
-- Step 6: Saving model to database
-- Step 7: Evaluation on test set
-- Total pipeline duration
-
-### Training-Level Timing
-
-During training, each epoch reports:
-- **Epoch duration**: Total time for the epoch
-- **Data loading time**: Time spent loading batches from dataset
-- **Batch processing time**: Time spent on forward/backward passes and optimization
-- **Validation time**: Time spent computing validation loss
-
-This breakdown helps identify whether bottlenecks are in:
-- **Data loading**: If data loading time is high, consider:
-  - Using lazy loading (already implemented for full_train)
-  - Increasing batch size to reduce per-batch overhead
-  - Optimizing dataset access patterns
-- **Batch processing**: If batch processing time is high, consider:
-  - Using GPU acceleration (Wgpu backend)
-  - Reducing model size
-  - Optimizing batch size
-- **Validation**: If validation time is high, consider:
-  - Reducing validation set size
-  - Computing validation less frequently
-
-### Typical Performance Characteristics
-
-For a typical training run with 1000 games:
-- **Metadata loading**: ~1-5 seconds
-- **Feature extraction**: ~10-30 seconds per replay (depends on replay length)
-- **Model creation**: <1 second
-- **Training**: ~5-15 seconds per epoch (depends on batch size and GPU)
-- **Inference**: <1 second per sample
-
-### Optimization Tips
-
-1. **Batch size**: Larger batches reduce per-batch overhead but require more memory. Typical values: 32-128 for training, 2048 for validation.
-
-2. **Lazy loading**: The full_train command uses lazy loading to avoid loading all replays into memory. This is essential for large datasets.
-
-3. **GPU acceleration**: Training uses the Wgpu backend for GPU acceleration. Ensure proper GPU drivers are installed.
-
-4. **Data preprocessing**: Consider preprocessing and caching features if feature extraction is a bottleneck.
-
-5. **Parallel processing**: Replay parsing and feature extraction can be parallelized across multiple replays (future enhancement).
+The app and training share one code path for stats (`feature_extractor`) and prediction
+(`skill_model`), so what is evaluated is exactly what ships.
+
+## Key decisions
+
+- **Hand-written stats + gradient-boosted trees** instead of a neural network. Faster to
+  train (minutes on CPU), deterministic, small enough for the browser, and far more accurate
+  on this data; see [`docs/model.md`](docs/model.md).
+- **Team-canonical stats.** Every positional stat is measured from the player's own side of
+  the field, using the roster slot's team, so blue and orange players are comparable.
+- **Lobby level + gap to the lobby.** Two ensembles per model: one for the lobby level, one
+  for each player's deviation from it.
+- **Whole match for the verdict, 60-second windows for the timeline.**
+- **Labels** are each player's ranked-3v3 rank at match time (from Ballchasing), converted to
+  the middle of the division's MMR range.
+
+## Database
+
+- **replays**: id, file path, playlist, rank band, download status, dataset split
+- **replay_players**: per-replay player name, team, rank and division
+
+Train/evaluation splits are assigned once and stored, so every evaluation uses the same
+held-out replays.

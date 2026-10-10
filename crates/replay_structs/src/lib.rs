@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 mod game_mode;
 mod math;
-mod model;
 mod rank;
 mod replay;
 mod team;
@@ -14,7 +13,6 @@ mod unsupported_match;
 
 pub use game_mode::*;
 pub use math::*;
-pub use model::*;
 pub use rank::*;
 pub use replay::*;
 pub use team::*;
@@ -231,6 +229,15 @@ pub struct GameFrame {
     pub seconds_remaining: i32,
     pub ball: BallState,
     pub players: Vec<PlayerState>,
+    /// Demolitions replicated in this frame (may repeat across consecutive frames).
+    pub demolitions: Vec<DemolitionEvent>,
+}
+
+/// One car demolishing another, by car actor id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemolitionEvent {
+    pub attacker_actor_id: i32,
+    pub victim_actor_id: i32,
 }
 
 /// Goal event extracted from replay header.
@@ -248,6 +255,21 @@ pub struct ParsedReplay {
     pub goals: Vec<GoalEvent>,
     pub goal_frames: Vec<usize>,
     pub kickoff_frames: Vec<usize>,
+    /// End-of-match scoreboard from the replay header, one entry per player.
+    pub header_player_stats: Vec<HeaderPlayerStats>,
+}
+
+/// One player's end-of-match scoreboard line from the replay header (`PlayerStats`).
+#[derive(Debug, Clone, Default)]
+pub struct HeaderPlayerStats {
+    pub name: String,
+    pub team: Option<Team>,
+    /// In-game score.
+    pub score: i32,
+    pub goals: i32,
+    pub assists: i32,
+    pub saves: i32,
+    pub shots: i32,
 }
 
 /// Internal state for tracking actors during parsing.
@@ -258,4 +280,33 @@ pub struct ActorState {
     pub rotation: Quaternion,
     pub boost: f32,
     pub is_demolished: bool,
+    /// Angular velocity from the rigid body (Unreal units, rad/s scaled by the replay).
+    pub angular_velocity: Vector3,
+    /// Replicated player inputs and car-component activity.
+    pub controls: CarControls,
+}
+
+/// A car's replicated inputs and which of its components are firing.
+///
+/// Read from `Vehicle_TA` (throttle, steer, handbrake) and from each `CarComponent_TA`'s
+/// `ReplicatedActive` byte (odd = active). These are what mechanics — flips, wavedashes,
+/// powerslides, air control — are measured from.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CarControls {
+    /// Throttle in `[-1, 1]`.
+    pub throttle: f32,
+    /// Steer in `[-1, 1]`.
+    pub steer: f32,
+    /// Handbrake (powerslide / air roll) held.
+    pub handbrake: bool,
+    /// Boost component active.
+    pub boosting: bool,
+    /// Jump component active.
+    pub jumping: bool,
+    /// Double-jump component active.
+    pub double_jumping: bool,
+    /// Dodge (flip) component active.
+    pub dodging: bool,
+    /// Last replicated dodge torque; its direction tells a front flip from a side or back flip.
+    pub dodge_torque: Vector3,
 }
